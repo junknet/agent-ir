@@ -18,7 +18,7 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart,
+  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart,
   IRRequest, IRStopReason, IRToolResult, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -30,13 +30,13 @@ const PROVIDER = "openai_chat";
  * `image` 在这里是 user 消息里的 `image_url`（base64 走 data: URI，url 直传）——
  * 注意它**不**蕴含 `toolResultImage`：tool 消息只吃文本，那是另一个能力位。
  */
-const SUPPORTED = new Set([
+const SUPPORTED = [
   "stream", "nonStream", "systemPrompt", "multiTurn", "image",
   "reasoningEffort",
   "toolFunction", "toolParallel", "toolChoiceSpecific",
   "structuredOutput",
   "maxOutputTokens", "stopSequences", "temperature", "topP", "serviceTier",
-] as const);
+] as const satisfies readonly IRCapability[];
 
 /**
  * 能承载但有损。判据只有一条：**上游忽略它之后，模型看到的内容与能做的事不变**，
@@ -57,12 +57,15 @@ const SUPPORTED = new Set([
  *   contextEdit                   没有 context_management。指令丢了只影响上游的上下文预算，
  *                                 不改变本次发出去的内容。
  *   topK                          Chat 没有 top_k，只是一个采样旋钮，不值得让整个上游失格。
+ *
+ * 元素类型是 `Exclude<IRCapability, 已 supports 的>`：与 supports 重叠会被编译期挡下 ——
+ * 重叠时准入先命中 supports 直接放行，上面逐条写下的降级动作与 IRLoss 就一条都不会发生。
  */
-const LOSSY = new Set([
+const LOSSY = [
   "thinking", "thinkingSignature", "reasoningBudget",
   "toolFreeform", "toolGroup", "toolResultError",
   "cacheBreakpoint", "contextEdit", "topK",
-] as const);
+] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
 
 // 两个集合都不放，因此准入层直接判这家上游不可用并给出精确 IR 路径：
 //   document          Chat 的 `file` part 是 OpenAI 私有且只吃 PDF，兼容端点普遍拒收；

@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { tryParseJson } from "../ir/sse.ts";
 import type {
-  IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss, UpstreamRequestBuildResult, IRPart,
+  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss, UpstreamRequestBuildResult, IRPart,
   IRReasoning, IRRequest, IRStopReason, IRToolResult, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -55,11 +55,14 @@ const SUPPORTED = [
   // functionCallingConfig.mode=ANY + allowedFunctionNames=[name]。
   "toolChoiceSpecific",
   "maxOutputTokens", "stopSequences", "temperature", "topP",
-] as const;
+] as const satisfies readonly IRCapability[];
 
 /**
  * 能承载但有损。每一条都在 lower 里另有一条**带具体路径**的 loss，
  * 准入那条只是「这家整体上对这个能力有损」的兜底。
+ *
+ * 元素类型是 `Exclude<IRCapability, 已 supports 的>`：与 supports 重叠会被编译期挡下 ——
+ * 重叠时准入先命中 supports 直接放行，下面逐条写下的降级动作与 IRLoss 就一条都不会发生。
  */
 const LOSSY = [
   // Anthropic 的 thinking.signature 是**思考块**的完整性凭据；Gemini 的 thoughtSignature
@@ -84,7 +87,7 @@ const LOSSY = [
   "topK",
   // 没有服务档位概念。
   "serviceTier",
-] as const;
+] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
 
 // 完全不支持（既不在 supports 也不在 lossy，准入直接判该出口不可用）：
 //   toolBuiltin      —— IR 的 builtin 身份（computer_*/web_search…）在 cloudcode 私有面
@@ -485,8 +488,14 @@ function lowerContents(request: IRRequest, ctx: LowerContext): GeminiContent[] {
   return contents;
 }
 
-/** effort → thinkingBudget。IR 明确不在 ingress 互转，换算发生在这里并留痕。 */
-const EFFORT_BUDGET: Readonly<Record<string, number>> = {
+/**
+ * effort → thinkingBudget。IR 明确不在 ingress 互转，换算发生在这里并留痕。
+ *
+ * 键是 `IREffort` 而不是 `string`（另外两个出口的 EFFORT_WIRE 一直是这么写的）：
+ * 开着 string 键时，新增一档 effort 会落进读取处的 `?? 4000` 默认值，还照样记一条
+ * 「已换算成 4000」的 loss —— 漂移伪装成正常换算，没有任何东西会报错。
+ */
+const EFFORT_BUDGET: Readonly<Record<IREffort, number>> = {
   minimal: 128, low: 1000, medium: 4000, high: 10000, xhigh: 24000, max: 32768,
 };
 
@@ -530,7 +539,9 @@ function resolveThinking(
   } else if (reasoning.budgetTokens !== undefined) {
     budget = reasoning.budgetTokens;
   } else if (reasoning.effort !== undefined) {
-    budget = EFFORT_BUDGET[reasoning.effort] ?? 4000;
+    // 无 `?? 默认值`：键被 IREffort 穷举，缺档在上面的声明处就编译失败。
+    // 留着默认值等于给漏改留一条静默的活路。
+    budget = EFFORT_BUDGET[reasoning.effort];
     losses.record({
       path: "$.intent.reasoning.effort", kind: "substituted",
       detail: `Gemini 只有 token 预算，effort='${reasoning.effort}' 换算成 thinkingBudget=${budget}`,

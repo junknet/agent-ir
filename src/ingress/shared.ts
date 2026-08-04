@@ -1,4 +1,5 @@
 /** 三个 ingress 共用的原语。任何解析歧义都在这里裁决一次，不许各入口各写一套。 */
+import { IR_EFFORTS } from "../ir/types.ts";
 import type {
   IRBlob, IRCacheBreakpoint, IREffort, IRLoss, IRPart, IRProtocol, IRSessionIdentity,
   IRToolChoice, IRTurn,
@@ -35,12 +36,15 @@ export function asFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-const EFFORTS: readonly IREffort[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
-
-/** 档位取值三个协议一致（Anthropic 走 output_config.effort，OpenAI 走 reasoning[_effort]）。 */
+/**
+ * 档位取值三个协议一致（Anthropic 走 output_config.effort，OpenAI 走 reasoning[_effort]）。
+ *
+ * 校验清单直接用 `IR_EFFORTS`：这里原先手抄了一份档位数组，抄漏一档不会有任何编译错误，
+ * 只会让客户端明确要求的 effort 静默变成 undefined。
+ */
 export function parseEffort(value: unknown): IREffort | undefined {
   const raw = asString(value);
-  return raw !== null && EFFORTS.includes(raw as IREffort) ? (raw as IREffort) : undefined;
+  return raw !== null && (IR_EFFORTS as readonly string[]).includes(raw) ? (raw as IREffort) : undefined;
 }
 
 /**

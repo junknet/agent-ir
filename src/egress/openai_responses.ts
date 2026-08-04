@@ -23,7 +23,7 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
+  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
   IRRequest, IRStopReason, IRTool, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -36,12 +36,12 @@ const PROVIDER = "openai_responses";
  * `document` 不在这里：`input_file` 在 80 条归档请求与 94 份 rollout 里**一次都没出现过**，
  * 拿不准的形状写进 supports 等于拿整条请求赌一个 400，所以它降级进 lossy 走文本占位。
  */
-const SUPPORTED = new Set([
+const SUPPORTED = [
   "stream", "nonStream", "systemPrompt", "multiTurn", "image",
   "thinking", "reasoningEffort",
   "toolFunction", "toolFreeform", "toolBuiltin", "toolGroup", "toolParallel", "toolChoiceSpecific",
   "structuredOutput", "maxOutputTokens", "temperature", "topP", "serviceTier",
-] as const);
+] as const satisfies readonly IRCapability[];
 
 /**
  * 能承载但有损。每一项都在 `lower` 里对应一处真实的降级动作 + 一条 IRLoss：
@@ -57,11 +57,14 @@ const SUPPORTED = new Set([
  *   contextEdit        没有等价的历史处置指令，只能整条丢
  *   stopSequences      `/v1/responses` 没有 stop 参数（Chat Completions 才有）
  *   topK               Responses 只有 temperature / top_p
+ *
+ * 元素类型是 `Exclude<IRCapability, 已 supports 的>`：与 supports 重叠会被编译期挡下 ——
+ * 重叠时准入先命中 supports 直接放行，上面逐条写下的降级动作与 IRLoss 就一条都不会发生。
  */
-const LOSSY = new Set([
+const LOSSY = [
   "thinkingSignature", "reasoningBudget", "document", "toolResultImage", "toolResultError",
   "cacheBreakpoint", "contextEdit", "stopSequences", "topK",
-] as const);
+] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
 
 export interface ResponsesUpstreamOptions {
   readonly baseUrl: string;

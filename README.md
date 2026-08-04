@@ -107,7 +107,7 @@ ingress_received → ingress_decoded → admission_decided → egress_lowered
 ## 测试
 
 ```bash
-bun test          # 52 项：38 边界用例 + 9 项请求↔响应对称性 + 5 项 807 条真实语料回放
+bun test          # 边界用例 + 请求↔响应对称性 + SSE 分帧 + 长流容错 + 807 条真实语料回放
 bun run typecheck
 ```
 
@@ -128,6 +128,9 @@ bun run typecheck
 | `/v1/messages` | Claude Code 2.1.221 | `--bare` 单轮 + 全量 237 工具的多轮工具调用 |
 | `/v1/responses` | codex 0.146.0 | 228KB 请求、247 工具、14 个 namespace 分组 |
 | `/v1/chat/completions` | jcode | 219KB 请求、230 工具 |
+
+出口侧已接四家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode`，
+因此当前可用路由是 3 入口 × 4 出口 = 12 条。
 
 codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍进名字，
 `ir_loss_recorded` 显式记下 `'toolGroup' only with loss of fidelity` ——

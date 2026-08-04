@@ -12,6 +12,7 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { readClientRequestForProtocol } from "../src/ingress/index.ts";
+import { IR_LOSS_KINDS } from "../src/ir/types.ts";
 import type { IRPart, IRProtocol, IRRequest } from "../src/ir/types.ts";
 
 const CORPUS_PATH = new URL("../.corpus/requests.ndjson", import.meta.url).pathname;
@@ -85,7 +86,7 @@ describe("corpus replay", () => {
       const { losses } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       for (const loss of losses) {
         expect(loss.stage).toBe("ingress");
-        expect(["dropped", "degraded", "substituted", "truncated"]).toContain(loss.kind);
+        expect(IR_LOSS_KINDS).toContain(loss.kind);
         details.set(loss.detail, (details.get(loss.detail) ?? 0) + 1);
       }
     }

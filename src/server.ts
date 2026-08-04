@@ -12,9 +12,7 @@ import { createAnthropicUpstream } from "./egress/anthropic.ts";
 import { checkUpstreamSupport, describeUnsupportedCapabilities } from "./ir/admission.ts";
 import { configureLogging, getLogger, jsonSink, parseLogLevel, textSink } from "./obs/log.ts";
 import { readClientRequestForProtocol } from "./ingress/index.ts";
-import { INGRESS_PATHS } from "./protocols.ts";
-import { writeAnthropicResponse } from "./ingress/anthropic_encode.ts";
-import { writeChatCompletionsResponse, writeResponsesResponse } from "./ingress/openai_encode.ts";
+import { INGRESS_CODECS, INGRESS_PATHS } from "./protocols.ts";
 import type { IREgress, IREvent, IRLoss, IRProtocol, IRRequest } from "./ir/types.ts";
 
 const DEV = (process.env.AGENT_IR_ENV ?? "dev") === "dev";
@@ -179,12 +177,10 @@ async function handle(httpRequest: Request): Promise<Response> {
   }
 
   // 出站编码按**入口协议**分发：客户端说哪种协议就回哪种，与上游用什么无关。
+  // 查注册表而不是写 if 链：旧的三元链最后一档是兜底分支，新增协议会被静默塞进 Responses 编码器；
+  // `INGRESS_CODECS` 的键由 IRProtocol 穷举，漏一个协议在 protocols.ts 就编译失败。
   const encodeOptions = { messageId: `msg_${traceId}`, onUnhandled };
-  const encode =
-    protocol === "anthropic_messages" ? writeAnthropicResponse
-    : protocol === "openai_chat_completions" ? writeChatCompletionsResponse
-    : writeResponsesResponse;
-  const response = await encode(observed(), request, encodeOptions);
+  const response = await INGRESS_CODECS[protocol].writeClientResponse(observed(), request, encodeOptions);
   log.info({
     event: "request_completed", trace: traceId, protocol, status: response.status,
     stream: request.intent.stream.value, elapsed_ms: Math.round(performance.now() - started),

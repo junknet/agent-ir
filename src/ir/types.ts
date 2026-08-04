@@ -17,7 +17,18 @@
 // 通用
 // ═══════════════════════════════════════════════════════════════════════════
 
-export type IRProtocol = "anthropic_messages" | "openai_responses" | "openai_chat_completions";
+/**
+ * 入口协议 —— **定值封闭集**，世界上的 agent 客户端协议就这三种。
+ *
+ * 常量数组是唯一授权定义，类型从它派生（与下面的 `IR_CAPABILITIES` 同构）。手写联合做不到
+ * 运行时枚举，于是每个需要「全部协议」的地方都会自己抄一份：路由表、注册表、测试各抄一遍，
+ * 少改一处没有任何东西会报错。从这里派生之后，`Record<IRProtocol, T>` 的键就是编译期的穷举证明。
+ */
+export const IR_PROTOCOLS = [
+  "anthropic_messages", "openai_responses", "openai_chat_completions",
+] as const;
+
+export type IRProtocol = (typeof IR_PROTOCOLS)[number];
 
 /** 值的来源。区分「客户端明确要求」与「网关替他决定」——两者冲突时的处理完全不同。 */
 export type IRSource = "client" | "gateway-default" | "gateway-forced";
@@ -189,7 +200,16 @@ export interface IRConversation {
 // L1 — 意图层
 // ═══════════════════════════════════════════════════════════════════════════
 
-export type IREffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+/**
+ * 推理强度档。常量数组是唯一授权定义 —— 因为 ingress 要**在运行时逐个校验**客户端送来的
+ * 字符串（`parseEffort`），手写联合逼着那边自己抄一份档位清单，抄漏一档的后果是：客户端
+ * 明确要求的 effort 被解成 undefined 静默丢掉，正是本文件反复强调的「有损发生在 ingress」。
+ *
+ * 从这里派生之后，加一档会同时点亮三个出口的 `Record<IREffort, …>` 换算表，逼每家表态。
+ */
+export const IR_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export type IREffort = (typeof IR_EFFORTS)[number];
 
 /**
  * 推理开关档。模式来自实测：
@@ -296,12 +316,17 @@ export interface IREgressProfile {
   readonly lossy: ReadonlySet<IRCapability>;
 }
 
+/** 损失的四种形态。语料回放要在运行时枚举它们核对，所以是常量数组而非手写联合。 */
+export const IR_LOSS_KINDS = ["dropped", "degraded", "substituted", "truncated"] as const;
+
+export type IRLossKind = (typeof IR_LOSS_KINDS)[number];
+
 export interface IRLoss {
   readonly stage: "ingress" | "egress" | "lift";
   readonly provider: string | null;
   /** IR 路径，如 `$.intent.stopping.maxOutputTokens`。 */
   readonly path: string;
-  readonly kind: "dropped" | "degraded" | "substituted" | "truncated";
+  readonly kind: IRLossKind;
   readonly detail: string;
 }
 

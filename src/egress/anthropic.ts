@@ -8,22 +8,27 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRRequest,
+  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRRequest,
   IRStopReason, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
-const SUPPORTED = new Set([
+const SUPPORTED = [
   "stream", "nonStream", "systemPrompt", "multiTurn", "image", "document",
   "thinking", "thinkingSignature", "reasoningEffort", "reasoningBudget",
   "toolFunction", "toolBuiltin", "toolParallel", "toolChoiceSpecific",
   "toolResultImage", "toolResultError", "structuredOutput", "cacheBreakpoint",
   "contextEdit", "maxOutputTokens", "stopSequences", "temperature", "topP", "topK", "serviceTier",
-] as const);
+] as const satisfies readonly IRCapability[];
 
 // toolFreeform：Anthropic 没有自由文本入参工具，只能包成单字段 JSON schema。
 // toolGroup：没有 namespace 概念，只能把分组拍进名字。
 // 两者都能承载，但都有损 —— 归 lossy，放行且强制留痕。
-const LOSSY = new Set(["toolFreeform", "toolGroup"] as const);
+//
+// 元素类型是 `Exclude<IRCapability, 已 supports 的>`：两个集合必须不相交。重叠时准入会
+// 先命中 supports 直接放行，这条注释承诺的「强制留痕」就静默失效了 —— 那正是不变量 3 的反面。
+const LOSSY = [
+  "toolFreeform", "toolGroup",
+] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
 
 export interface AnthropicUpstreamOptions {
   readonly baseUrl: string;
