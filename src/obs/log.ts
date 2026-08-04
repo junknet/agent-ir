@@ -99,14 +99,6 @@ export function textSink(options: { colors?: boolean } = {}): LogSink {
   };
 }
 
-export function combineSinks(sinks: readonly LogSink[]): LogSink {
-  return (line) => {
-    for (const sink of sinks) {
-      try { sink(line); } catch { /* sink 故障不得影响主流程，也无更低层可记 */ }
-    }
-  };
-}
-
 // ── normalization ──────────────────────────────────────────────────────────
 
 function isSensitive(name: string): boolean {

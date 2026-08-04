@@ -8,22 +8,15 @@
 import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import {
   clientValue, defaultValue,
-  type IRDecodeResult, type IREffort, type IRIntent, type IROutputFormat, type IRPart,
+  type IRDecodeResult, type IRIntent, type IROutputFormat, type IRPart,
   type IRReasoning, type IRTool, type IRToolChoice, type IRToolRef, type IRToolset, type IRTurn,
 } from "../ir/types.ts";
 import {
-  asFiniteNumber, asString, isRecord, LossRecorder, normalizeTurns,
+  asFiniteNumber, asString, isRecord, LossRecorder, normalizeTurns, parseEffort, parseStringToolChoice,
   opaquePart, parseImageBlob, textPart,
 } from "./shared.ts";
 
 const PROTOCOL = "openai_chat_completions" as const;
-const EFFORTS: readonly IREffort[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
-
-function parseEffort(value: unknown): IREffort | undefined {
-  const raw = asString(value);
-  return raw !== null && EFFORTS.includes(raw as IREffort) ? (raw as IREffort) : undefined;
-}
-
 function decodeContentPart(part: unknown, path: string, losses: LossRecorder): IRPart {
   if (typeof part === "string") return textPart(part);
   if (!isRecord(part)) {
@@ -122,9 +115,8 @@ function decodeTool(tool: unknown, path: string, losses: LossRecorder): IRTool |
 function decodeToolChoice(value: unknown, losses: LossRecorder): IRToolChoice | null {
   if (value === undefined || value === null) return null;
   if (typeof value === "string") {
-    if (value === "auto") return { kind: "auto" };
-    if (value === "none") return { kind: "none" };
-    if (value === "required") return { kind: "required" };
+    const parsed = parseStringToolChoice(value);
+    if (parsed !== null) return parsed;
     losses.record({ path: "$.tool_choice", kind: "dropped", detail: `unknown tool_choice '${value}'` });
     return null;
   }

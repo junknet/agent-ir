@@ -7,23 +7,16 @@
 import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import {
   clientValue, defaultValue,
-  type IRContextEdit, type IREffort, type IRIntent, type IROutputFormat, type IRPart,
+  type IRContextEdit, type IRIntent, type IROutputFormat, type IRPart,
   type IRDecodeResult, type IRReasoning, type IRReasoningDisplay, type IRReasoningMode,
   type IRTool, type IRToolChoice, type IRToolGroup, type IRToolRef, type IRToolset, type IRTurn,
 } from "../ir/types.ts";
 import {
-  asFiniteNumber, asString, isRecord, LossRecorder, normalizeTurns,
+  asFiniteNumber, asString, isRecord, LossRecorder, normalizeTurns, parseEffort,
   opaquePart, parseCacheBreakpoint, parseImageBlob, parseSessionIdentity, textPart,
 } from "./shared.ts";
 
 const PROTOCOL = "anthropic_messages" as const;
-const EFFORTS: readonly IREffort[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
-
-function parseEffort(value: unknown): IREffort | undefined {
-  const raw = asString(value);
-  return raw !== null && EFFORTS.includes(raw as IREffort) ? (raw as IREffort) : undefined;
-}
-
 // ── content ────────────────────────────────────────────────────────────────
 
 function decodeBlock(block: unknown, path: string, losses: LossRecorder): IRPart {

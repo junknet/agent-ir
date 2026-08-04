@@ -1,7 +1,15 @@
 /** 三个 ingress 共用的原语。任何解析歧义都在这里裁决一次，不许各入口各写一套。 */
 import type {
-  IRBlob, IRCacheBreakpoint, IRLoss, IRPart, IRProtocol, IRSessionIdentity, IRTurn,
+  IRBlob, IRCacheBreakpoint, IREffort, IRLoss, IRPart, IRProtocol, IRSessionIdentity,
+  IRToolChoice, IRTurn,
 } from "../ir/types.ts";
+
+/** 出站编码的共用参数。两个 encoder 都要，放这里避免它们互相 import。 */
+export interface EncodeOptions {
+  readonly messageId: string;
+  /** 未识别的上游事件计数回调；网关据此发现协议漂移。 */
+  readonly onUnhandled?: (rawType: string, raw: unknown) => void;
+}
 
 export class LossRecorder {
   readonly #losses: IRLoss[] = [];
@@ -25,6 +33,25 @@ export function asString(value: unknown): string | null {
 
 export function asFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+const EFFORTS: readonly IREffort[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** 档位取值三个协议一致（Anthropic 走 output_config.effort，OpenAI 走 reasoning[_effort]）。 */
+export function parseEffort(value: unknown): IREffort | undefined {
+  const raw = asString(value);
+  return raw !== null && EFFORTS.includes(raw as IREffort) ? (raw as IREffort) : undefined;
+}
+
+/**
+ * OpenAI 两个协议共用的 tool_choice 字符串档。
+ * Anthropic 不走这里：它用 `{type:'any'}` 表达 required，是另一套 wire 词汇。
+ */
+export function parseStringToolChoice(value: string): IRToolChoice | null {
+  if (value === "auto") return { kind: "auto" };
+  if (value === "none") return { kind: "none" };
+  if (value === "required") return { kind: "required" };
+  return null;
 }
 
 /**

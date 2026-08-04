@@ -365,13 +365,6 @@ export interface IRDecodeResult {
   readonly losses: readonly IRLoss[];
 }
 
-export interface IRIngress {
-  readonly protocol: IRProtocol;
-  decode(raw: unknown, traceId: string): IRDecodeResult;
-  /** 非流式要把整条流聚合完才能成体，因此允许返回 Promise。 */
-  encode(events: AsyncIterable<IREvent>, request: IRRequest): Response | Promise<Response>;
-}
-
 export interface IRWireRequest {
   readonly url: string;
   readonly method: "POST";

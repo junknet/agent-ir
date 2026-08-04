@@ -8,7 +8,7 @@
  */
 import { formatSse } from "../ir/sse.ts";
 import type { IREvent, IRPart, IRRequest, IRStopReason, IRUsage } from "../ir/types.ts";
-import type { EncodeOptions } from "./anthropic_encode.ts";
+import type { EncodeOptions } from "./shared.ts";
 
 const CHAT_FINISH: Record<IRStopReason, string> = {
   endTurn: "stop", maxTokens: "length", stopSequence: "stop",

@@ -6,6 +6,7 @@
  */
 import { formatSse } from "../ir/sse.ts";
 import type { IREvent, IRPart, IRRequest, IRStopReason, IRUsage } from "../ir/types.ts";
+import type { EncodeOptions } from "./shared.ts";
 
 const STOP_REASON_WIRE: Record<IRStopReason, string> = {
   endTurn: "end_turn", maxTokens: "max_tokens", stopSequence: "stop_sequence",
@@ -51,12 +52,6 @@ function usageWire(usage: IRUsage | null): Record<string, number> {
     ...(usage.cacheReadTokens === undefined ? {} : { cache_read_input_tokens: usage.cacheReadTokens }),
     ...(usage.cacheWriteTokens === undefined ? {} : { cache_creation_input_tokens: usage.cacheWriteTokens }),
   };
-}
-
-export interface EncodeOptions {
-  readonly messageId: string;
-  /** 未识别的上游事件计数回调；网关据此发现协议漂移。 */
-  readonly onUnhandled?: (rawType: string, raw: unknown) => void;
 }
 
 export function encodeAnthropicResponse(
