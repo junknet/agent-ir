@@ -322,13 +322,27 @@ export interface IRRequest {
 export type IRStopReason =
   | "endTurn" | "maxTokens" | "stopSequence" | "toolUse" | "refusal" | "aborted" | "error";
 
+/**
+ * 用量。**口径取 Anthropic 语义：`inputTokens` 不含缓存命中部分**，缓存单列。
+ *
+ * 这条必须写死在类型上，因为两家 wire 的口径是相反的：OpenAI 的 `prompt_tokens` /
+ * Responses 的 `input_tokens` **都包含** cached（实测 40,926 个样本零反例，缓存占比
+ * 62%–91%）。lift 进来时要减出去，lower/encode 出去时要加回来 —— 少做任何一边，
+ * 输入 token 就会虚增或少报最高九成，下游 harness 的上下文压缩阈值全部算错。
+ */
 export interface IRUsage {
+  /** 不含缓存命中。换算见本接口顶部说明。 */
   readonly inputTokens: number;
   readonly outputTokens: number;
   /** 三态：undefined = 上游不支持缓存；0 = 支持但没命中；>0 = 命中。 */
   readonly cacheReadTokens?: number;
   readonly cacheWriteTokens?: number;
   readonly reasoningTokens?: number;
+}
+
+/** 出站到「input 含缓存」口径的 wire 时用它加回去。加回来只此一处，不许各写各的。 */
+export function inputTokensIncludingCache(usage: IRUsage): number {
+  return usage.inputTokens + (usage.cacheReadTokens ?? 0);
 }
 
 export interface IRUpstreamError {
@@ -356,7 +370,23 @@ export type IREvent =
   | { readonly kind: "messageStop"; readonly reason: IRStopReason }
   | { readonly kind: "error"; readonly error: IRUpstreamError }
   | { readonly kind: "loss"; readonly loss: IRLoss }
-  | { readonly kind: "unhandled"; readonly rawType: string; readonly raw: unknown };
+  | { readonly kind: "unhandled"; readonly rawType: string; readonly raw: unknown }
+  /**
+   * 首个语义产出已经下发 —— **提交点**。由 stream guard 注入，encoder 忽略它。
+   *
+   * 这是长流容错的枢纽：提交之前上游出错还能换号重试、还能改状态码；提交之后字节已经
+   * 在下游手里，两者都做不到了，只能在 200 流里补一个协议内的 error 事件收尾。
+   * 把它做成流里的一等事件而不是旁路布尔，是因为「能不能重试」这个判断必须与事件顺序严格对齐。
+   */
+  | { readonly kind: "committed" }
+  /**
+   * 计时器驱动的保活提示。由 stream guard 按节律注入，各 encoder 渲染成自己协议的形态
+   * （Anthropic 的 `event: ping`、OpenAI 的 SSE 注释行）。
+   *
+   * **必须计时器驱动，不能数据驱动。** 生产实证：上游彻底静默正是保活唯一要顶的场景，
+   * 一旦把它挂在数据分支上，它就恰好在最该工作的时候停摆。
+   */
+  | { readonly kind: "heartbeat" };
 
 export type IRPartDelta =
   | { readonly kind: "text"; readonly text: string }

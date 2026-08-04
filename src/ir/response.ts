@@ -147,6 +147,12 @@ export async function assembleResponse(
       case "unhandled":
         unhandled.push({ rawType: event.rawType, raw: event.raw });
         break;
+
+      // 传输层信号，不进响应文档：committed 是给调用方判「还能不能换号」的，
+      // heartbeat 是给下游连接保活的，两者都不是模型产出。
+      case "committed":
+      case "heartbeat":
+        break;
     }
   }
 

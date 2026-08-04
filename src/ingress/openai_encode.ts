@@ -7,6 +7,7 @@
  * response.failed），否则调用方无法区分「模型没话说」与「上游拒绝了」，只能盲重试。
  */
 import { formatSse } from "../ir/sse.ts";
+import { inputTokensIncludingCache } from "../ir/types.ts";
 import type {
   IREvent, IRPart, IRRequest, IRResponsePart, IRStopReason, IRToolInput, IRUsage,
 } from "../ir/types.ts";
@@ -36,10 +37,13 @@ function disclose(event: Extract<IREvent, { kind: "error" }>): Disclosure {
 
 function usageWire(usage: IRUsage | null): Record<string, unknown> {
   if (usage === null) return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  // Chat 的 prompt_tokens **含**缓存命中，IRUsage 取 Anthropic 语义（不含），出站必须加回来。
+  // 少加这一步，chat→IR→chat 往返会把缓存部分整个少报（实测缓存占比可达九成）。
+  const promptTokens = inputTokensIncludingCache(usage);
   return {
-    prompt_tokens: usage.inputTokens,
+    prompt_tokens: promptTokens,
     completion_tokens: usage.outputTokens,
-    total_tokens: usage.inputTokens + usage.outputTokens,
+    total_tokens: promptTokens + usage.outputTokens,
     ...(usage.cacheReadTokens === undefined ? {} : { prompt_tokens_details: { cached_tokens: usage.cacheReadTokens } }),
     ...(usage.reasoningTokens === undefined ? {} : { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } }),
   };
@@ -126,7 +130,7 @@ async function consume(
       case "messageStop": accumulator.stopReason = event.reason; break;
       case "error": accumulator.failure = event; break;
       case "unhandled": options.onUnhandled?.(event.rawType, event.raw); break;
-      case "messageStart": case "partEnd": case "loss": break;
+      case "messageStart": case "partEnd": case "loss": case "committed": case "heartbeat": break;
     }
     onEvent?.(event, accumulator);
   }
@@ -185,6 +189,11 @@ function encodeChatStream(events: AsyncIterable<IREvent>, request: IRRequest, op
       try {
         const accumulator = await consume(events, options, (event, state) => {
           switch (event.kind) {
+            case "heartbeat":
+              // SSE 注释行：规范内的合法字节，客户端解析器一律忽略，但足以让
+              // 中间的 CDN/代理看到「数据还在流动」。生产实证静默 125.8s 即被掐。
+              controller.enqueue(encoder.encode(": keep-alive\n\n"));
+              break;
             case "messageStart": push({ role: "assistant" }, null); break;
             case "partStart":
               if (event.part.kind !== "toolCall") break;
@@ -309,9 +318,11 @@ function responsesEnvelope(
   return {
     id: options.messageId, object: "response", created_at: Math.floor(Date.now() / 1000),
     status, model: assembled.model.length > 0 ? assembled.model : request.model, output: responsesOutput(assembled),
+    // 同上：Responses 的 input_tokens 也含缓存命中。
     usage: assembled.usage === null ? null : {
-      input_tokens: assembled.usage.inputTokens, output_tokens: assembled.usage.outputTokens,
-      total_tokens: assembled.usage.inputTokens + assembled.usage.outputTokens,
+      input_tokens: inputTokensIncludingCache(assembled.usage),
+      output_tokens: assembled.usage.outputTokens,
+      total_tokens: inputTokensIncludingCache(assembled.usage) + assembled.usage.outputTokens,
     },
   };
 }
@@ -327,6 +338,7 @@ function encodeResponsesStream(events: AsyncIterable<IREvent>, request: IRReques
       try {
         send("response.created", { type: "response.created", sequence_number: next(), response: { id: options.messageId, object: "response", status: "in_progress", model: request.model, output: [] } });
         const state = await consume(events, options, (event) => {
+          if (event.kind === "heartbeat") { send("response.in_progress", { type: "response.in_progress", sequence_number: next() }); return; }
           if (event.kind === "partDelta" && event.delta.kind === "text") {
             send("response.output_text.delta", { type: "response.output_text.delta", sequence_number: next(), output_index: 0, delta: event.delta.text });
           }

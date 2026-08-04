@@ -13,5 +13,12 @@
     "@types/bun": "latest",
     "@types/node": "latest",
     "typescript": "latest"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./egress/windsurf": "./src/egress/windsurf/index.ts"
+  },
+  "optionalDependencies": {
+    "@bufbuild/protobuf": "^2.2.3"
   }
 }

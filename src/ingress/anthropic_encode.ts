@@ -142,6 +142,16 @@ function encodeStream(events: AsyncIterable<IREvent>, request: IRRequest, option
               break;
             }
 
+            case "committed":
+              break;
+
+            case "heartbeat":
+              // Anthropic 协议内的合法保活帧。生产实证：CF 计的是数据间隔，
+              // 静默 125.8 秒即被掐成 524，下游拿到的是纯文本错误页。
+              ensureStart(request.model);
+              send("ping", { type: "ping" });
+              break;
+
             case "loss":
               // 有损只进日志与遥测，不进出站字节。
               break;

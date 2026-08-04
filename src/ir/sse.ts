@@ -17,33 +17,53 @@ export async function* iterateSse(response: Response): AsyncGenerator<SseEvent> 
   if (body === null) return;
   const decoder = new TextDecoder();
   let buffer = "";
+  let pending: string[] = [];
+
+  const takeLine = (): string | null => {
+    // 规范允许三种行终止符：\r\n、\n、\r。只找 "\n\n" 会漏掉 CRLF 分帧的上游 ——
+    // 实测 Google CloudCode 的 v1internal:streamGenerateContent 就是 \r\n\r\n，
+    // 结果整条流被攒成一个 block、多个 JSON 首尾相接，**症状不是报错是内容凭空消失**。
+    // 官方 SDK 的做法同样是逐行扫描 + 空行分帧，不做字节对匹配。
+    const match = /\r\n|\n|\r/u.exec(buffer);
+    if (match === null) return null;
+    // 落在缓冲末尾的孤立 \r 可能是 \r\n 被 TCP 切开的前半截，等下一个 chunk 再判。
+    if (match[0] === "\r" && match.index === buffer.length - 1) return null;
+    const line = buffer.slice(0, match.index);
+    buffer = buffer.slice(match.index + match[0].length);
+    return line;
+  };
+
   for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
     buffer += decoder.decode(chunk, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const raw = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const parsed = parseSseBlock(raw);
+    for (let line = takeLine(); line !== null; line = takeLine()) {
+      if (line.length > 0) { pending.push(line); continue; }
+      const parsed = parseSseLines(pending);
+      pending = [];
       if (parsed !== null) yield parsed;
-      boundary = buffer.indexOf("\n\n");
     }
   }
+
   buffer += decoder.decode();
+  for (let line = takeLine(); line !== null; line = takeLine()) {
+    if (line.length > 0) { pending.push(line); continue; }
+    const parsed = parseSseLines(pending);
+    pending = [];
+    if (parsed !== null) yield parsed;
+  }
+  if (buffer.length > 0) pending.push(buffer);
   // 上游没有以空行收尾时，残留的最后一个事件仍然要发出去，不能因为「格式不完美」丢内容。
-  const tail = parseSseBlock(buffer);
+  const tail = parseSseLines(pending);
   if (tail !== null) yield tail;
 }
 
-function parseSseBlock(raw: string): SseEvent | null {
-  const lines = raw.split("\n");
+function parseSseLines(lines: readonly string[]): SseEvent | null {
   let event: string | null = null;
   const data: string[] = [];
   for (const line of lines) {
-    const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
-    if (normalized.length === 0 || normalized.startsWith(":")) continue;
-    const colon = normalized.indexOf(":");
-    const field = colon === -1 ? normalized : normalized.slice(0, colon);
-    const value = colon === -1 ? "" : normalized.slice(colon + 1).replace(/^ /u, "");
+    if (line.length === 0 || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /u, "");
     if (field === "event") event = value;
     else if (field === "data") data.push(value);
   }
