@@ -1,14 +1,8 @@
 # agent-ir
 
-多协议 LLM 网关的协议中立 IR。三个入口协议 → 一个 IR → 任意出口。
+多协议 LLM 网关的协议中立 IR。**三个入口协议 → 一个 IR → 五个上游**。
 
-```
-POST /v1/messages          ┐                                    ┌ anthropic
-POST /v1/responses         ┼─ readClientRequest ─► IR ─ writeUpstreamRequest ─┼ (下一个上游在这里加)
-POST /v1/chat/completions  ┘                        ▲                        └
-                                                    │
-                          writeClientResponse ◄─────┴─ readUpstreamResponse
-```
+完整架构图（总览 / 请求时序 / 事件流 / 源码映射）见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。
 
 不是又一个「以某家 wire 格式当 IR」的网关。设计依据是**真实流量**，每条结构决策都能追到具体证据。
 
@@ -30,23 +24,16 @@ POST /v1/chat/completions  ┘                        ▲                       
 这个不对称是 domain 固有的，但「响应组装完之后长什么样」同样必须是 IR ——
 否则每个出站协议都要自己从事件流折一遍，各折各的形状。
 
-```
-请求  IRRequest              L0 会话 + L1 意图 + L2 能力需求
-响应  IREvent 流             messageStart / partStart / partDelta / partEnd
-                             / usage / messageStop / error / loss / unhandled
-      ↓ assembleResponse()   唯一的折叠实现
-      IRResponse             { turn, stopReason, usage, error, losses, unhandled }
-```
 
 **闭环在 `IRResponse.turn`**：它是一个 assistant `IRTurn`，与请求历史里的回合同类型，
-可以直接 append 进下一轮的 `conversation.turns`，不必绕一圈 wire 再 decode。
+可以直接 append 进下一轮的 `conversation.turns`，不必绕一圈 wire 再读回。
 `IRTurn` 对 part 类型协变，所以它同时是「比历史回合窄」（`IRResponsePart`：模型不会
 生成 image / document / toolResult / opaque）和「是历史回合」。
 
-测试锁死了这条：组装出的回合与把同一段产出走 Anthropic wire 再 decode 回来的结果**完全相等**。
+测试锁死了这条：组装出的回合与把同一段产出走 Anthropic wire 再读回来的结果**完全相等**。
 
 流式路径不能用整段折叠（必须边收边发），但它的**收尾产物仍然是 `IRResponse`** ——
-于是 envelope 构造只有一份，不因流式/非流式分叉。
+于是 envelope 构造只有一份，不因流式/非流式分叉。流程图见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 三层结构
 
