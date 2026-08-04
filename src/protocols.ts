@@ -5,14 +5,14 @@
  * 新增上游再也不需要碰它。
  *
  * `EGRESS_PROVIDERS` 是**开放**的：接 Gemini CloudCode、Windsurf Connect、Bedrock
- * 都只是往这里加一行（两个函数：lower + lift），入口侧零改动，一次性多出三条路由。
+ * 都只是往这里加一行（两个函数：writeUpstreamRequest + readUpstreamResponse），入口侧零改动，一次性多出三条路由。
  */
-import { createAnthropicEgress, type AnthropicEgressOptions } from "./egress/anthropic.ts";
-import { encodeAnthropicResponse } from "./ingress/anthropic_encode.ts";
-import { decodeAnthropicMessages } from "./ingress/anthropic_messages.ts";
-import { decodeOpenAIChatCompletions } from "./ingress/openai_chat_completions.ts";
-import { encodeChatCompletionsResponse, encodeResponsesResponse } from "./ingress/openai_encode.ts";
-import { decodeOpenAIResponses } from "./ingress/openai_responses.ts";
+import { createAnthropicUpstream, type AnthropicUpstreamOptions } from "./egress/anthropic.ts";
+import { writeAnthropicResponse } from "./ingress/anthropic_encode.ts";
+import { readAnthropicMessagesRequest } from "./ingress/anthropic_messages.ts";
+import { readChatCompletionsRequest } from "./ingress/openai_chat_completions.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "./ingress/openai_encode.ts";
+import { readResponsesRequest } from "./ingress/openai_responses.ts";
 import type {
   IREgressDescriptor, IREgressRegistry, IRIngressCodec, IRIngressRegistry,
 } from "./ir/codec.ts";
@@ -22,20 +22,20 @@ import type { IRProtocol } from "./ir/types.ts";
 
 const anthropicMessages: IRIngressCodec = {
   protocol: "anthropic_messages",
-  decodeRequest: decodeAnthropicMessages,
-  encodeResponse: encodeAnthropicResponse,
+  readClientRequest: readAnthropicMessagesRequest,
+  writeClientResponse: writeAnthropicResponse,
 };
 
 const openaiResponses: IRIngressCodec = {
   protocol: "openai_responses",
-  decodeRequest: decodeOpenAIResponses,
-  encodeResponse: encodeResponsesResponse,
+  readClientRequest: readResponsesRequest,
+  writeClientResponse: writeResponsesResponse,
 };
 
 const openaiChatCompletions: IRIngressCodec = {
   protocol: "openai_chat_completions",
-  decodeRequest: decodeOpenAIChatCompletions,
-  encodeResponse: encodeChatCompletionsResponse,
+  readClientRequest: readChatCompletionsRequest,
+  writeClientResponse: writeChatCompletionsResponse,
 };
 
 export const INGRESS_CODECS = {
@@ -53,10 +53,10 @@ export const INGRESS_PATHS: Readonly<Record<string, IRProtocol>> = {
 
 // ── 出口：开放集，当前一家 ──────────────────────────────────────────────────
 
-const anthropicEgress: IREgressDescriptor<AnthropicEgressOptions> = {
+const anthropicEgress: IREgressDescriptor<AnthropicUpstreamOptions> = {
   name: "anthropic",
   wire: "anthropic_messages_sse",
-  create: createAnthropicEgress,
+  create: createAnthropicUpstream,
 };
 
 export const EGRESS_PROVIDERS = {

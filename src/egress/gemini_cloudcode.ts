@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { tryParseJson } from "../ir/sse.ts";
 import type {
-  IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss, IRLowerResult, IRPart,
+  IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss, UpstreamRequestBuildResult, IRPart,
   IRReasoning, IRRequest, IRStopReason, IRToolResult, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -245,7 +245,7 @@ export function createCloudCodeProjectSource(
 
 // ── lower ──────────────────────────────────────────────────────────────────
 
-class LowerLosses {
+class UpstreamRequestLosses {
   readonly #losses: IRLoss[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
@@ -311,11 +311,11 @@ type GeminiPart = Record<string, unknown>;
 
 interface LowerContext {
   readonly toolNameByCallId: ReadonlyMap<string, string>;
-  readonly losses: LowerLosses;
+  readonly losses: UpstreamRequestLosses;
 }
 
 /** 一条 IRPart → 0..n 个 Gemini part。返回数组而不是 `T | null`：一个 part 可能落成零个。 */
-function lowerPart(part: IRPart, path: string, ctx: LowerContext): GeminiPart[] {
+function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): GeminiPart[] {
   const { losses } = ctx;
   if (part.cacheBreakpoint !== undefined) {
     losses.record({
@@ -415,7 +415,7 @@ function lowerPart(part: IRPart, path: string, ctx: LowerContext): GeminiPart[] 
   }
 }
 
-function fallbackToolName(callId: string, path: string, losses: LowerLosses): string {
+function fallbackToolName(callId: string, path: string, losses: UpstreamRequestLosses): string {
   losses.record({
     path, kind: "substituted",
     detail: `tool result ${callId} 在历史里找不到对应的调用，functionResponse.name 只能填 'tool'`,
@@ -427,7 +427,7 @@ function fallbackToolName(callId: string, path: string, losses: LowerLosses): st
  * tool 结果 → `functionResponse.response`（一个 JSON struct，不是 content 数组）。
  * 形状照抄实测可用的 antigravity_provider：错误走 `{error}`，图片 base64 塞字段。
  */
-function lowerToolResult(result: IRToolResult, path: string, losses: LowerLosses): Record<string, unknown> {
+function lowerToolResult(result: IRToolResult, path: string, losses: UpstreamRequestLosses): Record<string, unknown> {
   const texts: string[] = [];
   const images: Array<{ media_type: string; data: string }> = [];
   for (const [index, inner] of result.parts.entries()) {
@@ -475,7 +475,7 @@ function lowerContents(request: IRRequest, ctx: LowerContext): GeminiContent[] {
   request.conversation.turns.forEach((turn, turnIndex) => {
     const role: "user" | "model" = turn.role === "assistant" ? "model" : "user";
     const parts = turn.parts.flatMap((part, partIndex) =>
-      lowerPart(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, ctx));
+      writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, ctx));
     if (parts.length === 0) return;
     const previous = contents[contents.length - 1];
     // Gemini 不接受相邻同角色的 content，合并而不是新开一条。
@@ -501,7 +501,7 @@ const MIN_VISIBLE_TOKENS = 4096;
 function resolveThinking(
   reasoning: IRReasoning,
   options: GeminiCloudCodeEgressOptions,
-  losses: LowerLosses,
+  losses: UpstreamRequestLosses,
 ): { config: Record<string, unknown> | null; budget: number } {
   if (reasoning.mode === "disabled") {
     losses.record({
@@ -545,7 +545,7 @@ function resolveThinking(
   return { config, budget };
 }
 
-export function createGeminiCloudCodeEgress(options: GeminiCloudCodeEgressOptions): IREgress {
+export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
@@ -557,8 +557,8 @@ export function createGeminiCloudCodeEgress(options: GeminiCloudCodeEgressOption
   return {
     profile,
 
-    async lower(request: IRRequest): Promise<IRLowerResult> {
-      const losses = new LowerLosses();
+    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
+      const losses = new UpstreamRequestLosses();
       const { conversation, intent } = request;
 
       const [accessToken, project, sessionId] = await Promise.all([
@@ -782,7 +782,7 @@ export function createGeminiCloudCodeEgress(options: GeminiCloudCodeEgressOption
       };
     },
 
-    lift(response: Response): AsyncIterable<IREvent> {
+    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
       return liftGeminiStream(response, options.model);
     },
   };

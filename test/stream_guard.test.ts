@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import {
-  DEFAULT_STREAM_POLICY, guardIRStream, isRetryableResponse, isSemanticOutput, retryDelayMs,
+  DEFAULT_STREAM_POLICY, superviseUpstreamStream, isRetryableResponse, isModelContentEvent, retryDelayMs,
 } from "../src/ir/stream_guard.ts";
 // 生产默认值本身也是契约的一部分：改动它等于改动被真实故障标定过的那组预算。
 import type { IREvent } from "../src/ir/types.ts";
@@ -31,16 +31,16 @@ async function drain(stream: AsyncIterable<IREvent>, limit = 200): Promise<IREve
 
 describe("提交点", () => {
   it("只有真实内容算语义产出 —— messageStart / usage 不算", () => {
-    expect(isSemanticOutput({ kind: "partStart", index: 0, part: { kind: "text", text: "" } })).toBe(true);
-    expect(isSemanticOutput({ kind: "partDelta", index: 0, delta: { kind: "text", text: "x" } })).toBe(true);
+    expect(isModelContentEvent({ kind: "partStart", index: 0, part: { kind: "text", text: "" } })).toBe(true);
+    expect(isModelContentEvent({ kind: "partDelta", index: 0, delta: { kind: "text", text: "x" } })).toBe(true);
     // 上游先回无内容首帧、随后在尾帧拒绝，是实测存在的形态（windsurf 的 permission_denied）。
     // 把首帧当提交，这类拒绝就永远失去换号机会。
-    expect(isSemanticOutput({ kind: "messageStart", model: "m" })).toBe(false);
-    expect(isSemanticOutput({ kind: "usage", usage: { inputTokens: 1, outputTokens: 1 } })).toBe(false);
+    expect(isModelContentEvent({ kind: "messageStart", model: "m" })).toBe(false);
+    expect(isModelContentEvent({ kind: "usage", usage: { inputTokens: 1, outputTokens: 1 } })).toBe(false);
   });
 
   it("首个语义产出之前注入一次 committed，且只注入一次", async () => {
-    const events = await drain(guardIRStream(sourceOf([
+    const events = await drain(superviseUpstreamStream(sourceOf([
       { kind: "messageStart", model: "m" },
       { kind: "partStart", index: 0, part: { kind: "text", text: "" } },
       { kind: "partDelta", index: 0, delta: { kind: "text", text: "hi" } },
@@ -54,7 +54,7 @@ describe("提交点", () => {
 describe("提交前判死（此时还没有字节下发，换号是安全的）", () => {
   it("静默达到 precommitIdleMs → 可重试的 transport error", async () => {
     // 用毫秒级预算跑真实计时器：比例与生产一致（心跳 : 判死 = 1 : 3）。
-    const collected = await drain(guardIRStream(silentSource(), {
+    const collected = await drain(superviseUpstreamStream(silentSource(), {
       precommitTotalMs: 300, precommitIdleMs: 30, postcommitIdleMs: null, heartbeatMs: 10,
     }));
     // 10ms / 20ms 各一次心跳，30ms 到线判死
@@ -65,7 +65,7 @@ describe("提交前判死（此时还没有字节下发，换号是安全的）"
   });
 
   it("总预算先到时同样判死（模型一直在挤心跳但从不产出）", async () => {
-    const collected = await drain(guardIRStream(silentSource(), {
+    const collected = await drain(superviseUpstreamStream(silentSource(), {
       precommitTotalMs: 25, precommitIdleMs: 10_000, postcommitIdleMs: null, heartbeatMs: 10,
     }));
     expect(collected[collected.length - 1]?.kind).toBe("error");
@@ -80,7 +80,7 @@ describe("提交后永不主动掐流", () => {
       await new Promise<never>(() => {});
     }
     // precommit 预算故意设得极短：提交之后它们必须全部失效，否则这条会在 5ms 判死。
-    const collected = await drain(guardIRStream(committedThenSilent(), {
+    const collected = await drain(superviseUpstreamStream(committedThenSilent(), {
       precommitTotalMs: 5, precommitIdleMs: 5, postcommitIdleMs: null, heartbeatMs: 10,
     }), 12);
     expect(collected.slice(0, 2).map((e) => e.kind)).toEqual(["committed", "partDelta"]);
@@ -94,7 +94,7 @@ describe("提交后永不主动掐流", () => {
       yield { kind: "partDelta", index: 0, delta: { kind: "text", text: "start" } };
       await new Promise<never>(() => {});
     }
-    const collected = await drain(guardIRStream(committedThenSilent(), {
+    const collected = await drain(superviseUpstreamStream(committedThenSilent(), {
       precommitTotalMs: 10_000, precommitIdleMs: 10_000, postcommitIdleMs: 30, heartbeatMs: 10,
     }));
     expect(collected[collected.length - 1]?.kind).toBe("error");
@@ -103,7 +103,7 @@ describe("提交后永不主动掐流", () => {
 
 describe("心跳必须计时器驱动", () => {
   it("上游彻底静默时心跳照发 —— 这正是它唯一要顶的场景", async () => {
-    const collected = await drain(guardIRStream(silentSource(), {
+    const collected = await drain(superviseUpstreamStream(silentSource(), {
       precommitTotalMs: 10_000, precommitIdleMs: 10_000, postcommitIdleMs: null, heartbeatMs: 5,
     }), 4);
     expect(collected.every((e) => e.kind === "heartbeat")).toBe(true);

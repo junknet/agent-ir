@@ -8,7 +8,7 @@ import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import {
   clientValue, defaultValue,
   type IRContextEdit, type IRIntent, type IROutputFormat, type IRPart,
-  type IRDecodeResult, type IRReasoning, type IRReasoningDisplay, type IRReasoningMode,
+  type ClientRequestReadResult, type IRReasoning, type IRReasoningDisplay, type IRReasoningMode,
   type IRTool, type IRToolChoice, type IRToolGroup, type IRToolRef, type IRToolset, type IRTurn,
 } from "../ir/types.ts";
 import {
@@ -268,7 +268,7 @@ function decodeContextEdits(body: Record<string, unknown>): IRContextEdit[] {
 
 // ── entry ──────────────────────────────────────────────────────────────────
 
-export function decodeAnthropicMessages(raw: unknown, traceId: string): IRDecodeResult {
+export function readAnthropicMessagesRequest(raw: unknown, traceId: string): ClientRequestReadResult {
   const losses = new LossRecorder();
   if (!isRecord(raw)) throw new TypeError("anthropic messages body must be a JSON object");
   const body = raw;

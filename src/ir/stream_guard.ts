@@ -31,7 +31,7 @@ import type { IREvent } from "./types.ts";
  * 上游先回一个无内容首帧、随后才在尾帧给出拒绝，是实测存在的形态（windsurf 的
  * permission_denied 就是这样到达的）。把首帧当提交会让这类拒绝永远失去换号机会。
  */
-export function isSemanticOutput(event: IREvent): boolean {
+export function isModelContentEvent(event: IREvent): boolean {
   return event.kind === "partStart" || event.kind === "partDelta";
 }
 
@@ -85,7 +85,7 @@ const IDLE = { idle: true } as const;
  * 判死只发生在**提交之前**：超总预算或超静默上限 → yield 一条 retryable 的 transport
  * error 并结束。提交之后永不主动掐流，只发心跳（见文件头的生产实测）。
  */
-export async function* guardIRStream(
+export async function* superviseUpstreamStream(
   source: AsyncIterable<IREvent>,
   policy: IRStreamPolicy = DEFAULT_STREAM_POLICY,
   clock: Clock = REAL_CLOCK,
@@ -143,7 +143,7 @@ export async function* guardIRStream(
       const event = winner.value;
       lastProgressAt = clock.now();
 
-      if (!committed && isSemanticOutput(event)) {
+      if (!committed && isModelContentEvent(event)) {
         committed = true;
         yield { kind: "committed" };
       }

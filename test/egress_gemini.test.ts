@@ -11,10 +11,10 @@
  */
 import { describe, expect, it } from "bun:test";
 import {
-  clearThoughtSignatureCache, createGeminiCloudCodeEgress,
+  clearThoughtSignatureCache, createGeminiCloudCodeUpstream,
 } from "../src/egress/gemini_cloudcode.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
-import { admit } from "../src/ir/admission.ts";
+import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { clientValue, defaultValue } from "../src/ir/types.ts";
 import type {
@@ -23,7 +23,7 @@ import type {
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
-const egress = createGeminiCloudCodeEgress({
+const egress = createGeminiCloudCodeUpstream({
   model: "gemini-3.6-flash-high",
   accessToken: "ya29.test-token",
   project: "default-cli-project",
@@ -199,7 +199,7 @@ describe("能力声明", () => {
   });
 
   it("cacheBreakpoint 走准入必然产出一条 loss（PROTOCOL_REFERENCE §7：agy 不支持 prompt caching）", () => {
-    const verdict = admit(
+    const verdict = checkUpstreamSupport(
       request({
         system: [{ kind: "text", text: "you are a gateway", cacheBreakpoint: { scope: "ephemeral" } }],
         turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
@@ -211,7 +211,7 @@ describe("能力声明", () => {
   });
 
   it("structuredOutput 直接判不可用，并带着精确 IR 路径", () => {
-    const verdict = admit(
+    const verdict = checkUpstreamSupport(
       request({
         turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
         intent: intent({
@@ -251,7 +251,7 @@ describe("lower：IR → v1internal wire", () => {
       choice: clientValue({ kind: "specific", ref: { group: null, name: "glob" } }),
       parallel: clientValue(true),
     };
-    const result = await egress.lower(request({
+    const result = await egress.writeUpstreamRequest(request({
       system: [{ kind: "text", text: "you are a gateway" }, { kind: "text", text: "be terse" }],
       toolset,
       turns: [
@@ -330,7 +330,7 @@ describe("lower：IR → v1internal wire", () => {
       choice: defaultValue({ kind: "auto" }),
       parallel: clientValue(false),
     };
-    const result = await egress.lower(request({
+    const result = await egress.writeUpstreamRequest(request({
       system: [{ kind: "text", text: "sys", cacheBreakpoint: { scope: "ephemeral" } }],
       toolset,
       turns: [
@@ -397,7 +397,7 @@ describe("lower：IR → v1internal wire", () => {
   });
 
   it("effort 在这里换算成 thinkingBudget（IR 不在 ingress 互转），并留痕", async () => {
-    const result = await egress.lower(request({
+    const result = await egress.writeUpstreamRequest(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       intent: intent({ reasoning: clientValue({ mode: "enabled", effort: "high", display: "summarized" }) }),
     }));
@@ -408,7 +408,7 @@ describe("lower：IR → v1internal wire", () => {
   });
 
   it("display:'hidden' 关掉 includeThoughts，不产出 thought part", async () => {
-    const result = await egress.lower(request({
+    const result = await egress.writeUpstreamRequest(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       intent: intent({ reasoning: clientValue({ mode: "enabled", budgetTokens: 1000, display: "hidden" }) }),
     }));
@@ -421,7 +421,7 @@ describe("lower：IR → v1internal wire", () => {
 
 describe("lift：v1internal SSE → IREvent", () => {
   it("正常文本流：思考累加 + 正文累加 + finishReason 终止 + usage", async () => {
-    const events = await collect(egress.lift(sse(REAL_TEXT_STREAM)));
+    const events = await collect(egress.readUpstreamResponse(sse(REAL_TEXT_STREAM)));
     const kinds = events.map((event) => event.kind);
 
     expect(events[0]).toEqual({ kind: "messageStart", model: "gemini-3.6-flash" });
@@ -430,7 +430,7 @@ describe("lift：v1internal SSE → IREvent", () => {
     expect(kinds.filter((kind) => kind === "partEnd")).toHaveLength(2);
     expect(events.at(-1)).toEqual({ kind: "messageStop", reason: "endTurn" });
 
-    const assembled = await assembleResponse(egress.lift(sse(REAL_TEXT_STREAM)), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(REAL_TEXT_STREAM)), "fallback");
     expect(assembled.model).toBe("gemini-3.6-flash");
     expect(assembled.turn.parts).toEqual([
       { kind: "thinking", text: "**Focusing on Precision**\n\n**Analyzing Conflicting Directives**\n\n" },
@@ -444,7 +444,7 @@ describe("lift：v1internal SSE → IREvent", () => {
 
   it("functionCall：args 整包到达，仍要发 toolInputJson delta（chat 流式 encoder 只读 delta）", async () => {
     clearThoughtSignatureCache();
-    const events = await collect(egress.lift(sse(REAL_TOOL_STREAM)));
+    const events = await collect(egress.readUpstreamResponse(sse(REAL_TOOL_STREAM)));
     const start = events.find((event) => event.kind === "partStart");
     expect(start).toEqual({
       kind: "partStart",
@@ -459,7 +459,7 @@ describe("lift：v1internal SSE → IREvent", () => {
     // STOP + 出过工具调用 → toolUse（Gemini 没有独立的 tool_use 终止码，这是推断）
     expect(events.at(-1)).toEqual({ kind: "messageStop", reason: "toolUse" });
 
-    const assembled = await assembleResponse(egress.lift(sse(REAL_TOOL_STREAM)), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(REAL_TOOL_STREAM)), "fallback");
     expect(assembled.turn.parts).toEqual([{
       kind: "toolCall",
       call: {
@@ -473,13 +473,13 @@ describe("lift：v1internal SSE → IREvent", () => {
 
   it("thoughtSignature 记一条 loss（IR 没有承载它的位置），并按 call id 回填到下一轮", async () => {
     clearThoughtSignatureCache();
-    const events = await collect(egress.lift(sse(REAL_TOOL_STREAM)));
+    const events = await collect(egress.readUpstreamResponse(sse(REAL_TOOL_STREAM)));
     const losses = events.filter((event) => event.kind === "loss");
     expect(losses).toHaveLength(1);
     expect(losses[0]).toMatchObject({ kind: "loss", loss: { stage: "lift", kind: "dropped" } });
 
     // 下一轮把同一个 call id 送回来：占位符被真实签名替换，且不再记「没有签名」的 loss
-    const next = await egress.lower(request({
+    const next = await egress.writeUpstreamRequest(request({
       turns: [
         { role: "user", parts: [{ kind: "text", text: "list" }] },
         { role: "assistant", parts: [{ kind: "toolCall", call: { id: "cKU4A4Y3", toolRef: { group: null, name: "glob" }, input: { kind: "json", value: {} } } }] },
@@ -491,7 +491,7 @@ describe("lift：v1internal SSE → IREvent", () => {
   });
 
   it("未知 chunk 形态 → unhandled，不静默吞掉", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { response: { somethingBrandNew: 1 }, traceId: "t" },
       "not json at all",
       REAL_TEXT_STREAM[4],
@@ -502,7 +502,7 @@ describe("lift：v1internal SSE → IREvent", () => {
   });
 
   it("未知 part 形态（inlineData 等新增输出）→ unhandled，rawType 带键集", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       {
         response: {
           candidates: [{
@@ -520,7 +520,7 @@ describe("lift：v1internal SSE → IREvent", () => {
   });
 
   it("多 candidate → loss（IR 的响应只有一个回合）", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       {
         response: {
           candidates: [
@@ -533,7 +533,7 @@ describe("lift：v1internal SSE → IREvent", () => {
       },
     ])));
     expect(events.some((event) => event.kind === "loss" && event.loss.path === "$.response.candidates")).toBe(true);
-    const assembled = await assembleResponse(egress.lift(sse([
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
       {
         response: {
           candidates: [
@@ -550,7 +550,7 @@ describe("lift：v1internal SSE → IREvent", () => {
 
   it("流结束却没等到任何 finishReason → error，不是安静的空成功", async () => {
     const truncated = REAL_TEXT_STREAM.slice(0, 3);
-    const events = await collect(egress.lift(sse(truncated)));
+    const events = await collect(egress.readUpstreamResponse(sse(truncated)));
     expect(events.at(-1)).toEqual({
       kind: "error",
       error: {
@@ -561,7 +561,7 @@ describe("lift：v1internal SSE → IREvent", () => {
     });
     expect(events.some((event) => event.kind === "messageStop")).toBe(false);
 
-    const assembled = await assembleResponse(egress.lift(sse(truncated)), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(truncated)), "fallback");
     expect(assembled.stopReason).toBeNull();
     expect(assembled.error?.kind).toBe("transport");
     // 内容还在，但结局是 error —— 调用方分得清截断与真结束
@@ -576,15 +576,15 @@ describe("lift：v1internal SSE → IREvent", () => {
         modelVersion: "gemini-default",
       },
     });
-    expect((await collect(egress.lift(sse([chunk("MAX_TOKENS")])))).at(-1)).toEqual({ kind: "messageStop", reason: "maxTokens" });
-    expect((await collect(egress.lift(sse([chunk("SAFETY")])))).at(-1)).toEqual({ kind: "messageStop", reason: "refusal" });
+    expect((await collect(egress.readUpstreamResponse(sse([chunk("MAX_TOKENS")])))).at(-1)).toEqual({ kind: "messageStop", reason: "maxTokens" });
+    expect((await collect(egress.readUpstreamResponse(sse([chunk("SAFETY")])))).at(-1)).toEqual({ kind: "messageStop", reason: "refusal" });
     // 工具调用写坏了：既没有合法 functionCall 也没有正文，报成 endTurn 会变成静默空回合
-    const malformed = (await collect(egress.lift(sse([chunk("MALFORMED_FUNCTION_CALL")])))).at(-1);
+    const malformed = (await collect(egress.readUpstreamResponse(sse([chunk("MALFORMED_FUNCTION_CALL")])))).at(-1);
     expect(malformed).toMatchObject({ kind: "error", error: { kind: "unknown", retryable: true } });
   });
 
   it("promptFeedback.blockReason → contentPolicy 且不可重试", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { response: { promptFeedback: { blockReason: "SAFETY" }, usageMetadata: { promptTokenCount: 12, totalTokenCount: 12 }, modelVersion: "gemini-3.6-flash" } },
     ])));
     expect(events.at(-1)).toMatchObject({ kind: "error", error: { kind: "contentPolicy", retryable: false } });
@@ -608,14 +608,14 @@ describe("lift：v1internal SSE → IREvent", () => {
       [google(504, "DEADLINE_EXCEEDED", "Deadline expired before operation could complete."), "upstreamUnavailable", true],
     ];
     for (const [response, kind, retryable] of cases) {
-      const events = await collect(egress.lift(response));
+      const events = await collect(egress.readUpstreamResponse(response));
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({ kind: "error", error: { kind, retryable } });
     }
   });
 
   it("流中直接塞 `{error}` 的 200 也要变成 error", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       REAL_TEXT_STREAM[2],
       { error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" } },
     ])));
@@ -631,7 +631,7 @@ describe("lift：v1internal SSE → IREvent", () => {
       REAL_TEXT_STREAM.map((chunk) => `data: ${JSON.stringify(chunk)}\r\n\r\n`).join(""),
       { status: 200, headers: { "content-type": "text/event-stream" } },
     );
-    const assembled = await assembleResponse(egress.lift(crlf), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(crlf), "fallback");
     expect(assembled.unhandled).toEqual([]);
     expect(assembled.stopReason).toBe("endTurn");
     expect(assembled.turn.parts.at(-1)).toEqual({ kind: "text", text: "OK喵" });
@@ -649,7 +649,7 @@ describe("lift：v1internal SSE → IREvent", () => {
       },
     });
     const assembled = await assembleResponse(
-      egress.lift(new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })),
+      egress.readUpstreamResponse(new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })),
       "fallback",
     );
     expect(assembled.unhandled).toEqual([]);
@@ -657,7 +657,7 @@ describe("lift：v1internal SSE → IREvent", () => {
   });
 
   it("非 SSE 的一次性 JSON 走同一条 chunk 处理，不长出第二条解析路径", async () => {
-    const events = await collect(egress.lift(new Response(JSON.stringify(REAL_TOOL_STREAM[1]), {
+    const events = await collect(egress.readUpstreamResponse(new Response(JSON.stringify(REAL_TOOL_STREAM[1]), {
       status: 200, headers: { "content-type": "application/json" },
     })));
     expect(events[0]).toMatchObject({ kind: "messageStart" });

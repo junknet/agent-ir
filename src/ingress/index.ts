@@ -1,15 +1,15 @@
-/** ingress 注册表：协议 → decode。新增协议只在这里落地一次。 */
-import type { IRDecodeResult, IRProtocol } from "../ir/types.ts";
-import { decodeAnthropicMessages } from "./anthropic_messages.ts";
-import { decodeOpenAIChatCompletions } from "./openai_chat_completions.ts";
-import { decodeOpenAIResponses } from "./openai_responses.ts";
+/** 入口注册表：协议 → 读入函数。新增协议只在这里落地一次。 */
+import type { ClientRequestReadResult, IRProtocol } from "../ir/types.ts";
+import { readAnthropicMessagesRequest } from "./anthropic_messages.ts";
+import { readChatCompletionsRequest } from "./openai_chat_completions.ts";
+import { readResponsesRequest } from "./openai_responses.ts";
 
-export type IRDecoder = (raw: unknown, traceId: string) => IRDecodeResult;
+export type ClientRequestReader = (raw: unknown, traceId: string) => ClientRequestReadResult;
 
-export const INGRESS_DECODERS: Readonly<Record<IRProtocol, IRDecoder>> = {
-  anthropic_messages: decodeAnthropicMessages,
-  openai_responses: decodeOpenAIResponses,
-  openai_chat_completions: decodeOpenAIChatCompletions,
+export const CLIENT_REQUEST_READERS: Readonly<Record<IRProtocol, ClientRequestReader>> = {
+  anthropic_messages: readAnthropicMessagesRequest,
+  openai_responses: readResponsesRequest,
+  openai_chat_completions: readChatCompletionsRequest,
 };
 
 export const INGRESS_PATHS: Readonly<Record<string, IRProtocol>> = {
@@ -18,8 +18,8 @@ export const INGRESS_PATHS: Readonly<Record<string, IRProtocol>> = {
   "/v1/chat/completions": "openai_chat_completions",
 };
 
-export function decodeForProtocol(protocol: IRProtocol, raw: unknown, traceId: string): IRDecodeResult {
-  return INGRESS_DECODERS[protocol](raw, traceId);
+export function readClientRequestForProtocol(protocol: IRProtocol, raw: unknown, traceId: string): ClientRequestReadResult {
+  return CLIENT_REQUEST_READERS[protocol](raw, traceId);
 }
 
-export { decodeAnthropicMessages, decodeOpenAIChatCompletions, decodeOpenAIResponses };
+export { readAnthropicMessagesRequest, readChatCompletionsRequest, readResponsesRequest };

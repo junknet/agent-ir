@@ -10,13 +10,13 @@
  */
 import type { IRCapabilityNeed, IREgressProfile, IRLoss, IRRequest } from "./types.ts";
 
-export interface AdmissionVerdict {
+export interface UpstreamSupportCheck {
   readonly admitted: boolean;
   readonly unsupported: readonly IRCapabilityNeed[];
   readonly losses: readonly IRLoss[];
 }
 
-export function admit(request: IRRequest, profile: IREgressProfile): AdmissionVerdict {
+export function checkUpstreamSupport(request: IRRequest, profile: IREgressProfile): UpstreamSupportCheck {
   const unsupported: IRCapabilityNeed[] = [];
   const losses: IRLoss[] = [];
   for (const need of request.requires) {
@@ -36,7 +36,7 @@ export function admit(request: IRRequest, profile: IREgressProfile): AdmissionVe
   return { admitted: unsupported.length === 0, unsupported, losses };
 }
 
-export function describeUnsupported(unsupported: readonly IRCapabilityNeed[]): string {
+export function describeUnsupportedCapabilities(unsupported: readonly IRCapabilityNeed[]): string {
   return unsupported
     .map((need) => `${need.capability} (${need.paths.slice(0, 3).join(", ")})`)
     .join("; ");

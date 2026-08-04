@@ -18,7 +18,7 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRLowerResult, IRPart,
+  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart,
   IRRequest, IRStopReason, IRToolResult, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -72,7 +72,7 @@ const LOSSY = new Set([
 //   toolResultImage   tool 消息只能是文本。把图片提到后续 user 消息里会改变「谁说的话」
 //                     并破坏 id 关联，写成占位文本则像素全丢 —— 两种都不是承载。
 
-export interface OpenAIChatEgressOptions {
+export interface ChatCompletionsUpstreamOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
@@ -82,7 +82,7 @@ export interface OpenAIChatEgressOptions {
 
 // ── lower ──────────────────────────────────────────────────────────────────
 
-class LowerLosses {
+class UpstreamRequestLosses {
   readonly #losses: IRLoss[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
@@ -100,7 +100,7 @@ function flatToolName(group: string | null, name: string): string {
 }
 
 /** 缓存断点在 Chat 上无处安放。每个带断点的 part 各记一条，路径指到具体位置。 */
-function noteCacheBreakpoint(part: IRPart, path: string, losses: LowerLosses): void {
+function noteCacheBreakpoint(part: IRPart, path: string, losses: UpstreamRequestLosses): void {
   if (part.cacheBreakpoint === undefined) return;
   losses.record({
     path: `${path}.cacheBreakpoint`, kind: "dropped",
@@ -115,7 +115,7 @@ function imageUrl(part: Extract<IRPart, { kind: "image" }>): string {
 }
 
 /** system 只能是文本。多个 part 之间用换行拼接，非文本 part 各记一条 loss。 */
-function lowerSystem(parts: readonly IRPart[], losses: LowerLosses): string {
+function lowerSystem(parts: readonly IRPart[], losses: UpstreamRequestLosses): string {
   const chunks: string[] = [];
   parts.forEach((part, index) => {
     const path = `$.conversation.system[${index}]`;
@@ -135,7 +135,7 @@ type ChatContent = string | Array<Record<string, unknown>>;
  * user 回合的内容。只要出现非文本元素就切成数组形态，否则保持字符串
  * —— 兼容端点对字符串 content 的支持面最广，能不用数组就不用。
  */
-function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: LowerLosses): ChatContent {
+function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: UpstreamRequestLosses): ChatContent {
   const blocks: Array<Record<string, unknown>> = [];
   let structured = false;
   parts.forEach((part, index) => {
@@ -199,7 +199,7 @@ interface AssistantMessage {
   readonly callIds: string[];
 }
 
-function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: LowerLosses): AssistantMessage {
+function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: UpstreamRequestLosses): AssistantMessage {
   const texts: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
   const callIds: string[] = [];
@@ -279,7 +279,7 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: Lowe
 }
 
 /** tool 消息只吃文本：图片没了，错误状态只能写进正文。 */
-function lowerToolResultContent(result: IRToolResult, path: string, losses: LowerLosses): string {
+function lowerToolResultContent(result: IRToolResult, path: string, losses: UpstreamRequestLosses): string {
   const texts: string[] = [];
   result.parts.forEach((part, index) => {
     const partPath = `${path}.result.parts[${index}]`;
@@ -327,7 +327,7 @@ function lowerToolResultContent(result: IRToolResult, path: string, losses: Lowe
  */
 function arrangeMessages(
   turns: readonly IRTurn[],
-  losses: LowerLosses,
+  losses: UpstreamRequestLosses,
 ): Array<Record<string, unknown>> {
   const resultsByCallId = new Map<string, { part: Extract<IRPart, { kind: "toolResult" }>; path: string }>();
   const stripped = turns.map((turn, turnIndex) => ({
@@ -405,7 +405,7 @@ function effortFromBudget(budgetTokens: number): string {
   return budgetTokens <= 1024 ? "low" : budgetTokens <= 4096 ? "medium" : "high";
 }
 
-export function createOpenAIChatEgress(options: OpenAIChatEgressOptions): IREgress {
+export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
@@ -415,8 +415,8 @@ export function createOpenAIChatEgress(options: OpenAIChatEgressOptions): IREgre
   return {
     profile,
 
-    async lower(request: IRRequest): Promise<IRLowerResult> {
-      const losses = new LowerLosses();
+    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
+      const losses = new UpstreamRequestLosses();
       const { conversation, intent } = request;
 
       const messages: Array<Record<string, unknown>> = [];
@@ -591,7 +591,7 @@ export function createOpenAIChatEgress(options: OpenAIChatEgressOptions): IREgre
       };
     },
 
-    lift(response: Response): AsyncIterable<IREvent> {
+    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
       return liftOpenAIChatStream(response);
     },
   };

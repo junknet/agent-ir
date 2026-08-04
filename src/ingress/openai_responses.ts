@@ -12,7 +12,7 @@
 import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import {
   clientValue, defaultValue,
-  type IRDecodeResult, type IRIntent, type IROutputFormat, type IRPart,
+  type ClientRequestReadResult, type IRIntent, type IROutputFormat, type IRPart,
   type IRReasoning, type IRReasoningDisplay, type IRTool, type IRToolChoice, type IRToolGroup,
   type IRToolRef, type IRToolset, type IRTurn,
 } from "../ir/types.ts";
@@ -274,7 +274,7 @@ function decodeOutputFormat(body: Record<string, unknown>, losses: LossRecorder)
   return { kind: "text" };
 }
 
-export function decodeOpenAIResponses(raw: unknown, traceId: string): IRDecodeResult {
+export function readResponsesRequest(raw: unknown, traceId: string): ClientRequestReadResult {
   const losses = new LossRecorder();
   if (!isRecord(raw)) throw new TypeError("responses body must be a JSON object");
   const body = raw;

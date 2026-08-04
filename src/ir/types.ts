@@ -399,7 +399,7 @@ export type IRPartDelta =
 // 契约
 // ═══════════════════════════════════════════════════════════════════════════
 
-export interface IRDecodeResult {
+export interface ClientRequestReadResult {
   readonly request: IRRequest;
   readonly losses: readonly IRLoss[];
 }
@@ -411,13 +411,13 @@ export interface IRWireRequest {
   readonly body: string;
 }
 
-export interface IRLowerResult {
+export interface UpstreamRequestBuildResult {
   readonly wire: IRWireRequest;
   readonly losses: readonly IRLoss[];
 }
 
 export interface IREgress {
   readonly profile: IREgressProfile;
-  lower(request: IRRequest): Promise<IRLowerResult>;
-  lift(response: Response): AsyncIterable<IREvent>;
+  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult>;
+  readUpstreamResponse(response: Response): AsyncIterable<IREvent>;
 }

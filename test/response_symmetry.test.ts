@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { assembleResponse, asResponsePart } from "../src/ir/response.ts";
-import { decodeAnthropicMessages } from "../src/ingress/index.ts";
+import { readAnthropicMessagesRequest } from "../src/ingress/index.ts";
 import type { IREvent, IRPart, IRTurn } from "../src/ir/types.ts";
 
 async function* streamOf(events: readonly IREvent[]): AsyncGenerator<IREvent> {
@@ -132,7 +132,7 @@ describe("闭环：响应回合直接接回下一轮请求", () => {
     const assembled = await assembleResponse(streamOf(TYPICAL_STREAM), "m");
 
     // 同一段助手产出，改从 Anthropic wire 走一遍 decode。
-    const viaWire = decodeAnthropicMessages({
+    const viaWire = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{
         role: "assistant",

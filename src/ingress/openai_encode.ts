@@ -166,7 +166,7 @@ function flattenForOpenAI(assembled: IRResponse): {
 
 // ── Chat Completions ───────────────────────────────────────────────────────
 
-export function encodeChatCompletionsResponse(
+export function writeChatCompletionsResponse(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Response | Promise<Response> {
   return request.intent.stream.value
@@ -289,12 +289,12 @@ async function encodeChatAggregate(
 
 // ── Responses ──────────────────────────────────────────────────────────────
 
-export function encodeResponsesResponse(
+export function writeResponsesResponse(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Response | Promise<Response> {
   return request.intent.stream.value
-    ? encodeResponsesStream(events, request, options)
-    : encodeResponsesAggregate(events, request, options);
+    ? writeClientResponsesStream(events, request, options)
+    : writeClientResponsesAggregate(events, request, options);
 }
 
 function responsesOutput(assembled: IRResponse): Array<Record<string, unknown>> {
@@ -327,7 +327,7 @@ function responsesEnvelope(
   };
 }
 
-function encodeResponsesStream(events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions): Response {
+function writeClientResponsesStream(events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -378,7 +378,7 @@ function encodeResponsesStream(events: AsyncIterable<IREvent>, request: IRReques
   });
 }
 
-async function encodeResponsesAggregate(
+async function writeClientResponsesAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
   const assembled = await assembleResponse(events, request.model);

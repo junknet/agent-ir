@@ -133,7 +133,7 @@ export function parseSessionIdentity(metadata: unknown): IRSessionIdentity {
  * 合并相邻同角色回合。
  *
  * OpenAI 侧一次并行工具调用会产生连续多条 `role:'tool'` 消息（语料 2355 条 tool 消息 /
- * 202 次并行），不合并就会在 lower 回 Anthropic 时变成多条 user 消息，被判成「漏了结果」。
+ * 202 次并行），不合并就会在 写出到 Anthropic 时变成多条 user 消息，被判成「漏了结果」。
  * 合并放在 IR 构建的最后一步，三个入口共用，不在各自 decode 里各修一次。
  */
 export function mergeAdjacentTurns(turns: readonly IRTurn[]): IRTurn[] {
@@ -156,7 +156,7 @@ export function mergeAdjacentTurns(turns: readonly IRTurn[]): IRTurn[] {
  *  - 先合并，让「空回合紧邻同角色回合」被无损吸收，不产生假的 loss；
  *  - 再丢掉真正孤立的空回合（它们被每个上游拒收）；
  *  - **必须再合并一次**：丢掉中间那个异角色空回合后，两侧会变成相邻同角色。
- *    少了这一步，IR 里会留下相邻同角色回合，lower 回 Anthropic 就是连续两条 user 消息。
+ *    少了这一步，IR 里会留下相邻同角色回合，写出到 Anthropic 就是连续两条 user 消息。
  *
  * 出参不变量：不存在相邻同角色回合，且没有空回合。
  */

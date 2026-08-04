@@ -3,11 +3,11 @@
 多协议 LLM 网关的协议中立 IR。三个入口协议 → 一个 IR → 任意出口。
 
 ```
-POST /v1/messages          ┐                    ┌ anthropic
-POST /v1/responses         ┼─ decode ─► IR ─ lower ─┼ (下一个出口在这里加)
-POST /v1/chat/completions  ┘         ▲          └
-                                     │
-                            lift ◄───┴─ AsyncIterable<IREvent>
+POST /v1/messages          ┐                                    ┌ anthropic
+POST /v1/responses         ┼─ readClientRequest ─► IR ─ writeUpstreamRequest ─┼ (下一个上游在这里加)
+POST /v1/chat/completions  ┘                        ▲                        └
+                                                    │
+                          writeClientResponse ◄─────┴─ readUpstreamResponse
 ```
 
 不是又一个「以某家 wire 格式当 IR」的网关。设计依据是**真实流量**，每条结构决策都能追到具体证据。
@@ -141,12 +141,12 @@ codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍�
 interface IREgress {
   readonly profile: IREgressProfile;              // supports / lossy 静态声明
   lower(request: IRRequest): Promise<IRLowerResult>;   // IR → wire + losses
-  lift(response: Response): AsyncIterable<IREvent>;    // wire → IR 事件流
+  readUpstreamResponse(response): AsyncIterable<IREvent>;              // 上游响应 → IR 事件流
 }
 ```
 
 两条硬要求：
 
-1. `lift` 的 switch **必须有 default 产出 `{kind:'unhandled'}`**。上游协议漂移要能自己冒头，
+1. `readUpstreamResponse` 的 switch **必须有 default 产出 `{kind:'unhandled'}`**。上游协议漂移要能自己冒头，
    不能等故障反推。
 2. 任何丢弃/降级/替换都要 `IRLoss`。「这个字段这个上游不支持」是设计信息，不是可以省略的细节。

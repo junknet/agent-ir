@@ -23,7 +23,7 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRLowerResult, IRPart, IRReasoningDisplay,
+  IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
   IRRequest, IRStopReason, IRTool, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -63,7 +63,7 @@ const LOSSY = new Set([
   "cacheBreakpoint", "contextEdit", "stopSequences", "topK",
 ] as const);
 
-export interface OpenAIResponsesEgressOptions {
+export interface ResponsesUpstreamOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
@@ -71,7 +71,7 @@ export interface OpenAIResponsesEgressOptions {
   readonly extraHeaders?: Readonly<Record<string, string>>;
 }
 
-class LowerLosses {
+class UpstreamRequestLosses {
   readonly #losses: IRLoss[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
@@ -107,7 +107,7 @@ type CallKind = "function" | "custom";
  * `role` 参与判定：assistant 的 content 只接受 `output_text`，图片之类只能出现在输入侧。
  */
 function lowerContentPart(
-  part: IRPart, role: "user" | "assistant" | "developer", path: string, losses: LowerLosses,
+  part: IRPart, role: "user" | "assistant" | "developer", path: string, losses: UpstreamRequestLosses,
 ): WireItem | null {
   switch (part.kind) {
     case "text":
@@ -152,7 +152,7 @@ function lowerContentPart(
 
 /** 工具结果 parts → 输出 item 的 `output`。实测形态：字符串，或 `input_text` 数组。 */
 function lowerToolOutput(
-  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, losses: LowerLosses,
+  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, losses: UpstreamRequestLosses,
 ): Array<WireItem> {
   const blocks: WireItem[] = [];
   parts.forEach((part, index) => {
@@ -187,7 +187,7 @@ function lowerToolOutput(
   return blocks;
 }
 
-function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, losses: LowerLosses): WireItem {
+function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, losses: UpstreamRequestLosses): WireItem {
   const { call } = part;
   if (call.input.kind === "text") {
     // freeform 的原生形态。实测 custom_tool_call 的键集是 {type,id,status,call_id,name,input}，
@@ -219,7 +219,7 @@ function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: st
  * summary-only 的形状从未在真实报文里出现过，赌它能过等于赌整条请求。跨协议进来的
  * Anthropic 签名思考正好落在这一支，丢弃并留痕（codex_provider 的做法也是整段不译）。
  */
-function lowerReasoningRun(run: readonly IRPart[], path: string, losses: LowerLosses): WireItem | null {
+function lowerReasoningRun(run: readonly IRPart[], path: string, losses: UpstreamRequestLosses): WireItem | null {
   const summary: WireItem[] = [];
   let encrypted: string | null = null;
   for (const part of run) {
@@ -250,7 +250,7 @@ interface LoweredConversation {
   readonly items: readonly WireItem[];
 }
 
-function lowerConversation(request: IRRequest, losses: LowerLosses): LoweredConversation {
+function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): LoweredConversation {
   const { conversation } = request;
   const items: WireItem[] = [];
   const callKinds = new Map<string, CallKind>();
@@ -347,7 +347,7 @@ function lowerConversation(request: IRRequest, losses: LowerLosses): LoweredConv
  * 与 Anthropic 出口的区别在于这里**不重排位置**：Responses 的 item 序列没有「结果必须紧邻
  * 且最前」那套排列规则，IR 的顺序直接就是合法顺序，只需要补洞和去孤儿。
  */
-function reconcileToolItems(items: readonly WireItem[], losses: LowerLosses): WireItem[] {
+function reconcileToolItems(items: readonly WireItem[], losses: UpstreamRequestLosses): WireItem[] {
   const isCall = (item: WireItem): boolean => item.type === "function_call" || item.type === "custom_tool_call";
   const isOutput = (item: WireItem): boolean =>
     item.type === "function_call_output" || item.type === "custom_tool_call_output";
@@ -388,7 +388,7 @@ function reconcileToolItems(items: readonly WireItem[], losses: LowerLosses): Wi
   return out;
 }
 
-function lowerTools(request: IRRequest, losses: LowerLosses): WireItem[] {
+function lowerTools(request: IRRequest, losses: UpstreamRequestLosses): WireItem[] {
   const { toolset } = request.conversation;
 
   const lowerOne = (tool: IRTool, index: number): WireItem => {
@@ -462,7 +462,7 @@ const SUMMARY_WIRE: Readonly<Record<IRReasoningDisplay, string | null>> = {
   hidden: null, summarized: "auto", full: "detailed",
 };
 
-function lowerReasoningConfig(request: IRRequest, losses: LowerLosses): Record<string, unknown> | null {
+function lowerReasoningConfig(request: IRRequest, losses: UpstreamRequestLosses): Record<string, unknown> | null {
   const reasoning = request.intent.reasoning.value;
   if (reasoning.mode === "disabled") {
     losses.record({
@@ -507,7 +507,7 @@ function lowerReasoningConfig(request: IRRequest, losses: LowerLosses): Record<s
   return Object.keys(config).length === 0 ? null : config;
 }
 
-export function createOpenAIResponsesEgress(options: OpenAIResponsesEgressOptions): IREgress {
+export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
@@ -517,8 +517,8 @@ export function createOpenAIResponsesEgress(options: OpenAIResponsesEgressOption
   return {
     profile,
 
-    async lower(request: IRRequest): Promise<IRLowerResult> {
-      const losses = new LowerLosses();
+    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
+      const losses = new UpstreamRequestLosses();
       const { conversation, intent } = request;
       const { instructions, items } = lowerConversation(request, losses);
       const tools = lowerTools(request, losses);
@@ -603,7 +603,7 @@ export function createOpenAIResponsesEgress(options: OpenAIResponsesEgressOption
       };
     },
 
-    lift(response: Response): AsyncIterable<IREvent> {
+    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
       return liftResponsesStream(response);
     },
   };

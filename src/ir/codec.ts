@@ -6,21 +6,21 @@
  * 客户端协议，它们**只能当出口**；Anthropic Messages 恰好两边都是，那是巧合（它既是客户端
  * 协议又是上游 API），不是结构规律。
  *
- *   inbox   封闭集，锁定三个        decode + encode        写完永不再长
- *   outbox  开放集，3 + n           lower  + lift          每加一家只付两个函数
+ *   inbox   封闭集，锁定三个   readClientRequest + writeClientResponse      写完永不再长
+ *   outbox  开放集，3 + n      writeUpstreamRequest + readUpstreamResponse  每加一家只付两个
  *
  * 于是路由数是 `3 × (3+n)`，不是 `N²`；而**新增一个上游的边际成本恒定是两个函数**，
  * 它换来的是「全部三个入口都能路由到它」。这是这套 IR 的全部经济意义：
  * 客户端协议的组合爆炸被入口侧一次性吸收，上游侧只按线性付费。
  */
-import type { IRDecodeResult, IREgress, IREvent, IRProtocol, IRRequest } from "./types.ts";
+import type { ClientRequestReadResult, IREgress, IREvent, IRProtocol, IRRequest } from "./types.ts";
 import type { EncodeOptions } from "../ingress/shared.ts";
 
 // ── 入口：封闭集 ────────────────────────────────────────────────────────────
 
-export type IRRequestDecoder = (raw: unknown, traceId: string) => IRDecodeResult;
+export type ClientRequestReader = (raw: unknown, traceId: string) => ClientRequestReadResult;
 
-export type IRResponseEncoder = (
+export type ClientResponseWriter = (
   events: AsyncIterable<IREvent>,
   request: IRRequest,
   options: EncodeOptions,
@@ -32,8 +32,8 @@ export type IRResponseEncoder = (
  */
 export interface IRIngressCodec {
   readonly protocol: IRProtocol;
-  readonly decodeRequest: IRRequestDecoder;
-  readonly encodeResponse: IRResponseEncoder;
+  readonly readClientRequest: ClientRequestReader;
+  readonly writeClientResponse: ClientResponseWriter;
 }
 
 /** 键必须覆盖全部三个协议，缺一个编译期报错。 */

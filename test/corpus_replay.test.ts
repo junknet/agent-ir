@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { decodeForProtocol } from "../src/ingress/index.ts";
+import { readClientRequestForProtocol } from "../src/ingress/index.ts";
 import type { IRPart, IRProtocol, IRRequest } from "../src/ir/types.ts";
 
 const CORPUS_PATH = new URL("../.corpus/requests.ndjson", import.meta.url).pathname;
@@ -51,7 +51,7 @@ describe("corpus replay", () => {
     const failures: Array<{ traceId: string; error: string }> = [];
     for (const entry of corpus) {
       try {
-        decodeForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+        readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       } catch (error) {
         failures.push({ traceId: entry.traceId, error: error instanceof Error ? error.message : String(error) });
       }
@@ -64,7 +64,7 @@ describe("corpus replay", () => {
     let opaque = 0;
     const tags = new Map<string, number>();
     for (const entry of corpus) {
-      const { request } = decodeForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       for (const part of allParts(request)) {
         parts += 1;
         if (part.kind !== "opaque") continue;
@@ -82,7 +82,7 @@ describe("corpus replay", () => {
   it.skipIf(corpus.length === 0)("every recorded loss is one of the intended kinds", () => {
     const details = new Map<string, number>();
     for (const entry of corpus) {
-      const { losses } = decodeForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      const { losses } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       for (const loss of losses) {
         expect(loss.stage).toBe("ingress");
         expect(["dropped", "degraded", "substituted", "truncated"]).toContain(loss.kind);
@@ -97,7 +97,7 @@ describe("corpus replay", () => {
     let results = 0;
     let orphans = 0;
     for (const entry of corpus) {
-      const { request } = decodeForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       const declared = new Set<string>();
       for (const part of allParts(request)) {
         if (part.kind === "toolCall") { declared.add(part.call.id); calls += 1; }
@@ -116,7 +116,7 @@ describe("corpus replay", () => {
 
   it.skipIf(corpus.length === 0)("derives capability needs for every request", () => {
     for (const entry of corpus) {
-      const { request } = decodeForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       expect(request.requires.length).toBeGreaterThan(0);
       for (const need of request.requires) expect(need.paths.length).toBeGreaterThan(0);
     }

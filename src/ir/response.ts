@@ -60,7 +60,7 @@ function finalizePart(pending: PendingPart): IRResponsePart | null {
       } catch { /* 落到下面的 freeform 分支 */ }
       return { ...part, call: { ...part.call, input: { kind: "text", text: toolInputBuffer } } };
     }
-    // image / document / toolResult / opaque 不属于模型的产出。走到这里说明某个 lift
+    // image / document / toolResult / opaque 不属于模型的产出。走到这里说明某个 readUpstreamResponse
     // 映射错了；在唯一的折叠点丢弃并留痕，好过让每个 encoder 各自 return null。
     case "image":
     case "document":

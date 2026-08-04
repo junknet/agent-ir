@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import {
-  decodeAnthropicMessages, decodeOpenAIChatCompletions, decodeOpenAIResponses,
+  readAnthropicMessagesRequest, readChatCompletionsRequest, readResponsesRequest,
 } from "../src/ingress/index.ts";
 import type { IRPart, IRRequest } from "../src/ir/types.ts";
 
@@ -25,7 +25,7 @@ function capabilities(request: IRRequest): string[] {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("anthropic messages ingress", () => {
   it("归位 messages 里的 role:'system'（语料 1537 次）到 conversation.system", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       system: "top-level",
       messages: [
@@ -41,9 +41,9 @@ describe("anthropic messages ingress", () => {
   });
 
   it("system 的 string 形态（语料 148 次）与 array 形态（420 次）产出同一种 IR", () => {
-    const fromString = decodeAnthropicMessages(
+    const fromString = readAnthropicMessagesRequest(
       { model: "m", max_tokens: 8, system: "abc", messages: [{ role: "user", content: "x" }] }, TRACE);
-    const fromArray = decodeAnthropicMessages(
+    const fromArray = readAnthropicMessagesRequest(
       { model: "m", max_tokens: 8, system: [{ type: "text", text: "abc" }], messages: [{ role: "user", content: "x" }] }, TRACE);
     expect(fromString.request.conversation.system).toEqual(fromArray.request.conversation.system);
   });
@@ -52,7 +52,7 @@ describe("anthropic messages ingress", () => {
     const uses = Array.from({ length: 9 }, (_, i) => ({
       type: "tool_use", id: `toolu_${i}`, name: "Bash", input: { command: `echo ${i}` },
     }));
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "user", content: "go" },
@@ -66,7 +66,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("tool_result 的三种 content 形态：string / 数组 / 含图片（语料 13530 / 625 / 94）", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "assistant", content: [
@@ -91,7 +91,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("is_error=true（语料 709 次）落成 status='error'，是一等状态不是异常", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "a", name: "T", input: {} }] },
@@ -104,7 +104,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("type:'custom' 的工具带 input_schema 时保留 schema —— 当 freeform 会丢掉整个参数契约", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       tools: [
         { type: "custom", name: "bash", description: "run", input_schema: { type: "object", properties: { command: { type: "string" } } } },
@@ -118,7 +118,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("computer_20251124 这类内建工具落成 builtin 并保留配置", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       tools: [{ type: "computer_20251124", name: "computer", display_width_px: 1280, display_height_px: 720, display_number: 1 }],
     }, TRACE);
@@ -128,7 +128,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("tool_use.caller 是对象 {type:'direct'}，按字符串读会整个丢掉", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{ role: "assistant", content: [{ type: "tool_use", id: "a", name: "Bash", input: {}, caller: { type: "direct" } }] }],
     }, TRACE);
@@ -137,7 +137,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("thinking adaptive + output_config.effort 共存时两个维度都留下（正交，不是互斥）", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       thinking: { type: "adaptive", display: "summarized" },
       output_config: { effort: "high" },
@@ -150,7 +150,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("output_config.format 的 json_schema 落成结构化输出需求", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } } },
     }, TRACE);
@@ -159,7 +159,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("context_management.edits 保留原始指令供能表达它的出口还原", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
     }, TRACE);
@@ -170,7 +170,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("cache_control 在五个位置都识别成 part 级断点", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
       messages: [
@@ -186,7 +186,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("metadata.user_id 里的 JSON 会话身份被解析出来（Claude Code 形态）", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       metadata: { user_id: JSON.stringify({ device_id: "d1", account_uuid: "", session_id: "s1" }) },
     }, TRACE);
@@ -194,7 +194,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("metadata.user_id 不是 JSON 时不报错，只是没有身份", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: "x" }],
       metadata: { user_id: "plain-user" },
     }, TRACE);
@@ -202,7 +202,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("不认识的内容块装箱成 opaque 而不是丢掉，并记一条 degraded", () => {
-    const { request, losses } = decodeAnthropicMessages({
+    const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{ role: "user", content: [{ type: "future_block_2027", payload: 42 }] }],
     }, TRACE);
@@ -213,7 +213,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("相邻同角色的空回合被合并吸收，**不**记 loss —— 它确实什么都没丢", () => {
-    const { request, losses } = decodeAnthropicMessages({
+    const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{ role: "user", content: "" }, { role: "user", content: "real" }],
     }, TRACE);
@@ -223,7 +223,7 @@ describe("anthropic messages ingress", () => {
   });
 
   it("孤立的空回合被丢掉并留痕 —— 空 content 是每个上游都拒收的形状", () => {
-    const { request, losses } = decodeAnthropicMessages({
+    const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "user", content: "first" },
@@ -237,8 +237,8 @@ describe("anthropic messages ingress", () => {
   });
 
   it("非对象 body 直接抛，不产出半个 IR", () => {
-    expect(() => decodeAnthropicMessages("not-json-object", TRACE)).toThrow(TypeError);
-    expect(() => decodeAnthropicMessages([1, 2, 3], TRACE)).toThrow(TypeError);
+    expect(() => readAnthropicMessagesRequest("not-json-object", TRACE)).toThrow(TypeError);
+    expect(() => readAnthropicMessagesRequest([1, 2, 3], TRACE)).toThrow(TypeError);
   });
 });
 
@@ -247,7 +247,7 @@ describe("openai chat completions ingress", () => {
   it("role:'tool' 归位成 user 回合里的 toolResult，连续多条合并成一个回合", () => {
     // 这正是 agent-all-sdk-ts 上炸过的形态：并行工具调用 → 连续多条 role:'tool' →
     // 不合并就变成多条 user 消息 → 转回 Anthropic 被判「漏了结果」，补占位后与真结果撞成 400。
-    const { request } = decodeOpenAIChatCompletions({
+    const { request } = readChatCompletionsRequest({
       model: "m",
       messages: [
         { role: "user", content: "go" },
@@ -266,7 +266,7 @@ describe("openai chat completions ingress", () => {
   });
 
   it("tool_calls 的 arguments 不是合法 JSON 时降级成 freeform 文本入参并留痕", () => {
-    const { request, losses } = decodeOpenAIChatCompletions({
+    const { request, losses } = readChatCompletionsRequest({
       model: "m",
       messages: [{ role: "assistant", content: null, tool_calls: [
         { id: "c1", type: "function", function: { name: "f", arguments: "{broken" } },
@@ -279,7 +279,7 @@ describe("openai chat completions ingress", () => {
   });
 
   it("没有 tool_call_id 的 tool 消息无法关联，丢弃并留痕（不静默变成普通文本）", () => {
-    const { request, losses } = decodeOpenAIChatCompletions({
+    const { request, losses } = readChatCompletionsRequest({
       model: "m",
       messages: [{ role: "user", content: "x" }, { role: "tool", content: "orphan" }],
     }, TRACE);
@@ -288,7 +288,7 @@ describe("openai chat completions ingress", () => {
   });
 
   it("developer 与 system 两种角色都归位到 conversation.system", () => {
-    const { request } = decodeOpenAIChatCompletions({
+    const { request } = readChatCompletionsRequest({
       model: "m",
       messages: [
         { role: "system", content: "s1" },
@@ -301,7 +301,7 @@ describe("openai chat completions ingress", () => {
   });
 
   it("image_url 的嵌套 data URL 解析成 base64 blob", () => {
-    const { request } = decodeOpenAIChatCompletions({
+    const { request } = readChatCompletionsRequest({
       model: "m",
       messages: [{ role: "user", content: [
         { type: "text", text: "look" },
@@ -316,14 +316,14 @@ describe("openai chat completions ingress", () => {
 
   it("三个 token 上限键任取其一，语义相同不重复", () => {
     for (const key of ["max_completion_tokens", "max_tokens", "max_output_tokens"]) {
-      const { request } = decodeOpenAIChatCompletions(
+      const { request } = readChatCompletionsRequest(
         { model: "m", messages: [{ role: "user", content: "x" }], [key]: 512 }, TRACE);
       expect(request.intent.stopping.maxOutputTokens?.value).toBe(512);
     }
   });
 
   it("response_format json_object 没有 schema，降级成 text 并留痕，不假装等价", () => {
-    const { request, losses } = decodeOpenAIChatCompletions({
+    const { request, losses } = readChatCompletionsRequest({
       model: "m", messages: [{ role: "user", content: "x" }],
       response_format: { type: "json_object" },
     }, TRACE);
@@ -332,12 +332,12 @@ describe("openai chat completions ingress", () => {
   });
 
   it("reasoning_effort 落成 effort 且 source=client；缺省时是 gateway-default", () => {
-    const explicit = decodeOpenAIChatCompletions(
+    const explicit = readChatCompletionsRequest(
       { model: "m", messages: [{ role: "user", content: "x" }], reasoning_effort: "high" }, TRACE);
     expect(explicit.request.intent.reasoning.source).toBe("client");
     expect(explicit.request.intent.reasoning.value.effort).toBe("high");
 
-    const implicit = decodeOpenAIChatCompletions(
+    const implicit = readChatCompletionsRequest(
       { model: "m", messages: [{ role: "user", content: "x" }] }, TRACE);
     expect(implicit.request.intent.reasoning.source).toBe("gateway-default");
     expect(implicit.request.intent.reasoning.value.effort).toBeUndefined();
@@ -347,7 +347,7 @@ describe("openai chat completions ingress", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("openai responses ingress", () => {
   it("instructions 与 developer 消息都是系统提示载体", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m", instructions: "top",
       input: [
         { type: "message", role: "developer", content: [{ type: "input_text", text: "dev" }] },
@@ -359,7 +359,7 @@ describe("openai responses ingress", () => {
   });
 
   it("function_call 的 namespace 是结构化分组，不做名字拍平", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m",
       input: [
         { type: "function_call", call_id: "c1", name: "close_agent", namespace: "multi_agent_v1", arguments: "{}" },
@@ -372,7 +372,7 @@ describe("openai responses ingress", () => {
   });
 
   it("custom_tool_call 的 input 是自由文本，保持 freeform 不硬塞成 JSON", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m",
       input: [{ type: "custom_tool_call", call_id: "c1", name: "exec", input: "const r = await tools.exec()" }],
     }, TRACE);
@@ -382,7 +382,7 @@ describe("openai responses ingress", () => {
   });
 
   it("custom_tool_call 的 status='failed' 落成结果 error 态", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m",
       input: [
         { type: "custom_tool_call", call_id: "c1", name: "exec", input: "x" },
@@ -394,7 +394,7 @@ describe("openai responses ingress", () => {
   });
 
   it("reasoning item 的 summary 与 encrypted_content 分别落成 thinking / redactedThinking", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m",
       input: [{ type: "reasoning", summary: [{ type: "summary_text", text: "thought" }], encrypted_content: "ENC" }],
     }, TRACE);
@@ -403,7 +403,7 @@ describe("openai responses ingress", () => {
   });
 
   it("namespace 工具展开成带 group 的成员 + 一条分组记录", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m", input: [{ type: "message", role: "user", content: "x" }],
       tools: [{ type: "namespace", name: "multi_agent_v1", description: "d", tools: [
         { type: "function", name: "close_agent", description: "c", parameters: { type: "object" } },
@@ -416,7 +416,7 @@ describe("openai responses ingress", () => {
   });
 
   it("没有 name 的内建工具（web_search）以 type 兜底，不因缺名被整条丢掉", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m", input: [{ type: "message", role: "user", content: "x" }],
       tools: [{ type: "web_search", external_web_access: false }],
     }, TRACE);
@@ -427,7 +427,7 @@ describe("openai responses ingress", () => {
   });
 
   it("input_image 的 image_url 是裸字符串（不是 Chat 的嵌套对象）", () => {
-    const { request } = decodeOpenAIResponses({
+    const { request } = readResponsesRequest({
       model: "m",
       input: [{ type: "message", role: "user", content: [
         { type: "input_image", image_url: "data:image/jpeg;base64,AAAA", detail: "high" },
@@ -439,13 +439,13 @@ describe("openai responses ingress", () => {
   });
 
   it("input 是裸字符串时当作单条 user 消息", () => {
-    const { request } = decodeOpenAIResponses({ model: "m", input: "just text" }, TRACE);
+    const { request } = readResponsesRequest({ model: "m", input: "just text" }, TRACE);
     expect(request.conversation.turns).toHaveLength(1);
     expect(partsOfTurn(request, 0)[0]).toEqual({ kind: "text", text: "just text" });
   });
 
   it("未知 item 类型装箱成 opaque 并留痕", () => {
-    const { request, losses } = decodeOpenAIResponses({
+    const { request, losses } = readResponsesRequest({
       model: "m", input: [{ type: "web_search_call", id: "ws_1", status: "completed" }],
     }, TRACE);
     expect(partsOfTurn(request, 0)[0]?.kind).toBe("opaque");
@@ -456,7 +456,7 @@ describe("openai responses ingress", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("cross-protocol invariants", () => {
   it("三个协议表达同一段对话时，产出结构等价的 IR", () => {
-    const anthropic = decodeAnthropicMessages({
+    const anthropic = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, system: "sys",
       messages: [
         { role: "user", content: "go" },
@@ -465,7 +465,7 @@ describe("cross-protocol invariants", () => {
       ],
     }, TRACE).request;
 
-    const chat = decodeOpenAIChatCompletions({
+    const chat = readChatCompletionsRequest({
       model: "m",
       messages: [
         { role: "system", content: "sys" },
@@ -475,7 +475,7 @@ describe("cross-protocol invariants", () => {
       ],
     }, TRACE).request;
 
-    const responses = decodeOpenAIResponses({
+    const responses = readResponsesRequest({
       model: "m", instructions: "sys",
       input: [
         { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
@@ -499,7 +499,7 @@ describe("cross-protocol invariants", () => {
   });
 
   it("关联靠 id 而非位置：把工具结果放到后面的回合，IR 依然关联得上", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "f", input: {} }] },

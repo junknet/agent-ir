@@ -12,9 +12,9 @@
  * 我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createOpenAIChatEgress } from "../src/egress/openai_chat_completions.ts";
-import { decodeAnthropicMessages } from "../src/ingress/index.ts";
-import { admit } from "../src/ir/admission.ts";
+import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
+import { readAnthropicMessagesRequest } from "../src/ingress/index.ts";
+import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
   clientValue, defaultValue,
@@ -24,7 +24,7 @@ import {
 
 const TRACE = "tr-test";
 
-const egress = createOpenAIChatEgress({
+const egress = createChatCompletionsUpstream({
   baseUrl: "https://api.openai.com/v1/",
   apiKey: "sk-test",
   model: "gpt-5-mini",
@@ -100,7 +100,7 @@ describe("能力声明", () => {
   });
 
   it("工具结果里的图片被准入层拒掉，并指到具体 IR 路径", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16,
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Screenshot", input: {} }] },
@@ -113,7 +113,7 @@ describe("能力声明", () => {
         },
       ],
     }, TRACE);
-    const verdict = admit(request, egress.profile);
+    const verdict = checkUpstreamSupport(request, egress.profile);
     expect(verdict.admitted).toBe(false);
     expect(verdict.unsupported.map((need) => need.capability)).toContain("toolResultImage");
     const need = verdict.unsupported.find((entry) => entry.capability === "toolResultImage");
@@ -121,14 +121,14 @@ describe("能力声明", () => {
   });
 
   it("带签名 thinking 的请求（语料 611 条 anthropic 里 464 条）能过准入，只记有损", () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16,
       messages: [
         { role: "user", content: "hi" },
         { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig" }, { type: "text", text: "ok" }] },
       ],
     }, TRACE);
-    const verdict = admit(request, egress.profile);
+    const verdict = checkUpstreamSupport(request, egress.profile);
     expect(verdict.admitted).toBe(true);
     expect(verdict.losses.map((loss) => loss.path).length).toBeGreaterThan(0);
   });
@@ -137,7 +137,7 @@ describe("能力声明", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lower：wire 形状", () => {
   it("system + 多轮 + 并行工具调用 + 工具结果", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "claude-opus-5", max_tokens: 1024, stream: true,
       system: [{ type: "text", text: "you are a gateway" }],
       tools: [{ name: "Bash", description: "run", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
@@ -164,7 +164,7 @@ describe("lower：wire 形状", () => {
       ],
     }, TRACE);
 
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     expect(wire.url).toBe("https://api.openai.com/v1/chat/completions");
     expect(wire.headers.authorization).toBe("Bearer sk-test");
     expect(wire.headers["content-type"]).toBe("application/json");
@@ -205,7 +205,7 @@ describe("lower：wire 形状", () => {
   });
 
   it("user 消息里的图片走 image_url，base64 转成 data: URI", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{
         role: "user",
@@ -215,7 +215,7 @@ describe("lower：wire 形状", () => {
         ],
       }],
     }, TRACE);
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     expect(messagesOf(wire)[0]).toEqual({
       role: "user",
       content: [
@@ -227,14 +227,14 @@ describe("lower：wire 形状", () => {
   });
 
   it("悬空调用补占位 tool 消息，孤儿结果丢弃 —— 两者都会让上游 400", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "toolu_live", name: "Bash", input: {} }] },
         { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ghost", content: "orphan" }] },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     const messages = messagesOf(wire);
     expect(messages.map((message) => message.role)).toEqual(["assistant", "tool"]);
     expect(messages[1]?.tool_call_id).toBe("toolu_live");
@@ -247,7 +247,7 @@ describe("lower：wire 形状", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lower：每一处降级都留痕", () => {
   it("thinking 与 signature 整块丢弃并各记一条", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         { role: "user", content: "hi" },
@@ -261,7 +261,7 @@ describe("lower：每一处降级都留痕", () => {
         },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     const assistant = messagesOf(wire)[1];
     expect(assistant?.content).toBe("answer");
 
@@ -274,14 +274,14 @@ describe("lower：每一处降级都留痕", () => {
   });
 
   it("cache_control / context_management / top_k / metadata 各记一条 dropped", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, top_k: 40,
       system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
       context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
       metadata: { user_id: JSON.stringify({ session_id: "s-1", account_uuid: "acc-1" }) },
       messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    const { losses } = await egress.lower(request);
+    const { losses } = await egress.writeUpstreamRequest(request);
 
     const cache = findLoss(losses, "no cache_control");
     expect(cache?.kind).toBe("dropped");
@@ -311,7 +311,7 @@ describe("lower：每一处降级都留痕", () => {
         turns: [{ role: "user", parts: [{ kind: "text", text: "go" }] }],
       },
     });
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     const payload = body(wire);
     expect(payload.tools).toEqual([
       { type: "function", function: { name: "apply_patch", description: "patch" } },
@@ -326,7 +326,7 @@ describe("lower：每一处降级都留痕", () => {
   });
 
   it("工具结果的 is_error 折进正文；空结果补占位", async () => {
-    const { request } = decodeAnthropicMessages({
+    const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
         {
@@ -345,7 +345,7 @@ describe("lower：每一处降级都留痕", () => {
         },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.lower(request);
+    const { wire, losses } = await egress.writeUpstreamRequest(request);
     const messages = messagesOf(wire);
     expect(messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "[tool error] boom" });
     expect(messages[2]).toEqual({ role: "tool", tool_call_id: "toolu_empty", content: "(empty)" });
@@ -354,13 +354,13 @@ describe("lower：每一处降级都留痕", () => {
   });
 
   it("thinking budget 折成 reasoning_effort 档位，effort 越界夹到 high", async () => {
-    const budget = await egress.lower(irRequest({
+    const budget = await egress.writeUpstreamRequest(irRequest({
       intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", budgetTokens: 8000, display: "summarized" }) },
     }));
     expect(body(budget.wire).reasoning_effort).toBe("high");
     expect(findLoss(budget.losses, "bucketed into reasoning_effort")?.kind).toBe("degraded");
 
-    const clamped = await egress.lower(irRequest({
+    const clamped = await egress.writeUpstreamRequest(irRequest({
       intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", effort: "xhigh", display: "summarized" }) },
     }));
     expect(body(clamped.wire).reasoning_effort).toBe("high");
@@ -370,7 +370,7 @@ describe("lower：每一处降级都留痕", () => {
   });
 
   it("stop 超过 4 条截断；json_schema 缺 name 时补一个", async () => {
-    const { wire, losses } = await egress.lower(irRequest({
+    const { wire, losses } = await egress.writeUpstreamRequest(irRequest({
       intent: {
         stopping: {
           maxOutputTokens: clientValue(256),
@@ -403,7 +403,7 @@ describe("lift：正常流", () => {
   });
 
   it("文本 + 推理 + 工具调用分片累加 + finish_reason + usage", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       first,
       chunk({ content: null, reasoning_content: "let me" }),
       chunk({ content: null, reasoning_content: " think" }),
@@ -464,7 +464,7 @@ describe("lift：正常流", () => {
   });
 
   it("finish_reason=length → maxTokens；[DONE] 本身不是终止信号", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       chunk({ content: "half" }),
       chunk({}, "length"),
     ])));
@@ -476,7 +476,7 @@ describe("lift：正常流", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lift：没匹配上的一律进 unhandled", () => {
   it("未知 delta 字段 / 未知 finish_reason / 认不出形状的 chunk / 非 JSON 帧", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "hi", audio: { id: "a" } }, finish_reason: null }] },
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "recitation" }] },
       { object: "chat.completion.pigeon", model: "m", pigeon: true },
@@ -494,7 +494,7 @@ describe("lift：没匹配上的一律进 unhandled", () => {
   });
 
   it("n>1 的多候选不静默丢", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [
         { index: 0, delta: { content: "a" }, finish_reason: null },
         { index: 1, delta: { content: "b" }, finish_reason: null },
@@ -510,7 +510,7 @@ describe("lift：没匹配上的一律进 unhandled", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lift：流被截断绝不伪装成成功", () => {
   it("没有 finish_reason 就结束 → error，而不是「200 但空」", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "half a sen" }, finish_reason: null }] },
     ])));
     expect(events.some((event) => event.kind === "messageStop")).toBe(false);
@@ -527,12 +527,12 @@ describe("lift：流被截断绝不伪装成成功", () => {
   });
 
   it("[DONE] 单独收尾同样算截断", async () => {
-    const events = await collect(egress.lift(sse([], { done: true })));
+    const events = await collect(egress.readUpstreamResponse(sse([], { done: true })));
     expect(events.filter((event) => event.kind === "error")).toHaveLength(1);
   });
 
   it("流里插一条 error 帧 → 终止且不再补 transport 错误", async () => {
-    const events = await collect(egress.lift(sse([
+    const events = await collect(egress.readUpstreamResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "x" }, finish_reason: null }] },
       { error: { message: "This model's maximum context length is 128000 tokens", type: "invalid_request_error", code: "context_length_exceeded" } },
     ])));
@@ -563,7 +563,7 @@ describe("lift：非流式合成等价事件序列", () => {
       usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
     });
 
-    const events = await collect(egress.lift(response));
+    const events = await collect(egress.readUpstreamResponse(response));
     expect(events[0]).toEqual({ kind: "messageStart", model: "deepseek-v4-flash" });
     const starts = events.filter(
       (event): event is Extract<IREvent, { kind: "partStart" }> => event.kind === "partStart");
@@ -581,7 +581,7 @@ describe("lift：非流式合成等价事件序列", () => {
   });
 
   it("200 但没有 choices → error，不是空成功", async () => {
-    const events = await collect(egress.lift(Response.json({ id: "x", object: "chat.completion", choices: [] })));
+    const events = await collect(egress.readUpstreamResponse(Response.json({ id: "x", object: "chat.completion", choices: [] })));
     expect(events.some((event) => event.kind === "messageStop")).toBe(false);
     const error = events.find(
       (event): event is Extract<IREvent, { kind: "error" }> => event.kind === "error");
@@ -589,7 +589,7 @@ describe("lift：非流式合成等价事件序列", () => {
   });
 
   it("200 但 body 不是 JSON（网关错误页）→ transport error", async () => {
-    const events = await collect(egress.lift(new Response("<html>502</html>", {
+    const events = await collect(egress.readUpstreamResponse(new Response("<html>502</html>", {
       status: 200, headers: { "content-type": "text/html" },
     })));
     expect(events).toHaveLength(1);
@@ -639,7 +639,7 @@ describe("lift：上游 4xx/5xx", () => {
 
   for (const testCase of cases) {
     it(`${testCase.status} → ${testCase.kind}（retryable=${testCase.retryable}）`, async () => {
-      const events = await collect(egress.lift(Response.json(testCase.payload, { status: testCase.status })));
+      const events = await collect(egress.readUpstreamResponse(Response.json(testCase.payload, { status: testCase.status })));
       expect(events).toHaveLength(1);
       const event = events[0] as Extract<IREvent, { kind: "error" }>;
       expect(event.kind).toBe("error");
@@ -651,7 +651,7 @@ describe("lift：上游 4xx/5xx", () => {
   }
 
   it("错误 body 不是 JSON（nginx 502 页）也要有正确的 kind", async () => {
-    const events = await collect(egress.lift(new Response("<html><body>502 Bad Gateway</body></html>", { status: 502 })));
+    const events = await collect(egress.readUpstreamResponse(new Response("<html><body>502 Bad Gateway</body></html>", { status: 502 })));
     const event = events[0] as Extract<IREvent, { kind: "error" }>;
     expect(event.error.kind).toBe("upstreamUnavailable");
     expect(event.error.retryable).toBe(true);

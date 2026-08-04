@@ -12,9 +12,9 @@
  *     `keepalive` / `response.failed` / 顶层 `error` 三例
  */
 import { describe, expect, it } from "bun:test";
-import { createOpenAIResponsesEgress } from "../src/egress/openai_responses.ts";
+import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
-import { admit } from "../src/ir/admission.ts";
+import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import {
   clientValue, defaultValue,
@@ -22,7 +22,7 @@ import {
   type IRToolset, type IRTurn,
 } from "../src/ir/types.ts";
 
-const egress = createOpenAIResponsesEgress({
+const egress = createResponsesUpstream({
   baseUrl: "https://api.openai.com/v1",
   apiKey: "sk-test",
   model: "gpt-5.6-sol",
@@ -72,7 +72,7 @@ async function lowerBody(request: IRRequest): Promise<{
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
 }> {
-  const lowered = await egress.lower(request);
+  const lowered = await egress.writeUpstreamRequest(request);
   const body = JSON.parse(lowered.wire.body) as Record<string, unknown>;
   return {
     body,
@@ -94,7 +94,7 @@ function sse(frames: ReadonlyArray<Record<string, unknown>>): Response {
 
 async function collect(response: Response): Promise<IREvent[]> {
   const events: IREvent[] = [];
-  for await (const event of egress.lift(response)) events.push(event);
+  for await (const event of egress.readUpstreamResponse(response)) events.push(event);
   return events;
 }
 
@@ -131,7 +131,7 @@ describe("能力声明", () => {
         parallel: defaultValue(true),
       },
     });
-    const verdict = admit(request, egress.profile);
+    const verdict = checkUpstreamSupport(request, egress.profile);
     expect(verdict.admitted).toBe(true);
     expect(verdict.losses).toHaveLength(0);
   });
@@ -426,7 +426,7 @@ describe("lift：正常流", () => {
   ];
 
   it("文本 delta、工具参数分片、推理摘要与加密思考全部落到 IR 上", async () => {
-    const assembled = await assembleResponse(egress.lift(sse(frames)), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(frames)), "fallback");
     expect(assembled.model).toBe("gpt-5.6-sol");
     expect(assembled.stopReason).toBe("toolUse");
     expect(assembled.error).toBeNull();
@@ -443,7 +443,7 @@ describe("lift：正常流", () => {
   });
 
   it("usage 换算成 Anthropic 语义：input 必须减去 cached_tokens", async () => {
-    const assembled = await assembleResponse(egress.lift(sse(frames)), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(frames)), "fallback");
     // 实测 input_tokens 18661 **含** cached 17792；不减的话缓存被双倍计入输入。
     expect(assembled.usage).toEqual({
       inputTokens: 18661 - 17792,
@@ -472,7 +472,7 @@ describe("lift：正常流", () => {
   });
 
   it("freeform 工具调用走 custom_tool_call，入参保持自由文本", async () => {
-    const assembled = await assembleResponse(egress.lift(sse([
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.output_item.added", output_index: 0, item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_p", name: "apply_patch", input: "" } },
       { type: "response.custom_tool_call_input.delta", output_index: 0, item_id: "ctc_1", delta: "*** Begin Patch" },
@@ -485,7 +485,7 @@ describe("lift：正常流", () => {
   });
 
   it("只有 done 带全量参数（没有任何 delta）时补发，不静默丢工具入参", async () => {
-    const assembled = await assembleResponse(egress.lift(sse([
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_y", name: "T", arguments: "" } },
       { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_1", arguments: "{\"a\":1}" },
@@ -519,7 +519,7 @@ describe("lift：失败形态一个都不能吞", () => {
     expect(last?.kind === "error" && last.error.retryable).toBe(true);
 
     // 折叠后 stopReason 仍为 null —— 调用方据此区分「说完了」与「连接断了」。
-    const assembled = await assembleResponse(egress.lift(sse([
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
       { type: "response.created", response: { model: "m" } },
     ])), "m");
     expect(assembled.stopReason).toBeNull();
@@ -527,7 +527,7 @@ describe("lift：失败形态一个都不能吞", () => {
   });
 
   it("response.failed 里的 context_length_exceeded 必须显形（实测一天 126 次被吞）", async () => {
-    const assembled = await assembleResponse(egress.lift(sse([
+    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.failed", response: {
         status: "failed",
@@ -575,7 +575,7 @@ describe("lift：非流式 JSON 合成等价事件序列", () => {
       usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 10 },
     };
     const response = new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
-    const assembled = await assembleResponse(egress.lift(response), "fallback");
+    const assembled = await assembleResponse(egress.readUpstreamResponse(response), "fallback");
 
     expect(assembled.model).toBe("gpt-5.6-sol");
     expect(assembled.turn.parts.map((part) => part.kind)).toEqual(["thinking", "redactedThinking", "text", "toolCall"]);

@@ -8,7 +8,7 @@
 import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import {
   clientValue, defaultValue,
-  type IRDecodeResult, type IRIntent, type IROutputFormat, type IRPart,
+  type ClientRequestReadResult, type IRIntent, type IROutputFormat, type IRPart,
   type IRReasoning, type IRTool, type IRToolChoice, type IRToolRef, type IRToolset, type IRTurn,
 } from "../ir/types.ts";
 import {
@@ -155,7 +155,7 @@ function decodeOutputFormat(body: Record<string, unknown>, losses: LossRecorder)
   return { kind: "text" };
 }
 
-export function decodeOpenAIChatCompletions(raw: unknown, traceId: string): IRDecodeResult {
+export function readChatCompletionsRequest(raw: unknown, traceId: string): ClientRequestReadResult {
   const losses = new LossRecorder();
   if (!isRecord(raw)) throw new TypeError("chat completions body must be a JSON object");
   const body = raw;

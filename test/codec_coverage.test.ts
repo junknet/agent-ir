@@ -22,8 +22,8 @@ describe("入口是封闭集", () => {
     for (const protocol of PROTOCOLS) {
       const codec = INGRESS_CODECS[protocol];
       expect(codec.protocol).toBe(protocol);
-      expect(typeof codec.decodeRequest).toBe("function");
-      expect(typeof codec.encodeResponse).toBe("function");
+      expect(typeof codec.readClientRequest).toBe("function");
+      expect(typeof codec.writeClientResponse).toBe("function");
     }
   });
 

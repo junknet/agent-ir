@@ -54,7 +54,7 @@ function usageWire(usage: IRUsage | null): Record<string, number> {
   };
 }
 
-export function encodeAnthropicResponse(
+export function writeAnthropicResponse(
   events: AsyncIterable<IREvent>,
   request: IRRequest,
   options: EncodeOptions,

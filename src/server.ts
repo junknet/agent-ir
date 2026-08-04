@@ -8,13 +8,13 @@
  * 这是上一轮踩过的坑。
  */
 import { randomUUID } from "node:crypto";
-import { createAnthropicEgress } from "./egress/anthropic.ts";
-import { admit, describeUnsupported } from "./ir/admission.ts";
+import { createAnthropicUpstream } from "./egress/anthropic.ts";
+import { checkUpstreamSupport, describeUnsupportedCapabilities } from "./ir/admission.ts";
 import { configureLogging, getLogger, jsonSink, parseLogLevel, textSink } from "./obs/log.ts";
-import { decodeForProtocol } from "./ingress/index.ts";
+import { readClientRequestForProtocol } from "./ingress/index.ts";
 import { INGRESS_PATHS } from "./protocols.ts";
-import { encodeAnthropicResponse } from "./ingress/anthropic_encode.ts";
-import { encodeChatCompletionsResponse, encodeResponsesResponse } from "./ingress/openai_encode.ts";
+import { writeAnthropicResponse } from "./ingress/anthropic_encode.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "./ingress/openai_encode.ts";
 import type { IREgress, IREvent, IRLoss, IRProtocol, IRRequest } from "./ir/types.ts";
 
 const DEV = (process.env.AGENT_IR_ENV ?? "dev") === "dev";
@@ -33,7 +33,7 @@ function requiredEnv(name: string): string {
   return value;
 }
 
-const egress: IREgress = createAnthropicEgress({
+const egress: IREgress = createAnthropicUpstream({
   baseUrl: requiredEnv("AGENT_IR_UPSTREAM_BASE_URL"),
   apiKey: requiredEnv("AGENT_IR_UPSTREAM_API_KEY"),
   model: process.env.AGENT_IR_UPSTREAM_MODEL ?? "claude-opus-5",
@@ -101,7 +101,7 @@ async function handle(httpRequest: Request): Promise<Response> {
 
   let decoded;
   try {
-    decoded = decodeForProtocol(protocol, raw, traceId);
+    decoded = readClientRequestForProtocol(protocol, raw, traceId);
   } catch (error) {
     log.warn({ event: "ingress_decode_failed", trace: traceId, protocol, error });
     return Response.json({ type: "error", error: { type: "invalid_request_error", message: "request could not be decoded" } }, { status: 400 });
@@ -110,7 +110,7 @@ async function handle(httpRequest: Request): Promise<Response> {
   logLosses(traceId, "ingress", decoded.losses);
   log.debug({ event: "ingress_decoded", trace: traceId, protocol, ...summarizeRequest(request) });
 
-  const verdict = admit(request, egress.profile);
+  const verdict = checkUpstreamSupport(request, egress.profile);
   logLosses(traceId, "admission", verdict.losses);
   log.debug({
     event: "admission_decided", trace: traceId, provider: egress.profile.provider,
@@ -123,12 +123,12 @@ async function handle(httpRequest: Request): Promise<Response> {
       type: "error",
       error: {
         type: "invalid_request_error",
-        message: `upstream '${egress.profile.provider}' cannot carry: ${describeUnsupported(verdict.unsupported)}`,
+        message: `upstream '${egress.profile.provider}' cannot carry: ${describeUnsupportedCapabilities(verdict.unsupported)}`,
       },
     }, { status: 422 });
   }
 
-  const lowered = await egress.lower(request);
+  const lowered = await egress.writeUpstreamRequest(request);
   logLosses(traceId, "egress", lowered.losses);
   log.debug({
     event: "egress_lowered", trace: traceId, provider: egress.profile.provider,
@@ -164,7 +164,7 @@ async function handle(httpRequest: Request): Promise<Response> {
   };
 
   async function* observed(): AsyncGenerator<IREvent> {
-    for await (const event of egress.lift(upstream)) {
+    for await (const event of egress.readUpstreamResponse(upstream)) {
       if (event.kind === "unhandled") { onUnhandled(event.rawType, event.raw); continue; }
       if (event.kind === "error") {
         log.warn({ event: "upstream_error_lifted", trace: traceId, error_kind: event.error.kind, http_status: event.error.httpStatus, message: event.error.message });
@@ -181,9 +181,9 @@ async function handle(httpRequest: Request): Promise<Response> {
   // 出站编码按**入口协议**分发：客户端说哪种协议就回哪种，与上游用什么无关。
   const encodeOptions = { messageId: `msg_${traceId}`, onUnhandled };
   const encode =
-    protocol === "anthropic_messages" ? encodeAnthropicResponse
-    : protocol === "openai_chat_completions" ? encodeChatCompletionsResponse
-    : encodeResponsesResponse;
+    protocol === "anthropic_messages" ? writeAnthropicResponse
+    : protocol === "openai_chat_completions" ? writeChatCompletionsResponse
+    : writeResponsesResponse;
   const response = await encode(observed(), request, encodeOptions);
   log.info({
     event: "request_completed", trace: traceId, protocol, status: response.status,

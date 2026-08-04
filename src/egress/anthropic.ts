@@ -1,14 +1,14 @@
 /**
- * Anthropic Messages 出口：IR → wire（lower）+ 上游 SSE → IREvent（lift）。
+ * Anthropic Messages 出口：writeUpstreamRequest（IR → wire）+ readUpstreamResponse（上游 SSE → IREvent）。
  *
- * lower 是**唯一**恢复 Anthropic 位置不变量的地方：
+ * writeUpstreamRequest 是**唯一**恢复 Anthropic 位置不变量的地方：
  *   每个 tool_use 恰好一个 tool_result，且位于紧随该 assistant 回合之后那条 user 回合的最前面。
  * IR 内部靠 id 关联、与位置无关，所以三个入口都不需要各自维护这套排列规则 ——
  * agent-all-sdk-ts 里那份 179 行的 anthropic_constraints.ts 在这个架构下只剩这一个函数。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IREgress, IREgressProfile, IREvent, IRLoss, IRLowerResult, IRPart, IRRequest,
+  IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRRequest,
   IRStopReason, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -25,7 +25,7 @@ const SUPPORTED = new Set([
 // 两者都能承载，但都有损 —— 归 lossy，放行且强制留痕。
 const LOSSY = new Set(["toolFreeform", "toolGroup"] as const);
 
-export interface AnthropicEgressOptions {
+export interface AnthropicUpstreamOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly anthropicVersion?: string;
@@ -34,7 +34,7 @@ export interface AnthropicEgressOptions {
   readonly model: string;
 }
 
-class LowerLosses {
+class UpstreamRequestLosses {
   readonly #losses: IRLoss[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: "anthropic", ...loss });
@@ -47,7 +47,7 @@ function flatToolName(group: string | null, name: string): string {
   return group === null ? name : `${group}__${name}`;
 }
 
-function lowerPart(part: IRPart, path: string, losses: LowerLosses): Record<string, unknown> | null {
+function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequestLosses): Record<string, unknown> | null {
   const cache = part.cacheBreakpoint === undefined ? {} : { cache_control: { type: "ephemeral" } };
   switch (part.kind) {
     case "text":
@@ -89,7 +89,7 @@ function lowerPart(part: IRPart, path: string, losses: LowerLosses): Record<stri
       };
     case "toolResult": {
       const inner = part.result.parts
-        .map((child, index) => lowerPart(child, `${path}.result.parts[${index}]`, losses))
+        .map((child, index) => writePartToUpstream(child, `${path}.result.parts[${index}]`, losses))
         .filter((block): block is Record<string, unknown> => block !== null);
       return {
         type: "tool_result",
@@ -118,7 +118,7 @@ function lowerPart(part: IRPart, path: string, losses: LowerLosses): Record<stri
  * 有顺序陷阱（实测踩过：占位块 push 到 user 回合末尾会变成 [tool_result, text, tool_result]，
  * 上游 400；[text, tool_result] 顺序必死，[tool_result, text] 才过）。
  */
-function arrangeToolTurns(turns: readonly IRTurn[], losses: LowerLosses): IRTurn[] {
+function arrangeToolTurns(turns: readonly IRTurn[], losses: UpstreamRequestLosses): IRTurn[] {
   // 1. 摘出全部工具结果，按 callId 索引
   const resultsByCallId = new Map<string, IRPart>();
   const stripped: IRTurn[] = turns.map((turn) => ({
@@ -184,7 +184,7 @@ function arrangeToolTurns(turns: readonly IRTurn[], losses: LowerLosses): IRTurn
   return merged;
 }
 
-export function createAnthropicEgress(options: AnthropicEgressOptions): IREgress {
+export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREgress {
   const profile: IREgressProfile = {
     provider: "anthropic",
     supports: new Set(SUPPORTED),
@@ -194,18 +194,18 @@ export function createAnthropicEgress(options: AnthropicEgressOptions): IREgress
   return {
     profile,
 
-    async lower(request: IRRequest): Promise<IRLowerResult> {
-      const losses = new LowerLosses();
+    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
+      const losses = new UpstreamRequestLosses();
       const { conversation, intent } = request;
 
       const system = conversation.system
-        .map((part, index) => lowerPart(part, `$.conversation.system[${index}]`, losses))
+        .map((part, index) => writePartToUpstream(part, `$.conversation.system[${index}]`, losses))
         .filter((block): block is Record<string, unknown> => block !== null);
 
       const messages = arrangeToolTurns(conversation.turns, losses).map((turn, turnIndex) => ({
         role: turn.role,
         content: turn.parts
-          .map((part, partIndex) => lowerPart(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, losses))
+          .map((part, partIndex) => writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, losses))
           .filter((block): block is Record<string, unknown> => block !== null),
       })).filter((message) => message.content.length > 0);
 
@@ -298,13 +298,13 @@ export function createAnthropicEgress(options: AnthropicEgressOptions): IREgress
       };
     },
 
-    lift(response: Response): AsyncIterable<IREvent> {
+    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
       return liftAnthropicStream(response);
     },
   };
 }
 
-// ── lift ───────────────────────────────────────────────────────────────────
+// ── readUpstreamResponse ───────────────────────────────────────────────────────────────────
 
 function mapStopReason(raw: unknown): IRStopReason {
   switch (raw) {
