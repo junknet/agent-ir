@@ -21,6 +21,7 @@
  * 确定性是默认值，修复是显式选择。
  */
 import { checkUpstreamSupport } from "../ir/admission.ts";
+import type { UpstreamSupportCheck } from "../ir/admission.ts";
 import type { IREgressProfile, IRLoss, IRRequest } from "../ir/types.ts";
 import {
   IR_REPAIR_KINDS,
@@ -123,7 +124,7 @@ export function describeRepairsAsLosses(
  */
 export function repairForAdmission(
   request: IRRequest, profile: IREgressProfile, policy: IRRepairPolicy,
-): IRRepairResult & { readonly admission: ReturnType<typeof checkUpstreamSupport> } {
+): IRRepairResult & { readonly admission: UpstreamSupportCheck } {
   const outcome = repairIRRequest(request, profile, policy);
   return { ...outcome, admission: checkUpstreamSupport(outcome.request, profile) };
 }
