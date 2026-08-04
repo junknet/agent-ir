@@ -5,6 +5,12 @@
  *   每个 tool_use 恰好一个 tool_result，且位于紧随该 assistant 回合之后那条 user 回合的最前面。
  * IR 内部靠 id 关联、与位置无关，所以三个入口都不需要各自维护这套排列规则 ——
  * agent-all-sdk-ts 里那份 179 行的 anthropic_constraints.ts 在这个架构下只剩这一个函数。
+ *
+ * 本文件同时是「IR → Anthropic Messages body」这份投影的**唯一授权定义**。
+ * 不止一家上游说这条 wire（GitHub Copilot 的数据面就是 `${apiBase}/v1/messages` +
+ * `anthropic-version: 2023-06-01`），它们之间的差别只有三处：端点与身份头、能力声明、
+ * 以及对已投影 body 的方言复核。这三处收敛在 `AnthropicMessagesDialect` 里，
+ * 投影本身**只有这一份** —— 复制一份出去就是 silent mirror：改了一边另一边不会失败，只会一起沉默。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
@@ -40,11 +46,49 @@ export interface AnthropicUpstreamOptions {
   readonly model: string;
 }
 
+/**
+ * 说 Anthropic Messages wire 的一家上游与另一家的**全部**差别。
+ *
+ * 三个位置，一个都不多：
+ *   - `resolveTarget`：端点与身份头。**按请求解析且是异步的** —— Copilot 的 session token
+ *     会过期，凭据只能由调用方经 options 注入的回调提供；这里绝不伸手拿环境变量或本机文件。
+ *   - `supports` / `lossy`：能力声明。两家跑的是同一份 body，但上游的行为实证不同。
+ *   - `review`：对已投影 body 的方言复核。允许的动作只有两个 —— 删掉「目标 wire 真的没有
+ *     这个位置」的字段并记 loss，或带精确 IR 路径拒绝。**改写成别的东西是策略，归 repair**，
+ *     不在这里（ARCHITECTURE §7 的划线判据）。
+ */
+export interface AnthropicMessagesDialect {
+  /** 落进 `IREgressProfile.provider` 与每一条 `IRLoss.provider`。 */
+  readonly provider: string;
+  /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
+  readonly model: string;
+  readonly supports: readonly IRCapability[];
+  readonly lossy: readonly IRCapability[];
+  resolveTarget(request: IRRequest): Promise<AnthropicMessagesTarget>;
+  review?(body: Record<string, unknown>, request: IRRequest): AnthropicMessagesDialectReview;
+}
+
+export interface AnthropicMessagesTarget {
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export interface AnthropicMessagesDialectReview {
+  /** 复核后的 body。省略 = 原样采用（复核只提意见、不改字段的常见情况）。 */
+  readonly body?: Record<string, unknown>;
+  readonly losses?: readonly Omit<IRLoss, "stage" | "provider">[];
+  readonly problems?: readonly IRBuildProblem[];
+}
+
 class UpstreamRequestReport {
+  readonly #provider: string;
   readonly #losses: IRLoss[] = [];
   readonly #problems: IRBuildProblem[] = [];
+  constructor(provider: string) {
+    this.#provider = provider;
+  }
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: "anthropic", ...loss });
+    this.#losses.push({ stage: "egress", provider: this.#provider, ...loss });
   }
   reject(problem: IRBuildProblem): void {
     this.#problems.push(problem);
@@ -208,18 +252,25 @@ function arrangeToolTurns(turns: readonly IRTurn[], report: UpstreamRequestRepor
   return merged;
 }
 
-export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREgress {
+/**
+ * Anthropic Messages wire 的出口工厂。**投影只有这一份**，方言只换端点、身份头、
+ * 能力声明与复核 —— `createAnthropicUpstream` 与 `createCopilotUpstream` 都是它的薄封装。
+ *
+ * `readUpstreamResponse` 不做方言化：读回来的就是同一条 wire 的同一套 SSE 事件，
+ * 给它开一个 hook 等于给「Anthropic 事件语义」开第二份认知。
+ */
+export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialect): IREgress {
   const profile: IREgressProfile = {
-    provider: "anthropic",
-    supports: new Set(SUPPORTED),
-    lossy: new Set(LOSSY),
+    provider: dialect.provider,
+    supports: new Set(dialect.supports),
+    lossy: new Set(dialect.lossy),
   };
 
   return {
     profile,
 
     async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const report = new UpstreamRequestReport();
+      const report = new UpstreamRequestReport(dialect.provider);
       const { conversation, intent } = request;
 
       const system = conversation.system
@@ -307,7 +358,7 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
       }
 
       const body: Record<string, unknown> = {
-        model: options.model,
+        model: dialect.model,
         messages,
         max_tokens: maxTokens,
         stream: intent.stream.value,
@@ -323,23 +374,26 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
         ...(intent.contextEdits.length === 0 ? {} : { context_management: { edits: intent.contextEdits.map((edit) => edit.raw) } }),
       };
 
+      // 方言复核跑在这里而不是各自的工厂里：它必须看到**共享投影的产物**，
+      // 才不会与投影漂移（复核一个自己重编的 body 就又是两份认知了）。
+      const reviewed = dialect.review?.(body, request);
+      for (const loss of reviewed?.losses ?? []) report.record(loss);
+      for (const problem of reviewed?.problems ?? []) report.reject(problem);
+
       // 拒绝是收集齐再返回：已经记下的 loss 一并交出（有损是既成事实，拒绝不改写它）。
       if (report.rejected) {
         return { ok: false, problems: report.drainProblems(), losses: report.drain() };
       }
 
+      // 凭据在这一步才解析：编不出 wire 的请求不值得去刷一次 token。
+      const target = await dialect.resolveTarget(request);
       return {
         ok: true,
         wire: {
-          url: `${options.baseUrl.replace(/\/$/u, "")}/v1/messages`,
+          url: target.url,
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-api-key": options.apiKey,
-            "anthropic-version": options.anthropicVersion ?? "2023-06-01",
-            ...(options.extraHeaders ?? {}),
-          },
-          body: JSON.stringify(body),
+          headers: target.headers,
+          body: JSON.stringify(reviewed?.body ?? body),
         },
         losses: report.drain(),
       };
@@ -349,6 +403,25 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
       return liftAnthropicStream(response);
     },
   };
+}
+
+/** 原生 Anthropic：`x-api-key` + 固定 baseUrl，没有方言复核。 */
+export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREgress {
+  return createAnthropicMessagesUpstream({
+    provider: "anthropic",
+    model: options.model,
+    supports: SUPPORTED,
+    lossy: LOSSY,
+    resolveTarget: () => Promise.resolve({
+      url: `${options.baseUrl.replace(/\/$/u, "")}/v1/messages`,
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": options.apiKey,
+        "anthropic-version": options.anthropicVersion ?? "2023-06-01",
+        ...(options.extraHeaders ?? {}),
+      },
+    }),
+  });
 }
 
 // ── readUpstreamResponse ───────────────────────────────────────────────────────────────────
@@ -364,24 +437,77 @@ function mapStopReason(raw: unknown): IRStopReason {
   }
 }
 
+/**
+ * 上游错误 → IR 分类。三级证据，**从强到弱**，先命中先用：
+ *
+ *   1. **正文语义**（最强）—— 上游明说了这次失败的具体原因
+ *   2. **错误类型**（次之）—— 上游给的粗分类
+ *   3. **HTTP 状态码**（兜底）—— 正文完全没有可用信号时的最后依据
+ *
+ * 顺序不是随便排的，两条踩过的坑：
+ *
+ * - **上下文超长必须排在 `invalid_request_error` 之前**。Anthropic 对「prompt is too long:
+ *   214253 tokens > 200000 maximum」回的 type 就是 `invalid_request_error`，把类型判断排在
+ *   前面会让上下文超长这一支**永远不可达** —— 调用方看到的是笼统的「请求无效」，
+ *   压缩上下文这条唯一正确的自救路径就此消失。
+ * - **状态码必须参与分类**。上游前面挂着 nginx / Cloudflare 时，5xx 的正文是 HTML 或纯文本
+ *   （`error code: 524`），解不出 type 也解不出 message。只看正文会把这些瞬时故障判成
+ *   `unknown` + 不可重试，本该退避重试的请求直接失败。
+ */
+const UPSTREAM_ERROR_TYPE_KINDS: Readonly<Record<string, IRUpstreamError["kind"]>> = {
+  invalid_request_error: "invalidRequest",
+  authentication_error: "permissionDenied",
+  permission_error: "permissionDenied",
+  permission_denied: "permissionDenied",
+  rate_limit_error: "rateLimited",
+  overloaded_error: "upstreamUnavailable",
+  api_error: "upstreamUnavailable",
+};
+
+/** 正文语义证据。命中即定，压过类型与状态码。 */
+const CONTEXT_LENGTH_PATTERN = /context.{0,12}length|too long|exceeds? the (maximum|context)/iu;
+
+function kindFromHttpStatus(httpStatus: number | null): IRUpstreamError["kind"] {
+  if (httpStatus === null) return "unknown";
+  if (httpStatus === 401 || httpStatus === 403) return "permissionDenied";
+  if (httpStatus === 429) return "rateLimited";
+  if (httpStatus === 408) return "upstreamUnavailable";
+  // 5xx 一律当上游暂时不可用：包含 520–529 这些 Cloudflare 自造码，
+  // 只枚举 500/502/503/504 会把边缘层的瞬时故障判成不可重试。
+  if (httpStatus >= 500) return "upstreamUnavailable";
+  if (httpStatus >= 400) return "invalidRequest";
+  return "unknown";
+}
+
+/** 可重试性由 kind 单点派生，不在各处各判一次。 */
+function isRetryableKind(kind: IRUpstreamError["kind"]): boolean {
+  return kind === "rateLimited" || kind === "upstreamUnavailable" || kind === "transport";
+}
+
 function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstreamError {
   const holder = typeof payload === "object" && payload !== null ? payload as Record<string, unknown> : {};
   const inner = typeof holder.error === "object" && holder.error !== null
     ? holder.error as Record<string, unknown> : holder;
   const type = typeof inner.type === "string" ? inner.type : "";
-  const message = typeof inner.message === "string" ? inner.message : "upstream error";
+  const bodyMessage = typeof inner.message === "string" ? inner.message : null;
+  // 正文不是 JSON 时（nginx HTML / "error code: 524"），原始文本本身就是唯一的语义线索。
+  // 空串不算证据：上游可能什么都没回（连接被中间层掐断时常见）。
+  const rawText = typeof payload === "string" && payload.trim().length > 0 ? payload : null;
+  const evidence = bodyMessage ?? rawText ?? "";
+
   const kind: IRUpstreamError["kind"] =
-    type === "invalid_request_error" ? "invalidRequest"
-    : type === "authentication_error" || type === "permission_error" || type === "permission_denied" ? "permissionDenied"
-    : type === "rate_limit_error" ? "rateLimited"
-    : type === "overloaded_error" || type === "api_error" ? "upstreamUnavailable"
-    : /context.{0,12}length|too long|exceeds? the (maximum|context)/iu.test(message) ? "contextLengthExceeded"
-    : "unknown";
+    CONTEXT_LENGTH_PATTERN.test(evidence) ? "contextLengthExceeded"
+    : UPSTREAM_ERROR_TYPE_KINDS[type] ?? kindFromHttpStatus(httpStatus);
+
   return {
     kind,
     httpStatus,
-    message,
-    retryable: kind === "rateLimited" || kind === "upstreamUnavailable",
+    // message 永远非空：它是日志与下发披露的唯一线索，空串等于把故障现场抹掉。
+    message: bodyMessage
+      ?? (rawText === null
+        ? (httpStatus === null ? "upstream error" : `upstream returned HTTP ${httpStatus} with no error body`)
+        : rawText.slice(0, 500)),
+    retryable: isRetryableKind(kind),
     raw: payload,
   };
 }

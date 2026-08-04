@@ -53,6 +53,16 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
   readonly bindsWithoutEnv: boolean;
   readonly provider: string;
 }>> = {
+  copilot: {
+    env: {
+      AGENT_IR_COPILOT_API_BASE: "https://api.individual.githubcopilot.com",
+      AGENT_IR_COPILOT_SESSION_TOKEN: "tid=test",
+      AGENT_IR_COPILOT_GITHUB_TOKEN: "gho_test",
+    },
+    bindsWithoutEnv: false,
+    provider: "copilot",
+  },
+
   anthropic: {
     env: {
       AGENT_IR_ANTHROPIC_BASE_URL: "https://example.invalid",

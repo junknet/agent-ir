@@ -8,6 +8,7 @@
  * 都只是往这里加一行（两个函数：writeUpstreamRequest + readUpstreamResponse），入口侧零改动，一次性多出三条路由。
  */
 import { createAnthropicUpstream, type AnthropicUpstreamOptions } from "./egress/anthropic.ts";
+import { createCopilotUpstream, type CopilotUpstreamOptions } from "./egress/copilot.ts";
 import { createGeminiCloudCodeUpstream, type GeminiCloudCodeEgressOptions } from "./egress/gemini_cloudcode.ts";
 import { createChatCompletionsUpstream, type ChatCompletionsUpstreamOptions } from "./egress/openai_chat_completions.ts";
 import { createResponsesUpstream, type ResponsesUpstreamOptions } from "./egress/openai_responses.ts";
@@ -111,17 +112,29 @@ const windsurfEgress: IREgressDescriptor<WindsurfEgressOptions, Uint8Array> = {
 };
 
 
+/**
+ * GitHub Copilot。**与 anthropic 共用同一份 Anthropic Messages 投影**（参数化的 dialect），
+ * 差别只在鉴权头、每凭据自有的 base URL、以及能力边界 —— 后者按 606 条真实 Copilot
+ * 归档流量的字段计数定，不是从「原生支持所以它也支持」类推来的。
+ */
+const copilotEgress: IREgressDescriptor<CopilotUpstreamOptions> = {
+  name: "copilot",
+  wire: "anthropic_messages_sse",
+  create: createCopilotUpstream,
+};
+
 export const EGRESS_PROVIDERS = {
   anthropic: anthropicEgress,
   openai_chat: chatCompletionsEgress,
   openai_responses: responsesEgress,
   gemini_cloudcode: geminiCloudCodeEgress,
   windsurf: windsurfEgress,
+  copilot: copilotEgress,
 } as const satisfies IREgressRegistry;
 
 export {
   anthropicEgress, anthropicMessages, chatCompletionsEgress, geminiCloudCodeEgress,
-  openaiChatCompletions, openaiResponses, responsesEgress, windsurfEgress,
+  openaiChatCompletions, openaiResponses, copilotEgress, responsesEgress, windsurfEgress,
 };
 export {
   createAnthropicUpstream, createChatCompletionsUpstream,

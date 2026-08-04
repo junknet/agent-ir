@@ -981,8 +981,11 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
     if (status === "RESOURCE_EXHAUSTED" || code === 429) {
       return /quota/iu.test(message) ? "quotaExhausted" : "rateLimited";
     }
+    // 5xx 一律当上游暂时不可用。**不要只枚举 500/502/503/504** —— CloudCode 前面挂着
+    // Google 的边缘层，507/520/522/524/529 这些码同样是瞬时故障；漏掉它们等于把本该
+    // 退避重试的请求判成 unknown + 不可重试，直接失败。
     if (status === "UNAVAILABLE" || status === "INTERNAL" || status === "DEADLINE_EXCEEDED"
-      || code === 500 || code === 502 || code === 503 || code === 504) {
+      || (code !== null && code >= 500)) {
       return "upstreamUnavailable";
     }
     if (status === "CANCELLED" || code === 499) return "transport";

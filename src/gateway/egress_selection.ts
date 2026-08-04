@@ -123,6 +123,19 @@ export const EGRESS_CONFIGS: Readonly<Record<EgressName, BoundEgressConfig>> = {
     },
   }),
 
+  /** Copilot 与 anthropic 同一份投影，但 base URL 是每个凭据自己的，且 session token 会过期。 */
+  copilot: defineEgressConfig("copilot", {
+    create: EGRESS_PROVIDERS.copilot.create,
+    readOptions: (env, key) => {
+      const apiBase = readRequiredText(env, key("API_BASE"));
+      const sessionToken = readRequiredText(env, key("SESSION_TOKEN"));
+      const githubToken = readRequiredText(env, key("GITHUB_TOKEN"));
+      return (model) => ({
+        apiBase, sessionToken, githubToken, model,
+      });
+    },
+  }),
+
   openai_chat: defineEgressConfig("openai_chat", {
     create: EGRESS_PROVIDERS.openai_chat.create,
     readOptions: (env, key) => {

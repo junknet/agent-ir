@@ -114,10 +114,30 @@ export async function* superviseUpstreamStream(
         ? policy.heartbeatMs
         : Math.min(policy.heartbeatMs, idleBudget);
 
-      const winner = await Promise.race([
-        iterator.next(),
-        clock.sleep(waitMs).then((): typeof IDLE => IDLE),
-      ]);
+      // 上游迭代器可能**抛**而不是 yield：TCP reset、body 读取失败、provider 内部异常。
+      // 失败在这套契约里是**数据不是控制流** —— 异常穿透守卫会让下游在已经收到 200 和
+      // 部分字节之后拿不到任何协议内的收尾事件，正是「200 但半截」。
+      // 这里把它就地转成 error 事件；提交后尤其重要：那时状态码已经发出去，改不了了。
+      let winner: typeof IDLE | IteratorResult<IREvent>;
+      try {
+        winner = await Promise.race([
+          iterator.next(),
+          clock.sleep(waitMs).then((): typeof IDLE => IDLE),
+        ]);
+      } catch (error) {
+        yield {
+          kind: "error",
+          error: {
+            kind: "transport",
+            httpStatus: null,
+            message: error instanceof Error ? error.message : String(error),
+            // 提交前可以换号重试；提交后调用方不能重试，但仍需知道这是传输故障而非模型结束。
+            retryable: !committed,
+            raw: error,
+          },
+        };
+        return;
+      }
 
       if ("idle" in winner) {
         const idleFor = clock.now() - lastProgressAt;
