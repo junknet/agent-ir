@@ -129,8 +129,9 @@ bun run typecheck
 | `/v1/responses` | codex 0.146.0 | 228KB 请求、247 工具、14 个 namespace 分组 |
 | `/v1/chat/completions` | jcode | 219KB 请求、230 工具 |
 
-出口侧已接四家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode`，
-因此当前可用路由是 3 入口 × 4 出口 = 12 条。
+出口侧已接五家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode` · `windsurf`，
+因此当前可用路由是 3 入口 × 5 出口 = 15 条。Windsurf 使用统一的
+ConnectRPC/Protobuf `GetChatMessage` outbox；模型家族只由 `chat_model_uid` 选择，不另拆出口。
 
 codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍进名字，
 `ir_loss_recorded` 显式记下 `'toolGroup' only with loss of fidelity` ——

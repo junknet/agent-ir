@@ -18,7 +18,7 @@ import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import {
   clientValue, defaultValue,
-  type IRConversation, type IREvent, type IRIntent, type IRPart, type IRRequest,
+  type IRBuildProblem, type IRConversation, type IREvent, type IRIntent, type IRPart, type IRRequest,
   type IRToolset, type IRTurn,
 } from "../src/ir/types.ts";
 
@@ -65,14 +65,20 @@ function makeRequest(input: {
   return { ...partial, requires: deriveCapabilityNeeds(partial) };
 }
 
+/**
+ * `writeUpstreamRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
+ * 万一被拒，失败信息里直接是 problems，而不是一句「wire is undefined」。
+ */
 async function lowerBody(request: IRRequest): Promise<{
   readonly body: Record<string, unknown>;
   readonly items: Array<Record<string, unknown>>;
   readonly losses: readonly { path: string; kind: string; detail: string }[];
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
+  readonly rawBody: string;
 }> {
   const lowered = await egress.writeUpstreamRequest(request);
+  if (!lowered.ok) throw new Error(`expected a compiled request, got problems: ${JSON.stringify(lowered.problems)}`);
   const body = JSON.parse(lowered.wire.body) as Record<string, unknown>;
   return {
     body,
@@ -80,6 +86,20 @@ async function lowerBody(request: IRRequest): Promise<{
     losses: lowered.losses.map((loss) => ({ path: loss.path, kind: loss.kind, detail: loss.detail })),
     url: lowered.wire.url,
     headers: lowered.wire.headers,
+    rawBody: lowered.wire.body,
+  };
+}
+
+/** 期望拒绝。返回 problems 与拒绝前已记下的 losses（契约要求两者一并交出）。 */
+async function rejected(request: IRRequest): Promise<{
+  readonly problems: readonly IRBuildProblem[];
+  readonly losses: readonly { path: string; kind: string; detail: string }[];
+}> {
+  const lowered = await egress.writeUpstreamRequest(request);
+  if (lowered.ok) throw new Error(`expected a rejection, got a wire: ${lowered.wire.body}`);
+  return {
+    problems: lowered.problems,
+    losses: lowered.losses.map((loss) => ({ path: loss.path, kind: loss.kind, detail: loss.detail })),
   };
 }
 
@@ -110,10 +130,16 @@ describe("能力声明", () => {
     expect(egress.profile.lossy.has("toolFreeform")).toBe(false);
   });
 
-  it("没核实过形状的一律不进 supports：document / stopSequences / topK / reasoningBudget", () => {
-    for (const capability of ["document", "stopSequences", "topK", "reasoningBudget", "thinkingSignature"] as const) {
+  it("没核实过形状的一律不进 supports：stopSequences / topK / reasoningBudget", () => {
+    for (const capability of ["stopSequences", "topK", "reasoningBudget", "thinkingSignature"] as const) {
       expect(egress.profile.supports.has(capability)).toBe(false);
       expect(egress.profile.lossy.has(capability)).toBe(true);
+    }
+    // document 与 toolResultImage 以前挂在 lossy 上，靠一句文本占位符「承载」——
+    // 占位是策略不是承载，剥离之后它们两个集合都不在，由准入层带路径拒。
+    for (const capability of ["document", "toolResultImage"] as const) {
+      expect(egress.profile.supports.has(capability)).toBe(false);
+      expect(egress.profile.lossy.has(capability)).toBe(false);
     }
     // supports 与 lossy 不相交，否则 admission 的三条规则会退化成两条。
     for (const capability of egress.profile.supports) expect(egress.profile.lossy.has(capability)).toBe(false);
@@ -154,7 +180,9 @@ describe("lower：会话 → 扁平 item 序列", () => {
       ] },
       { role: "user", parts: [
         { kind: "toolResult", result: { callId: "call_a", parts: [{ kind: "text", text: "/home" }], status: "ok" } },
-        { kind: "toolResult", result: { callId: "call_b", parts: [], status: "ok" } },
+        // 以前这里是 `parts: []` —— 空结果现在会被拒（补正文是策略），
+        // 而这条用例要验的是配对与顺序，所以给它一句真实内容。
+        { kind: "toolResult", result: { callId: "call_b", parts: [{ kind: "text", text: "sent" }], status: "ok" } },
         { kind: "toolResult", result: { callId: "call_c", parts: [{ kind: "text", text: "applied" }], status: "ok" } },
         { kind: "text", text: "now summarise" },
       ] },
@@ -252,6 +280,56 @@ describe("lower：会话 → 扁平 item 序列", () => {
     expect(losses).toHaveLength(0);
   });
 
+  it("正常请求 ok:true，wire 逐字段锁死", async () => {
+    const { body, url, headers, rawBody } = await lowerBody(makeRequest({
+      system: [{ kind: "text", text: "You are Codex." }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: { stopping: { maxOutputTokens: clientValue(256) } },
+    }));
+    expect(url).toBe("https://api.openai.com/v1/responses");
+    expect(headers).toEqual({
+      "content-type": "application/json",
+      authorization: "Bearer sk-test",
+      accept: "text/event-stream",
+    });
+    expect(body).toEqual({
+      model: "gpt-5.6-sol",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      stream: true,
+      store: false,
+      instructions: "You are Codex.",
+      reasoning: { summary: "auto" },
+      include: ["reasoning.encrypted_content"],
+      max_output_tokens: 256,
+    });
+    expect(rawBody.length).toBeGreaterThan(0);
+  });
+
+  it("确定性：同一个 IR 连续构造两次，body 字节完全相同", async () => {
+    const request = makeRequest({
+      system: [{ kind: "text", text: "You are Codex." }],
+      turns: [
+        { role: "user", parts: [{ kind: "text", text: "go" }] },
+        { role: "assistant", parts: [
+          { kind: "toolCall", call: { id: "call_a", toolRef: { group: "collaboration", name: "send_message" }, input: { kind: "json", value: { target: "/root" } } } },
+        ] },
+        { role: "user", parts: [
+          { kind: "toolResult", result: { callId: "call_a", parts: [{ kind: "text", text: "done" }], status: "ok" } },
+        ] },
+      ],
+      toolset: {
+        tools: [{ kind: "function", ref: { group: "collaboration", name: "send_message" }, description: "", schema: { type: "object" } }],
+        groups: [{ name: "collaboration", members: ["send_message"] }],
+        choice: clientValue({ kind: "auto" }),
+        parallel: clientValue(true),
+      },
+    });
+    const first = await lowerBody(request);
+    const second = await lowerBody(request);
+    expect(second.rawBody).toBe(first.rawBody);
+    expect(second.losses).toEqual(first.losses);
+  });
+
   it("非文本 system 部分退到 role:'developer' 的 message item，与 instructions 共存", async () => {
     const { body, items } = await lowerBody(makeRequest({
       system: [
@@ -269,8 +347,10 @@ describe("lower：会话 → 扁平 item 序列", () => {
 
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lower：损失必须留痕", () => {
-  it("悬空调用补占位输出，孤儿结果丢弃，两者各记一条", async () => {
-    const { items, losses } = await lowerBody(makeRequest({
+  // 旧行为：悬空调用补一条占位 output、孤儿结果直接丢，各记一条 loss。两者都是
+  // 「网关替客户端决定」，已剥离到 src/repair —— Core 现在只拒绝，并且一次收齐。
+  it("悬空调用与孤儿结果一次全收集地拒绝，路径指到具体 part", async () => {
+    const { problems } = await rejected(makeRequest({
       turns: [
         { role: "assistant", parts: [
           { kind: "toolCall", call: { id: "call_dangling", toolRef: { group: null, name: "T" }, input: { kind: "json", value: {} } } },
@@ -280,11 +360,51 @@ describe("lower：损失必须留痕", () => {
         ] },
       ],
     }));
-    expect(items.map((item) => item.type)).toEqual(["function_call", "function_call_output"]);
-    expect(items[1]?.call_id).toBe("call_dangling");
-    expect(losses.map((loss) => loss.kind).sort()).toEqual(["dropped", "substituted"]);
-    expect(losses.some((loss) => loss.detail.includes("orphan tool result call_orphan"))).toBe(true);
-    expect(losses.some((loss) => loss.detail.includes("dangling tool call call_dangling"))).toBe(true);
+    expect(problems).toHaveLength(2);
+
+    const dangling = problems.find((problem) => problem.kind === "danglingToolCall");
+    expect(dangling?.path).toBe("$.conversation.turns[0].parts[0]");
+    expect(dangling?.detail).toContain("call_dangling");
+    expect(dangling?.detail).toContain("fillDanglingToolCall");
+
+    const orphan = problems.find((problem) => problem.kind === "orphanToolResult");
+    expect(orphan?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(orphan?.detail).toContain("call_orphan");
+    expect(orphan?.detail).toContain("dropOrphanToolResult");
+  });
+
+  it("空工具输出拒绝：以前补一个空 input_text，等于替客户端宣布工具跑成功了", async () => {
+    const { problems } = await rejected(makeRequest({
+      turns: [
+        { role: "assistant", parts: [{ kind: "toolCall", call: { id: "c1", toolRef: { group: null, name: "T" }, input: { kind: "json", value: {} } } }] },
+        { role: "user", parts: [{ kind: "toolResult", result: { callId: "c1", parts: [], status: "ok" } }] },
+      ],
+    }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("requiredFieldMissing");
+    expect(problems[0]?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(problems[0]?.detail).toContain("fillEmptyToolResult");
+  });
+
+  it("多个问题混在一条请求里全部收齐，不短路", async () => {
+    const { problems } = await rejected(makeRequest({
+      turns: [
+        { role: "user", parts: [
+          { kind: "document", media: { source: { kind: "base64", data: "JVBER" }, mediaType: "application/pdf" } },
+        ] },
+        { role: "assistant", parts: [
+          { kind: "toolCall", call: { id: "call_dangling", toolRef: { group: null, name: "T" }, input: { kind: "json", value: {} } } },
+        ] },
+      ],
+      intent: { outputFormat: clientValue({ kind: "jsonSchema", schema: { type: "object" } }) },
+    }));
+    expect(problems.map((problem) => problem.kind).sort()).toEqual(
+      ["danglingToolCall", "requiredFieldMissing", "unrepresentablePart"]);
+    expect(problems.map((problem) => problem.path).sort()).toEqual([
+      "$.conversation.turns[0].parts[0]",
+      "$.conversation.turns[1].parts[0]",
+      "$.intent.outputFormat",
+    ]);
   });
 
   it("工具结果的错误位没有载体：错误性写进正文并记 degraded", async () => {
@@ -302,8 +422,10 @@ describe("lower：损失必须留痕", () => {
     expect(losses.some((loss) => loss.kind === "degraded" && loss.detail.includes("no error flag"))).toBe(true);
   });
 
-  it("工具结果里的图片退化成占位符并记 dropped（实测 output 只有 string / input_text 两种）", async () => {
-    const { items, losses } = await lowerBody(makeRequest({
+  // 旧行为：工具结果里的图片换成一句「这条路线载不动图片」的占位文本。截图类工具的全部
+  // 价值就在像素上，用一句转述顶替是网关替客户端做的取舍 —— 已剥离成拒绝。
+  it("工具结果里的图片拒绝，不再拿占位文本顶替", async () => {
+    const { problems } = await rejected(makeRequest({
       turns: [
         { role: "assistant", parts: [{ kind: "toolCall", call: { id: "c1", toolRef: { group: null, name: "T" }, input: { kind: "json", value: {} } } }] },
         { role: "user", parts: [{ kind: "toolResult", result: {
@@ -313,9 +435,42 @@ describe("lower：损失必须留痕", () => {
         } }] },
       ],
     }));
-    const output = items.find((item) => item.type === "function_call_output")?.output as Array<Record<string, unknown>>;
-    expect(String(output[0]?.text)).toContain("cannot carry it");
-    expect(losses.some((loss) => loss.kind === "dropped" && loss.detail.includes("tool result image"))).toBe(true);
+    // 图片没了 → 输出也空了：两条问题都要报出来，客户端才知道「换个上游」还是「改内容」。
+    expect(problems.map((problem) => problem.kind)).toEqual(["unrepresentablePart", "requiredFieldMissing"]);
+    const image = problems[0];
+    expect(image?.path).toBe("$.conversation.turns[1].parts[0].result.parts[0]");
+    expect(image?.detail).toContain("image/png");
+    expect(image?.detail).toContain("textualizeUnsupportedImage");
+  });
+
+  it("文档拒绝：input_file 的形状从未在真实报文里出现过，占位文本不等于送到了", async () => {
+    const { problems } = await rejected(makeRequest({
+      turns: [{ role: "user", parts: [
+        { kind: "document", media: { source: { kind: "base64", data: "JVBER" }, mediaType: "application/pdf" }, title: "spec" },
+      ] }],
+    }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("unrepresentablePart");
+    expect(problems[0]?.path).toBe("$.conversation.turns[0].parts[0]");
+    expect(problems[0]?.detail).toContain("application/pdf");
+    expect(problems[0]?.detail).toContain("textualizeUnsupportedDocument");
+  });
+
+  it("客户端给了 json_schema 的 name 就照发；没给则拒绝，不替它取名", async () => {
+    const named = await lowerBody(makeRequest({
+      intent: { outputFormat: clientValue({ kind: "jsonSchema", name: "verdict", schema: { type: "object" }, strict: true }) },
+    }));
+    expect(named.body.text).toEqual({
+      format: { type: "json_schema", name: "verdict", schema: { type: "object" }, strict: true },
+    });
+
+    const { problems } = await rejected(makeRequest({
+      intent: { outputFormat: clientValue({ kind: "jsonSchema", schema: { type: "object" } }) },
+    }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("requiredFieldMissing");
+    expect(problems[0]?.path).toBe("$.intent.outputFormat");
+    expect(problems[0]?.detail).toContain("text.format.json_schema");
   });
 
   it("thinking 只有签名没有 encrypted_content 时整条 reasoning 丢弃 —— 两条独立留痕", async () => {

@@ -18,8 +18,8 @@ import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
   clientValue, defaultValue,
-  type IRConversation, type IREvent, type IRIntent, type IRLoss, type IRRequest,
-  type IRToolChoice, type IROutputFormat, type IRReasoning,
+  type IRBuildProblem, type IRConversation, type IREvent, type IRIntent, type IRLoss, type IRRequest,
+  type IRToolChoice, type IROutputFormat, type IRReasoning, type IRWireRequest,
 } from "../src/ir/types.ts";
 
 const TRACE = "tr-test";
@@ -68,6 +68,29 @@ function messagesOf(wire: { body: string }): Array<Record<string, unknown>> {
 
 function findLoss(losses: readonly IRLoss[], fragment: string): IRLoss | undefined {
   return losses.find((loss) => loss.detail.includes(fragment));
+}
+
+/**
+ * `writeUpstreamRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
+ * 万一被拒，失败信息里直接是 problems，而不是一句「wire is undefined」。
+ */
+async function compiled(request: IRRequest): Promise<{
+  readonly wire: IRWireRequest;
+  readonly losses: readonly IRLoss[];
+}> {
+  const built = await egress.writeUpstreamRequest(request);
+  if (!built.ok) throw new Error(`expected a compiled request, got problems: ${JSON.stringify(built.problems)}`);
+  return { wire: built.wire, losses: built.losses };
+}
+
+/** 期望拒绝。返回 problems 与拒绝前已记下的 losses（契约要求两者一并交出）。 */
+async function rejected(request: IRRequest): Promise<{
+  readonly problems: readonly IRBuildProblem[];
+  readonly losses: readonly IRLoss[];
+}> {
+  const built = await egress.writeUpstreamRequest(request);
+  if (built.ok) throw new Error(`expected a rejection, got a wire: ${built.wire.body}`);
+  return { problems: built.problems, losses: built.losses };
 }
 
 function sse(chunks: readonly unknown[], { done = true }: { done?: boolean } = {}): Response {
@@ -164,7 +187,7 @@ describe("lower：wire 形状", () => {
       ],
     }, TRACE);
 
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
+    const { wire, losses } = await compiled(request);
     expect(wire.url).toBe("https://api.openai.com/v1/chat/completions");
     expect(wire.headers.authorization).toBe("Bearer sk-test");
     expect(wire.headers["content-type"]).toBe("application/json");
@@ -204,6 +227,55 @@ describe("lower：wire 形状", () => {
     expect(losses).toEqual([]);
   });
 
+  it("正常请求 ok:true，wire 逐字段锁死", async () => {
+    const request = irRequest({
+      conversation: { turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }] },
+      intent: { stream: clientValue(true), stopping: { maxOutputTokens: clientValue(64) } },
+    });
+    const { wire, losses } = await compiled(request);
+    expect(wire.url).toBe("https://api.openai.com/v1/chat/completions");
+    expect(wire.method).toBe("POST");
+    expect(wire.headers).toEqual({
+      "content-type": "application/json",
+      authorization: "Bearer sk-test",
+    });
+    expect(JSON.parse(wire.body)).toEqual({
+      model: "gpt-5-mini",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: 64,
+    });
+    expect(losses).toEqual([]);
+  });
+
+  it("确定性：同一个 IR 连续构造两次，body 字节完全相同", async () => {
+    const request = irRequest({
+      conversation: {
+        turns: [
+          { role: "user", parts: [{ kind: "text", text: "hi" }] },
+          { role: "assistant", parts: [
+            { kind: "toolCall", call: { id: "call_1", toolRef: { group: "mcp", name: "read" }, input: { kind: "json", value: { path: "/tmp" } } } },
+          ] },
+          { role: "user", parts: [
+            { kind: "toolResult", result: { callId: "call_1", parts: [{ kind: "text", text: "ok" }], status: "ok" } },
+          ] },
+        ],
+        toolset: {
+          tools: [{ kind: "function", ref: { group: "mcp", name: "read" }, description: "r", schema: { type: "object" } }],
+          groups: [{ name: "mcp", members: ["read"] }],
+          choice: clientValue<IRToolChoice>({ kind: "auto" }),
+          parallel: clientValue(true),
+        },
+      },
+    });
+    const first = await compiled(request);
+    const second = await compiled(request);
+    expect(second.wire.body).toBe(first.wire.body);
+    expect(second.wire).toEqual(first.wire);
+    expect(second.losses).toEqual(first.losses);
+  });
+
   it("user 消息里的图片走 image_url，base64 转成 data: URI", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
@@ -215,7 +287,7 @@ describe("lower：wire 形状", () => {
         ],
       }],
     }, TRACE);
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
+    const { wire, losses } = await compiled(request);
     expect(messagesOf(wire)[0]).toEqual({
       role: "user",
       content: [
@@ -226,7 +298,9 @@ describe("lower：wire 形状", () => {
     expect(losses).toEqual([]);
   });
 
-  it("悬空调用补占位 tool 消息，孤儿结果丢弃 —— 两者都会让上游 400", async () => {
+  // 旧行为：悬空调用补一条占位 tool 消息、孤儿结果直接丢，各记一条 loss。
+  // 两者都是「网关替客户端决定」，已剥离到 src/repair —— Core 现在只拒绝。
+  it("悬空调用与孤儿结果一次全收集地拒绝，不发一个上游必然 400 的 body", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
@@ -234,13 +308,53 @@ describe("lower：wire 形状", () => {
         { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ghost", content: "orphan" }] },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
-    const messages = messagesOf(wire);
-    expect(messages.map((message) => message.role)).toEqual(["assistant", "tool"]);
-    expect(messages[1]?.tool_call_id).toBe("toolu_live");
-    expect(String(messages[1]?.content)).toContain("missing from client history");
-    expect(findLoss(losses, "dangling tool call toolu_live")?.kind).toBe("substituted");
-    expect(findLoss(losses, "orphan tool result toolu_ghost")?.kind).toBe("dropped");
+    const { problems } = await rejected(request);
+
+    const dangling = problems.find((problem) => problem.kind === "danglingToolCall");
+    expect(dangling?.path).toBe("$.conversation.turns[0].parts[0]");
+    expect(dangling?.detail).toContain("toolu_live");
+    expect(dangling?.detail).toContain("fillDanglingToolCall");
+
+    const orphan = problems.find((problem) => problem.kind === "orphanToolResult");
+    expect(orphan?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(orphan?.detail).toContain("toolu_ghost");
+    expect(orphan?.detail).toContain("dropOrphanToolResult");
+
+    // 遇到第一个问题就短路的话，客户端要修两轮才能把同一条请求修好。
+    expect(problems).toHaveLength(2);
+  });
+
+  it("三类问题混在一条请求里：全部收齐，且拒绝前的 losses 一并交出", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8, top_k: 40,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_dangling", name: "Bash", input: {} },
+            { type: "tool_use", id: "toolu_empty", name: "Bash", input: {} },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_empty", content: [] },
+            { type: "tool_result", tool_use_id: "toolu_ghost", content: "orphan" },
+          ],
+        },
+      ],
+    }, TRACE);
+    const { problems, losses } = await rejected(request);
+
+    expect(problems.map((problem) => problem.kind).sort()).toEqual(
+      ["danglingToolCall", "orphanToolResult", "requiredFieldMissing"]);
+    expect(problems.map((problem) => problem.path).sort()).toEqual([
+      "$.conversation.turns[0].parts[0]",
+      "$.conversation.turns[1].parts[0]",
+      "$.conversation.turns[1].parts[1]",
+    ]);
+    // 有损条目照样交出：调用方一次就能看全「拒绝理由 + 已经知道会丢什么」。
+    expect(findLoss(losses, "no top_k")?.path).toBe("$.intent.sampling.topK");
   });
 });
 
@@ -261,7 +375,7 @@ describe("lower：每一处降级都留痕", () => {
         },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
+    const { wire, losses } = await compiled(request);
     const assistant = messagesOf(wire)[1];
     expect(assistant?.content).toBe("answer");
 
@@ -281,7 +395,7 @@ describe("lower：每一处降级都留痕", () => {
       metadata: { user_id: JSON.stringify({ session_id: "s-1", account_uuid: "acc-1" }) },
       messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    const { losses } = await egress.writeUpstreamRequest(request);
+    const { losses } = await compiled(request);
 
     const cache = findLoss(losses, "no cache_control");
     expect(cache?.kind).toBe("dropped");
@@ -311,7 +425,7 @@ describe("lower：每一处降级都留痕", () => {
         turns: [{ role: "user", parts: [{ kind: "text", text: "go" }] }],
       },
     });
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
+    const { wire, losses } = await compiled(request);
     const payload = body(wire);
     expect(payload.tools).toEqual([
       { type: "function", function: { name: "apply_patch", description: "patch" } },
@@ -325,42 +439,44 @@ describe("lower：每一处降级都留痕", () => {
     expect(findLoss(losses, "flattened into the tool name")?.kind).toBe("degraded");
   });
 
-  it("工具结果的 is_error 折进正文；空结果补占位", async () => {
+  it("工具结果的 is_error 折进正文 —— 编译事实：写进去的是 IR 里已有的 status", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
-        {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: "toolu_e", name: "Bash", input: {} },
-            { type: "tool_use", id: "toolu_empty", name: "Bash", input: {} },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "tool_result", tool_use_id: "toolu_e", content: "boom", is_error: true },
-            { type: "tool_result", tool_use_id: "toolu_empty", content: [] },
-          ],
-        },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_e", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_e", content: "boom", is_error: true }] },
       ],
     }, TRACE);
-    const { wire, losses } = await egress.writeUpstreamRequest(request);
-    const messages = messagesOf(wire);
-    expect(messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "[tool error] boom" });
-    expect(messages[2]).toEqual({ role: "tool", tool_call_id: "toolu_empty", content: "(empty)" });
+    const { wire, losses } = await compiled(request);
+    expect(messagesOf(wire)[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "[tool error] boom" });
     expect(findLoss(losses, "no is_error flag")?.kind).toBe("degraded");
-    expect(findLoss(losses, "empty tool result replaced")?.kind).toBe("substituted");
+  });
+
+  // 旧行为：空结果补 `(empty)`。那是替客户端宣布「工具跑成功且无输出」，agent 会照着往下走。
+  it("空工具结果拒绝，不再补 `(empty)`", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_empty", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_empty", content: [] }] },
+      ],
+    }, TRACE);
+    const { problems } = await rejected(request);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("requiredFieldMissing");
+    expect(problems[0]?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(problems[0]?.detail).toContain("toolu_empty");
+    expect(problems[0]?.detail).toContain("fillEmptyToolResult");
   });
 
   it("thinking budget 折成 reasoning_effort 档位，effort 越界夹到 high", async () => {
-    const budget = await egress.writeUpstreamRequest(irRequest({
+    const budget = await compiled(irRequest({
       intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", budgetTokens: 8000, display: "summarized" }) },
     }));
     expect(body(budget.wire).reasoning_effort).toBe("high");
     expect(findLoss(budget.losses, "bucketed into reasoning_effort")?.kind).toBe("degraded");
 
-    const clamped = await egress.writeUpstreamRequest(irRequest({
+    const clamped = await compiled(irRequest({
       intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", effort: "xhigh", display: "summarized" }) },
     }));
     expect(body(clamped.wire).reasoning_effort).toBe("high");
@@ -369,24 +485,45 @@ describe("lower：每一处降级都留痕", () => {
     expect(clampLoss?.path).toBe("$.intent.reasoning.effort");
   });
 
-  it("stop 超过 4 条截断；json_schema 缺 name 时补一个", async () => {
-    const { wire, losses } = await egress.writeUpstreamRequest(irRequest({
+  it("stop 超过 4 条截断（编译事实：wire 的容量就是 4）", async () => {
+    const { wire, losses } = await compiled(irRequest({
       intent: {
         stopping: {
           maxOutputTokens: clientValue(256),
           stopSequences: clientValue(["a", "b", "c", "d", "e"]),
         },
+      },
+    }));
+    expect(body(wire).stop).toEqual(["a", "b", "c", "d"]);
+    expect(findLoss(losses, "at most 4 stop sequences")?.kind).toBe("truncated");
+  });
+
+  it("客户端给了 json_schema.name 就照发", async () => {
+    const { wire, losses } = await compiled(irRequest({
+      intent: {
+        outputFormat: clientValue<IROutputFormat>({
+          kind: "jsonSchema", name: "verdict", schema: { type: "object" }, strict: true,
+        }),
+      },
+    }));
+    expect(body(wire).response_format).toEqual({
+      type: "json_schema",
+      json_schema: { name: "verdict", schema: { type: "object" }, strict: true },
+    });
+    expect(losses).toEqual([]);
+  });
+
+  // 旧行为：缺 name 时补 'response'。那个名字会随结构化输出回到客户端手里，网关无权替它取。
+  it("json_schema 缺 name 时拒绝，不再补 'response'", async () => {
+    const { problems } = await rejected(irRequest({
+      intent: {
         outputFormat: clientValue<IROutputFormat>({ kind: "jsonSchema", schema: { type: "object" }, strict: true }),
       },
     }));
-    const payload = body(wire);
-    expect(payload.stop).toEqual(["a", "b", "c", "d"]);
-    expect(payload.response_format).toEqual({
-      type: "json_schema",
-      json_schema: { name: "response", schema: { type: "object" }, strict: true },
-    });
-    expect(findLoss(losses, "at most 4 stop sequences")?.kind).toBe("truncated");
-    expect(findLoss(losses, "requires json_schema.name")?.kind).toBe("substituted");
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("requiredFieldMissing");
+    expect(problems[0]?.path).toBe("$.intent.outputFormat");
+    expect(problems[0]?.detail).toContain("json_schema.name");
   });
 });
 

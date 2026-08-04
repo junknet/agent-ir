@@ -11,6 +11,7 @@ import { createAnthropicUpstream, type AnthropicUpstreamOptions } from "./egress
 import { createGeminiCloudCodeUpstream, type GeminiCloudCodeEgressOptions } from "./egress/gemini_cloudcode.ts";
 import { createChatCompletionsUpstream, type ChatCompletionsUpstreamOptions } from "./egress/openai_chat_completions.ts";
 import { createResponsesUpstream, type ResponsesUpstreamOptions } from "./egress/openai_responses.ts";
+import { createWindsurfUpstream, type WindsurfEgressOptions } from "./egress/windsurf/index.ts";
 import { writeAnthropicResponse } from "./ingress/anthropic_encode.ts";
 import { readAnthropicMessagesRequest } from "./ingress/anthropic_messages.ts";
 import { readChatCompletionsRequest } from "./ingress/openai_chat_completions.ts";
@@ -99,14 +100,30 @@ const geminiCloudCodeEgress: IREgressDescriptor<GeminiCloudCodeEgressOptions> = 
   create: createGeminiCloudCodeUpstream,
 };
 
+/**
+ * Windsurf/Devin 的统一模型网关。模型家族由 `chat_model_uid` 选择，wire 始终是
+ * ConnectRPC + Protobuf，因此它是一个出口而不是新的客户端入口协议。
+ */
+const windsurfEgress: IREgressDescriptor<WindsurfEgressOptions, Uint8Array> = {
+  name: "windsurf",
+  wire: "connectrpc_protobuf_stream",
+  create: createWindsurfUpstream,
+};
+
+
 export const EGRESS_PROVIDERS = {
   anthropic: anthropicEgress,
   openai_chat: chatCompletionsEgress,
   openai_responses: responsesEgress,
   gemini_cloudcode: geminiCloudCodeEgress,
+  windsurf: windsurfEgress,
 } as const satisfies IREgressRegistry;
 
 export {
   anthropicEgress, anthropicMessages, chatCompletionsEgress, geminiCloudCodeEgress,
-  openaiChatCompletions, openaiResponses, responsesEgress,
+  openaiChatCompletions, openaiResponses, responsesEgress, windsurfEgress,
+};
+export {
+  createAnthropicUpstream, createChatCompletionsUpstream,
+  createGeminiCloudCodeUpstream, createResponsesUpstream, createWindsurfUpstream,
 };

@@ -342,7 +342,7 @@ export function readAnthropicMessagesRequest(raw: unknown, traceId: string): Cli
 
   const conversation = {
     system,
-    turns: normalizeTurns(turns, losses),
+    turns: normalizeTurns(turns),
     toolset,
   };
   const partial = {

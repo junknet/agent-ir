@@ -85,6 +85,11 @@ describe("路由数只随出口线性增长", () => {
     expect(PROTOCOLS).not.toContain("gemini_cloudcode" as never);
   });
 
+  it("Windsurf Connect 已在册 —— 它服务不同模型家族，但不是一组按模型拆开的出口", () => {
+    expect(EGRESS_PROVIDERS.windsurf.wire).toBe("connectrpc_protobuf_stream");
+    expect(PROTOCOLS).not.toContain("windsurf" as never);
+  });
+
   it("接一家新上游的边际收益恒为 3 —— 两个函数换三条路由", () => {
     expect(routesPerNewEgress(INGRESS_CODECS)).toBe(PROTOCOLS.length);
 

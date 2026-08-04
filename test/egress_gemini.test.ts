@@ -18,7 +18,7 @@ import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { clientValue, defaultValue } from "../src/ir/types.ts";
 import type {
-  IREvent, IRIntent, IRPart, IRRequest, IRToolset, IRTurn,
+  IRBuildProblem, IREvent, IRIntent, IRPart, IRRequest, IRToolset, IRTurn, IRWireRequest, IRLoss,
 } from "../src/ir/types.ts";
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
@@ -81,6 +81,29 @@ async function collect(events: AsyncIterable<IREvent>): Promise<IREvent[]> {
   const out: IREvent[] = [];
   for await (const event of events) out.push(event);
   return out;
+}
+
+/**
+ * `writeUpstreamRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
+ * 万一被拒，失败信息里直接是 problems，而不是一句「wire is undefined」。
+ */
+async function compiled(request: IRRequest): Promise<{
+  readonly wire: IRWireRequest;
+  readonly losses: readonly IRLoss[];
+}> {
+  const built = await egress.writeUpstreamRequest(request);
+  if (!built.ok) throw new Error(`expected a compiled request, got problems: ${JSON.stringify(built.problems)}`);
+  return { wire: built.wire, losses: built.losses };
+}
+
+/** 期望拒绝。返回 problems 与拒绝前已记下的 losses（契约要求两者一并交出）。 */
+async function rejected(request: IRRequest): Promise<{
+  readonly problems: readonly IRBuildProblem[];
+  readonly losses: readonly IRLoss[];
+}> {
+  const built = await egress.writeUpstreamRequest(request);
+  if (built.ok) throw new Error(`expected a rejection, got a wire: ${built.wire.body}`);
+  return { problems: built.problems, losses: built.losses };
 }
 
 // 真实抓包的签名前缀（原文 400~1200 字符，此处截短）。
@@ -251,7 +274,7 @@ describe("lower：IR → v1internal wire", () => {
       choice: clientValue({ kind: "specific", ref: { group: null, name: "glob" } }),
       parallel: clientValue(true),
     };
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await compiled(request({
       system: [{ kind: "text", text: "you are a gateway" }, { kind: "text", text: "be terse" }],
       toolset,
       turns: [
@@ -330,7 +353,7 @@ describe("lower：IR → v1internal wire", () => {
       choice: defaultValue({ kind: "auto" }),
       parallel: clientValue(false),
     };
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await compiled(request({
       system: [{ kind: "text", text: "sys", cacheBreakpoint: { scope: "ephemeral" } }],
       toolset,
       turns: [
@@ -341,19 +364,21 @@ describe("lower：IR → v1internal wire", () => {
             { kind: "thinking", text: "hmm", signature: "anthropic-sig" },
             { kind: "redactedThinking", data: "zzz" },
             { kind: "opaque", origin: "openai_responses", tag: "web_search_call", raw: { type: "web_search_call" } },
+            { kind: "toolCall", call: { id: "call_shot", toolRef: { group: null, name: "screenshot" }, input: { kind: "json", value: {} } } },
           ],
         },
         {
           role: "user",
           parts: [
-            { kind: "toolResult", result: { callId: "orphan", parts: [{ kind: "image", media: { source: { kind: "base64", data: "AAA" }, mediaType: "image/jpeg" } }], status: "ok" } },
+            { kind: "toolResult", result: { callId: "call_shot", parts: [{ kind: "image", media: { source: { kind: "base64", data: "AAA" }, mediaType: "image/jpeg" } }], status: "ok" } },
           ],
         },
       ],
       intent: intent({
         reasoning: clientValue({ mode: "enabled", effort: "high", budgetTokens: 2048, display: "summarized" }),
         sampling: { topK: clientValue(40), temperature: clientValue(0.2) },
-        stopping: { maxOutputTokens: clientValue(64) },
+        // 6144 = thinkingBudget(2048) + 正文最低额度(4096)：给得下去，才轮得到「留痕」这条路。
+        stopping: { maxOutputTokens: clientValue(6144) },
         contextEdits: [{ kind: "clearThinking", keep: "all", raw: { type: "clear_thinking_20251015" } }],
         serviceTier: clientValue("priority"),
         stream: clientValue(false),
@@ -373,7 +398,6 @@ describe("lower：IR → v1internal wire", () => {
     expect(has("builtin 工具")).toBe(true);
     expect(has("freeform 工具")).toBe(true);
     expect(has("tool group 'mcp'")).toBe(true);
-    expect(has("找不到对应的调用")).toBe(true);                      // 孤儿结果 name 兜底
     expect(has("模型是否真按图片解读未经实测")).toBe(true);           // toolResultImage
     expect(has("关闭并行调用")).toBe(true);
     expect(has("generationConfig.topK")).toBe(true);
@@ -381,23 +405,158 @@ describe("lower：IR → v1internal wire", () => {
     expect(has("上下文编辑指令")).toBe(true);
     expect(has("服务档位")).toBe(true);
     expect(has("streamGenerateContent")).toBe(true);                // 非流式
-    // maxOutputTokens=64 会被思考预算吃光，必须抬高并留痕
-    expect(has("不留正文额度会返回 200 但正文全空")).toBe(true);
-
     const body = JSON.parse(result.wire.body) as Record<string, any>;
-    expect(body.request.generationConfig.maxOutputTokens).toBe(2048 + 4096);
+    // 客户端明确给的额度照发，一个 token 都不替它改
+    expect(body.request.generationConfig.maxOutputTokens).toBe(6144);
     expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingBudget: 2048 });
     expect(body.request.generationConfig.topK).toBeUndefined();
-    // url 图片那条 user、整条思考 assistant 都被清空 → 不进 contents；只剩孤儿结果那条
-    expect(body.request.contents).toHaveLength(1);
-    expect(body.request.contents[0].role).toBe("user");
-    expect(body.request.contents[0].parts[0].functionResponse.name).toBe("tool");
+    // url 图片那条 user 被清空 → 不进 contents；assistant 只剩工具调用
+    expect(body.request.contents.map((content: any) => content.role)).toEqual(["model", "user"]);
+    expect(body.request.contents[1].parts[0].functionResponse.name).toBe("screenshot");
     // builtin 被丢掉，剩下两个声明
     expect(body.request.tools[0].functionDeclarations.map((d: any) => d.name)).toEqual(["apply_patch", "mcp__search"]);
   });
 
+  // 旧行为：孤儿结果的 functionResponse.name 填成 'tool'。那个名字是上游用来找函数声明的，
+  // 编一个等于把「结果对不上调用」伪装成一次正常回传。
+  it("孤儿工具结果拒绝，不再把 functionResponse.name 编成 'tool'", async () => {
+    clearThoughtSignatureCache();
+    const { problems } = await rejected(request({
+      turns: [
+        { role: "user", parts: [{ kind: "text", text: "go" }] },
+        { role: "user", parts: [
+          { kind: "toolResult", result: { callId: "ghost", parts: [{ kind: "text", text: "x" }], status: "ok" } },
+        ] },
+      ],
+    }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("orphanToolResult");
+    expect(problems[0]?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(problems[0]?.detail).toContain("ghost");
+    expect(problems[0]?.detail).toContain("dropOrphanToolResult");
+  });
+
+  // 旧行为：客户端给的 max_tokens 小于思考预算时**擅自抬高**。抬高是在推翻客户端明确写下的
+  // 成本上限；不抬则上游返回 200 但正文全空。两条路都不能默默走，只能拒绝。
+  it("max_tokens 被思考预算吃光时拒绝，不再擅自抬高；多个问题一次全收集", async () => {
+    clearThoughtSignatureCache();
+    const { problems, losses } = await rejected(request({
+      turns: [
+        { role: "user", parts: [{ kind: "text", text: "go" }] },
+        { role: "user", parts: [
+          { kind: "toolResult", result: { callId: "ghost", parts: [{ kind: "text", text: "x" }], status: "ok" } },
+        ] },
+      ],
+      intent: intent({
+        reasoning: clientValue({ mode: "enabled", budgetTokens: 10000, display: "summarized" }),
+        sampling: { topK: clientValue(40) },
+        stopping: { maxOutputTokens: clientValue(20) },
+      }),
+    }));
+    expect(problems.map((problem) => problem.kind).sort()).toEqual(["orphanToolResult", "requiredFieldMissing"]);
+
+    const ceiling = problems.find((problem) => problem.kind === "requiredFieldMissing");
+    expect(ceiling?.path).toBe("$.intent.stopping.maxOutputTokens");
+    expect(ceiling?.detail).toContain("thinkingBudget(10000)");
+    expect(ceiling?.detail).toContain("14096");
+    // 拒绝前记下的有损条目照样交出
+    expect(losses.some((loss) => loss.path === "$.intent.sampling.topK")).toBe(true);
+  });
+
+  it("空工具结果拒绝：以前 status='missing' 会被补一句网关自己写的正文", async () => {
+    clearThoughtSignatureCache();
+    const { problems } = await rejected(request({
+      turns: [
+        { role: "assistant", parts: [
+          { kind: "toolCall", call: { id: "call_e", toolRef: { group: null, name: "bash" }, input: { kind: "json", value: {} } } },
+        ] },
+        { role: "user", parts: [
+          { kind: "toolResult", result: { callId: "call_e", parts: [], status: "missing" } },
+        ] },
+      ],
+    }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.kind).toBe("requiredFieldMissing");
+    expect(problems[0]?.path).toBe("$.conversation.turns[1].parts[0]");
+    expect(problems[0]?.detail).toContain("fillEmptyToolResult");
+  });
+
+  it("客户端没给 max_tokens 时不补默认值：generationConfig 里根本没有这个键", async () => {
+    clearThoughtSignatureCache();
+    const result = await compiled(request({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const body = JSON.parse(result.wire.body) as Record<string, any>;
+    expect("maxOutputTokens" in body.request.generationConfig).toBe(false);
+    expect(result.losses).toEqual([]);
+  });
+
+  it("正常请求 ok:true，wire 逐字段锁死", async () => {
+    clearThoughtSignatureCache();
+    const result = await compiled(request({
+      system: [{ kind: "text", text: "sys" }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: intent({ stopping: { maxOutputTokens: clientValue(1024) } }),
+    }));
+    expect(result.wire.url).toBe("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
+    expect(result.wire.method).toBe("POST");
+    expect(result.wire.headers).toEqual({
+      authorization: "Bearer ya29.test-token",
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      "cache-control": "no-cache",
+      "user-agent": "antigravity/fantasy/1.0.0 linux/amd64",
+    });
+    expect(JSON.parse(result.wire.body)).toEqual({
+      project: "default-cli-project",
+      requestId: "agent/1785856733829/1785856733829/deadbeef/2",
+      model: "gemini-3.6-flash-high",
+      userAgent: "antigravity",
+      requestType: "agent",
+      request: {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        sessionId: "1785856733829",
+        systemInstruction: { role: "user", parts: [{ text: "sys" }] },
+        generationConfig: {
+          maxOutputTokens: 1024,
+          thinkingConfig: { includeThoughts: true },
+        },
+        labels: {
+          used_claude: "false",
+          used_claude_conservative: "false",
+          trajectory_id: "deadbeef",
+          last_step_index: "0",
+          model_enum: "MODEL_PLACEHOLDER_M71",
+        },
+      },
+    });
+    expect(result.losses).toEqual([]);
+  });
+
+  it("确定性：同一个 IR 连续构造两次，body 字节完全相同", async () => {
+    clearThoughtSignatureCache();
+    const fixture = request({
+      system: [{ kind: "text", text: "sys" }],
+      turns: [
+        { role: "user", parts: [{ kind: "text", text: "hi" }] },
+        { role: "assistant", parts: [
+          { kind: "toolCall", call: { id: "call_d", toolRef: { group: null, name: "glob" }, input: { kind: "json", value: { path: "**/*" } } } },
+        ] },
+        { role: "user", parts: [
+          { kind: "toolResult", result: { callId: "call_d", parts: [{ kind: "text", text: "a.txt" }], status: "ok" } },
+        ] },
+      ],
+      intent: intent({ stopping: { maxOutputTokens: clientValue(1024) } }),
+    });
+    const first = await compiled(fixture);
+    const second = await compiled(fixture);
+    expect(second.wire.body).toBe(first.wire.body);
+    expect(second.wire).toEqual(first.wire);
+    expect(second.losses).toEqual(first.losses);
+  });
+
   it("effort 在这里换算成 thinkingBudget（IR 不在 ingress 互转），并留痕", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await compiled(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       intent: intent({ reasoning: clientValue({ mode: "enabled", effort: "high", display: "summarized" }) }),
     }));
@@ -408,7 +567,7 @@ describe("lower：IR → v1internal wire", () => {
   });
 
   it("display:'hidden' 关掉 includeThoughts，不产出 thought part", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await compiled(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       intent: intent({ reasoning: clientValue({ mode: "enabled", budgetTokens: 1000, display: "hidden" }) }),
     }));
@@ -479,7 +638,7 @@ describe("lift：v1internal SSE → IREvent", () => {
     expect(losses[0]).toMatchObject({ kind: "loss", loss: { stage: "lift", kind: "dropped" } });
 
     // 下一轮把同一个 call id 送回来：占位符被真实签名替换，且不再记「没有签名」的 loss
-    const next = await egress.writeUpstreamRequest(request({
+    const next = await compiled(request({
       turns: [
         { role: "user", parts: [{ kind: "text", text: "list" }] },
         { role: "assistant", parts: [{ kind: "toolCall", call: { id: "cKU4A4Y3", toolRef: { group: null, name: "glob" }, input: { kind: "json", value: {} } } }] },

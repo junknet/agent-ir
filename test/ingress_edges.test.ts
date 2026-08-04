@@ -222,7 +222,10 @@ describe("anthropic messages ingress", () => {
     expect(losses).toEqual([]);
   });
 
-  it("孤立的空回合被丢掉并留痕 —— 空 content 是每个上游都拒收的形状", () => {
+  it("孤立的空回合**原样保留**，Core 不丢也不留痕 —— 丢空是策略", () => {
+    // 这条原本断言「丢掉并留痕」，锁的正是被剥离出去的 dropEmptyTurns。
+    // 丢空回合是「我替你删」，已归 repair 层的 dropEmptyTurn；Core 只做确定性编译，
+    // 把空回合原样交给 egress，由各 wire 按自己的编译事实处置。
     const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
@@ -231,9 +234,9 @@ describe("anthropic messages ingress", () => {
         { role: "user", content: "second" },
       ],
     }, TRACE);
-    expect(request.conversation.turns.map((t) => t.role)).toEqual(["user"]);
-    expect(partsOfTurn(request, 0).map((p) => (p.kind === "text" ? p.text : p.kind))).toEqual(["first", "second"]);
-    expect(losses.some((l) => l.kind === "dropped" && l.detail.includes("empty"))).toBe(true);
+    expect(request.conversation.turns.map((t) => t.role)).toEqual(["user", "assistant", "user"]);
+    expect(partsOfTurn(request, 1)).toEqual([]);
+    expect(losses).toEqual([]);
   });
 
   it("非对象 body 直接抛，不产出半个 IR", () => {

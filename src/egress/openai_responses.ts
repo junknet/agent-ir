@@ -19,11 +19,15 @@
  *
  * 与 Anthropic 出口最大的结构差异：`input` 是**扁平 item 序列**，工具调用/结果/推理各自
  * 是独立 item，靠 call_id 关联。IR 本来就是这个形态，所以这里不需要 `arrangeToolTurns`
- * 那种位置重排，只需要补全「调用必须有对应输出」这一条上游硬约束。
+ * 那种位置重排，只需要核对「调用必须有对应输出」这一条上游硬约束。
+ *
+ * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
+  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss,
+  UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
   IRRequest, IRStopReason, IRTool, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -34,7 +38,7 @@ const PROVIDER = "openai_responses";
  *
  * toolGroup / toolFreeform / toolBuiltin 三项是这个出口独有的原生能力（见文件头）。
  * `document` 不在这里：`input_file` 在 80 条归档请求与 94 份 rollout 里**一次都没出现过**，
- * 拿不准的形状写进 supports 等于拿整条请求赌一个 400，所以它降级进 lossy 走文本占位。
+ * 拿不准的形状写进 supports 等于拿整条请求赌一个 400；它也不在 lossy 里 —— 见下方说明。
  */
 const SUPPORTED = [
   "stream", "nonStream", "systemPrompt", "multiTurn", "image",
@@ -49,9 +53,6 @@ const SUPPORTED = [
  *   thinkingSignature  Anthropic 的签名思考块在 Responses 没有载体（这里的凭据是
  *                      `reasoning.encrypted_content`），签名只能丢
  *   reasoningBudget    Responses 没有 token 预算参数，只能折算成 effort 档
- *   document           无实测形状，退化成文本占位符，正文不到达模型
- *   toolResultImage    `function_call_output.output` 实测只见过字符串与 input_text 数组
- *                      （rollout 7901+1176 条无一例外），图片退化成占位文本
  *   toolResultError    输出 item 没有 is_error 之类的错误位，只能把错误性写进正文
  *   cacheBreakpoint    Responses 自动缓存（prompt_cache_key），没有显式断点
  *   contextEdit        没有等价的历史处置指令，只能整条丢
@@ -62,9 +63,17 @@ const SUPPORTED = [
  * 重叠时准入先命中 supports 直接放行，上面逐条写下的降级动作与 IRLoss 就一条都不会发生。
  */
 const LOSSY = [
-  "thinkingSignature", "reasoningBudget", "document", "toolResultImage", "toolResultError",
+  "thinkingSignature", "reasoningBudget", "toolResultError",
   "cacheBreakpoint", "contextEdit", "stopSequences", "topK",
 ] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
+
+// 两个集合都不放，因此准入层直接判这家上游不可用并给出精确 IR 路径：
+//   document         `input_file` 的形状在 80 条归档请求与 94 份 rollout 里一次都没出现过。
+//                    以前它在 lossy 里，靠一句文本占位符「承载」—— 那不是承载，是网关替
+//                    客户端决定让模型看一句转述。占位是策略（`textualizeUnsupportedDocument`），
+//                    所以这条能力的诚实结论是：这条路线载不动。
+//   toolResultImage  `function_call_output.output` 实测只有 string 与 input_text 两种形态
+//                    （rollout 7901+1176 条无一例外）。同上：占位文本不等于把像素送到了。
 
 export interface ResponsesUpstreamOptions {
   readonly baseUrl: string;
@@ -74,12 +83,30 @@ export interface ResponsesUpstreamOptions {
   readonly extraHeaders?: Readonly<Record<string, string>>;
 }
 
-class UpstreamRequestLosses {
+/**
+ * 一次构造的全部产出：**有损留痕**与**拒绝理由**收在同一个对象里。
+ *
+ * 分界线（本文件每一处判定都由它推出）：
+ *   - **编译事实**（`record`）：Responses 的 wire 真的没有这个位置，而 Core **不必写出
+ *     任何客户端没说过的内容**。例如输出 item 没有错误位、没有 stop 参数、没有 top_k、
+ *     没有显式缓存断点、effort 只有那几档。
+ *   - **策略**（`reject`）：Core 得**发明内容、补默认值或拿文本占位符顶替**才能凑出一个
+ *     合法 body。这类决定换一个调用方就想要不同结果，归 `src/repair`；Core 带路径拒绝。
+ *
+ * 拒绝**收集齐再返回**，不短路：调用方一次看全才能一次修完。
+ */
+class UpstreamRequestReport {
   readonly #losses: IRLoss[] = [];
+  readonly #problems: IRBuildProblem[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
   }
+  reject(problem: IRBuildProblem): void {
+    this.#problems.push(problem);
+  }
+  get rejected(): boolean { return this.#problems.length > 0; }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
+  drainProblems(): readonly IRBuildProblem[] { return [...this.#problems]; }
 }
 
 type WireItem = Record<string, unknown>;
@@ -110,7 +137,7 @@ type CallKind = "function" | "custom";
  * `role` 参与判定：assistant 的 content 只接受 `output_text`，图片之类只能出现在输入侧。
  */
 function lowerContentPart(
-  part: IRPart, role: "user" | "assistant" | "developer", path: string, losses: UpstreamRequestLosses,
+  part: IRPart, role: "user" | "assistant" | "developer", path: string, report: UpstreamRequestReport,
 ): WireItem | null {
   switch (part.kind) {
     case "text":
@@ -120,25 +147,29 @@ function lowerContentPart(
         : { type: "input_text", text: part.text };
     case "image":
       if (role === "assistant") {
-        losses.record({ path, kind: "dropped", detail: "assistant message content accepts output_text only; image dropped" });
+        report.record({ path, kind: "dropped", detail: "assistant message content accepts output_text only; image dropped" });
         return null;
       }
       // 实测 input_image.image_url 是**裸字符串**（可能是 data: URL），不是嵌套对象。
       return { type: "input_image", image_url: dataUrl(part) };
     case "document":
-      losses.record({
-        path, kind: "dropped",
-        detail: `document (${part.media.mediaType}) replaced by a text marker: the Responses input_file shape is not present in any archived request or rollout, and guessing it costs the whole request a 400`,
+      // **策略**，已剥离：`input_file` 的形状在 80 条归档请求与 94 份 rollout 里一次都没
+      // 出现过，这条路线**载不动文档**。以前换成一句「这里本来有个文档」的占位文本 ——
+      // 那是网关替客户端决定「让模型看一句转述而不是正文」，模型据此作答会像读过一份
+      // 它从没读过的文件。载不动就说载不动；要占位的调用方显式 compose
+      // `textualizeUnsupportedDocument`。
+      report.reject({
+        kind: "unrepresentablePart",
+        path,
+        detail: `document (${part.media.mediaType}) has no verified carrier on /v1/responses: the input_file shape `
+          + "appears in no archived request or rollout, and the gateway will not substitute a text description "
+          + "(compose repair 'textualizeUnsupportedDocument' to accept that trade)",
       });
-      return {
-        type: role === "assistant" ? "output_text" : "input_text",
-        text: `[gateway: a ${part.media.mediaType} document was attached here but this upstream route cannot carry it; its contents are unavailable]`,
-        ...(role === "assistant" ? { annotations: [] } : {}),
-      };
+      return null;
     case "opaque":
       // 同源原样放回（无损往返）；异源没法翻译，丢弃留痕。
       if (part.origin === "openai_responses" && isRecord(part.raw)) return part.raw;
-      losses.record({
+      report.record({
         path, kind: "dropped",
         detail: `opaque part from ${part.origin} (${part.tag}) has no Responses content representation`,
       });
@@ -148,14 +179,14 @@ function lowerContentPart(
     case "toolCall":
     case "toolResult":
       // 这四种在 Responses 里是**独立 item**，不是 message 的 content，由调用方分流。
-      losses.record({ path, kind: "dropped", detail: `'${part.kind}' is not a message content shape and was not routed to its own item` });
+      report.record({ path, kind: "dropped", detail: `'${part.kind}' is not a message content shape and was not routed to its own item` });
       return null;
   }
 }
 
 /** 工具结果 parts → 输出 item 的 `output`。实测形态：字符串，或 `input_text` 数组。 */
 function lowerToolOutput(
-  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, losses: UpstreamRequestLosses,
+  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, report: UpstreamRequestReport,
 ): Array<WireItem> {
   const blocks: WireItem[] = [];
   parts.forEach((part, index) => {
@@ -165,38 +196,51 @@ function lowerToolOutput(
       return;
     }
     if (part.kind === "image") {
-      // rollout 里 7901 条 custom_tool_call_output + 1176 条 function_call_output 的 output
-      // 只有 string 与 input_text 数组两种形态，没有一条带图片。塞进去可能 400，塞 data URL
-      // 文本则是几十万 token 的哑弹 —— 两者都不如一个模型看得懂的占位符。
-      losses.record({
-        path: childPath, kind: "dropped",
-        detail: `tool result image (${part.media.mediaType}) replaced by a text marker: Responses tool output carries text parts only`,
+      // **策略**，已剥离：rollout 里 7901 条 custom_tool_call_output + 1176 条
+      // function_call_output 的 output 只有 string 与 input_text 两种形态，没有一条带图片
+      // —— 工具输出**载不动像素**，这是编译事实。但把它换成一句占位文本是网关替客户端
+      // 决定「模型看一句转述就够了」，而截图类工具的全部价值恰恰在像素上。
+      report.reject({
+        kind: "unrepresentablePart",
+        path: childPath,
+        detail: `tool result image (${part.media.mediaType}) has no carrier in a Responses tool output (verified over `
+          + "9077 rollout output items: string or input_text only), and the gateway will not substitute a text marker "
+          + "(compose repair 'textualizeUnsupportedImage' to accept that trade)",
       });
-      blocks.push({ type: "input_text", text: `[gateway: tool returned a ${part.media.mediaType} image; this upstream route cannot carry it]` });
       return;
     }
-    losses.record({ path: childPath, kind: "dropped", detail: `'${part.kind}' has no representation inside a Responses tool output` });
+    report.record({ path: childPath, kind: "dropped", detail: `'${part.kind}' has no representation inside a Responses tool output` });
   });
   if (status === "error") {
-    // 输出 item 上没有 is_error 之类的错误位。不标记的话模型会当成执行成功 —— 那正是
-    // 「假装工具返回空」那类最贵的静默失败，所以把错误性写进正文并留痕。
-    losses.record({
+    // **编译事实**：输出 item 上没有 is_error 之类的错误位，正文是唯一的承载位置，而写
+    // 进去的是 IR 里**已有的** status，不是发明出来的内容。不标记的话模型会当成执行成功
+    // —— 那正是「假装工具返回空」那类最贵的静默失败。
+    report.record({
       path, kind: "degraded",
       detail: "Responses tool output has no error flag; the failure is marked inside the output text instead",
     });
     blocks.unshift({ type: "input_text", text: "[gateway: this tool call failed]" });
   }
-  if (blocks.length === 0) blocks.push({ type: "input_text", text: "" });
+  if (blocks.length === 0) {
+    // **策略**，已剥离：以前补一个空的 input_text。空串对模型的意思是「工具跑完了，
+    // 没有输出」，而 IR 说的只是「没有内容」—— 把未知说成成功是最贵的那种谎。
+    report.reject({
+      kind: "requiredFieldMissing",
+      path,
+      detail: "tool output lowers to zero content blocks; Responses needs an output and the gateway will not "
+        + "invent one (compose repair 'fillEmptyToolResult' to choose the wording)",
+    });
+  }
   return blocks;
 }
 
-function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, losses: UpstreamRequestLosses): WireItem {
+function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, report: UpstreamRequestReport): WireItem {
   const { call } = part;
   if (call.input.kind === "text") {
     // freeform 的原生形态。实测 custom_tool_call 的键集是 {type,id,status,call_id,name,input}，
     // **没有 namespace** —— 分组的 freeform 工具只能在调用侧丢掉分组。
     if (call.toolRef.group !== null) {
-      losses.record({
+      report.record({
         path, kind: "degraded",
         detail: `custom_tool_call carries no namespace field (verified over 7901 rollout items); group '${call.toolRef.group}' is not recoverable from the call item`,
       });
@@ -222,13 +266,13 @@ function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: st
  * summary-only 的形状从未在真实报文里出现过，赌它能过等于赌整条请求。跨协议进来的
  * Anthropic 签名思考正好落在这一支，丢弃并留痕（codex_provider 的做法也是整段不译）。
  */
-function lowerReasoningRun(run: readonly IRPart[], path: string, losses: UpstreamRequestLosses): WireItem | null {
+function lowerReasoningRun(run: readonly IRPart[], path: string, report: UpstreamRequestReport): WireItem | null {
   const summary: WireItem[] = [];
   let encrypted: string | null = null;
   for (const part of run) {
     if (part.kind === "thinking") {
       if (part.signature !== undefined) {
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "thinking signature has no carrier on Responses; the round-trip credential here is reasoning.encrypted_content",
         });
@@ -239,7 +283,7 @@ function lowerReasoningRun(run: readonly IRPart[], path: string, losses: Upstrea
     if (part.kind === "redactedThinking") encrypted = part.data;
   }
   if (encrypted === null) {
-    losses.record({
+    report.record({
       path, kind: "dropped",
       detail: "reasoning item dropped: without encrypted_content it cannot be replayed on this endpoint (store=false), and a summary-only reasoning item has never appeared in real traffic",
     });
@@ -253,10 +297,14 @@ interface LoweredConversation {
   readonly items: readonly WireItem[];
 }
 
-function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): LoweredConversation {
+function lowerConversation(request: IRRequest, report: UpstreamRequestReport): LoweredConversation {
   const { conversation } = request;
   const items: WireItem[] = [];
   const callKinds = new Map<string, CallKind>();
+  // 配对检查在 **IR 层**做，不在 wire item 上做：wire item 只剩 call_id，拒绝时报不出
+  // 「是哪个 part」，而拒绝的全部价值就在这条路径上。
+  const callSites = new Map<string, string>();
+  const outputSites = new Map<string, string>();
   let cacheBreakpoints = 0;
 
   const countCache = (part: IRPart): void => {
@@ -275,7 +323,7 @@ function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): L
       if (part.text.length > 0) instructionLines.push(part.text);
       return;
     }
-    const block = lowerContentPart(part, "developer", path, losses);
+    const block = lowerContentPart(part, "developer", path, report);
     if (block !== null) developerContent.push(block);
   });
   if (developerContent.length > 0) {
@@ -295,7 +343,7 @@ function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): L
     let reasoningRun: IRPart[] = [];
     const flushReasoning = (path: string): void => {
       if (reasoningRun.length === 0) return;
-      const item = lowerReasoningRun(reasoningRun, path, losses);
+      const item = lowerReasoningRun(reasoningRun, path, report);
       reasoningRun = [];
       if (item !== null) items.push(item);
     };
@@ -313,20 +361,22 @@ function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): L
       if (part.kind === "toolCall") {
         flush();
         callKinds.set(part.call.id, part.call.input.kind === "text" ? "custom" : "function");
-        items.push(lowerToolCallItem(part, path, losses));
+        callSites.set(part.call.id, path);
+        items.push(lowerToolCallItem(part, path, report));
         continue;
       }
       if (part.kind === "toolResult") {
         flush();
+        outputSites.set(part.result.callId, path);
         const kind = callKinds.get(part.result.callId) ?? "function";
         items.push({
           type: kind === "custom" ? "custom_tool_call_output" : "function_call_output",
           call_id: part.result.callId,
-          output: lowerToolOutput(part.result.parts, part.result.status, path, losses),
+          output: lowerToolOutput(part.result.parts, part.result.status, path, report),
         });
         continue;
       }
-      const block = lowerContentPart(part, turn.role, path, losses);
+      const block = lowerContentPart(part, turn.role, path, report);
       if (block !== null) pending.push(block);
     }
     flushReasoning(`$.conversation.turns[${turnIndex}]`);
@@ -334,71 +384,64 @@ function lowerConversation(request: IRRequest, losses: UpstreamRequestLosses): L
   }
 
   if (cacheBreakpoints > 0) {
-    losses.record({
+    report.record({
       path: "$.conversation", kind: "dropped",
       detail: `${cacheBreakpoints} ephemeral cache breakpoint(s) dropped; Responses caches automatically (prompt_cache_key) and has no explicit breakpoint`,
     });
   }
 
-  return { instructions: instructionLines.join("\n\n"), items: reconcileToolItems(items, losses) };
+  checkToolPairing(callSites, outputSites, report);
+  return { instructions: instructionLines.join("\n\n"), items };
 }
 
 /**
- * 补全上游的唯一硬约束：**每个 function_call / custom_tool_call 都必须有配对的输出 item**
+ * 上游的唯一硬约束：**每个 function_call / custom_tool_call 都必须有配对的输出 item**
  * （缺了 400 "No tool output found for function call"，多了同样 400）。
  *
- * 与 Anthropic 出口的区别在于这里**不重排位置**：Responses 的 item 序列没有「结果必须紧邻
- * 且最前」那套排列规则，IR 的顺序直接就是合法顺序，只需要补洞和去孤儿。
+ * 这里**只裁决、不动手**。原先的补占位输出与丢孤儿都是策略，已剥离：
+ *   - 悬空调用补 `[gateway: tool result missing…]` —— 网关编了一段模型会读到的正文；
+ *   - 孤儿结果直接丢 —— 客户端真送来的工具输出就此蒸发。
+ * 两条在 `IR_REPAIR_KINDS` 里各有对应项（`fillDanglingToolCall` / `dropOrphanToolResult`），
+ * 由调用方显式 compose。
+ *
+ * 位置本身不需要处理：Responses 的 item 序列没有「结果必须紧邻且最前」那套排列规则，
+ * IR 的顺序直接就是合法顺序 —— 这正是它相对 Anthropic / Chat 出口省下的一整套重排。
  */
-function reconcileToolItems(items: readonly WireItem[], losses: UpstreamRequestLosses): WireItem[] {
-  const isCall = (item: WireItem): boolean => item.type === "function_call" || item.type === "custom_tool_call";
-  const isOutput = (item: WireItem): boolean =>
-    item.type === "function_call_output" || item.type === "custom_tool_call_output";
-
-  const callIds = new Set<string>();
-  const answered = new Set<string>();
-  for (const item of items) {
-    const callId = asString(item.call_id);
-    if (callId === null) continue;
-    if (isCall(item)) callIds.add(callId);
-    else if (isOutput(item)) answered.add(callId);
-  }
-
-  const out: WireItem[] = [];
-  for (const item of items) {
-    const callId = asString(item.call_id);
-    if (isOutput(item) && (callId === null || !callIds.has(callId))) {
-      losses.record({
-        path: "$.conversation.turns", kind: "dropped",
-        detail: `orphan tool result ${callId ?? "<no call_id>"} has no matching call and is rejected upstream`,
-      });
-      continue;
-    }
-    out.push(item);
-    if (!isCall(item) || callId === null || answered.has(callId)) continue;
-    // 悬空调用：客户端历史缺了结果。措辞要让模型知道结果不可信 —— 假装工具返回空
-    // 会让 agent 以为命令执行成功且无输出。
-    out.push({
-      type: item.type === "custom_tool_call" ? "custom_tool_call_output" : "function_call_output",
-      call_id: callId,
-      output: [{ type: "input_text", text: "[gateway: tool result missing from client history; treat as unknown]" }],
-    });
-    losses.record({
-      path: "$.conversation.turns", kind: "substituted",
-      detail: `dangling tool call ${callId} filled with an explicit placeholder output`,
+function checkToolPairing(
+  callSites: ReadonlyMap<string, string>,
+  outputSites: ReadonlyMap<string, string>,
+  report: UpstreamRequestReport,
+): void {
+  for (const [callId, path] of callSites) {
+    if (outputSites.has(callId)) continue;
+    report.reject({
+      kind: "danglingToolCall",
+      path,
+      detail: `tool call ${callId} has no tool output in the conversation; /v1/responses answers an unpaired call `
+        + "with 400 \"No tool output found for function call\", and the gateway will not invent an output "
+        + "(compose repair 'fillDanglingToolCall' to choose the placeholder wording)",
     });
   }
-  return out;
+  for (const [callId, path] of outputSites) {
+    if (callSites.has(callId)) continue;
+    report.reject({
+      kind: "orphanToolResult",
+      path,
+      detail: `tool result ${callId} has no matching tool call; /v1/responses rejects an output item whose call_id `
+        + "it never issued, and dropping it would hide an output the client did send "
+        + "(compose repair 'dropOrphanToolResult' to discard it deliberately)",
+    });
+  }
 }
 
-function lowerTools(request: IRRequest, losses: UpstreamRequestLosses): WireItem[] {
+function lowerTools(request: IRRequest, report: UpstreamRequestReport): WireItem[] {
   const { toolset } = request.conversation;
 
   const lowerOne = (tool: IRTool, index: number): WireItem => {
     const path = `$.conversation.toolset.tools[${index}]`;
     if (tool.kind === "function") {
       if (tool.deferLoading === true) {
-        losses.record({ path, kind: "dropped", detail: "defer_loading is an Anthropic-only hint with no Responses equivalent" });
+        report.record({ path, kind: "dropped", detail: "defer_loading is an Anthropic-only hint with no Responses equivalent" });
       }
       return {
         type: "function", name: tool.ref.name, description: tool.description,
@@ -465,10 +508,10 @@ const SUMMARY_WIRE: Readonly<Record<IRReasoningDisplay, string | null>> = {
   hidden: null, summarized: "auto", full: "detailed",
 };
 
-function lowerReasoningConfig(request: IRRequest, losses: UpstreamRequestLosses): Record<string, unknown> | null {
+function lowerReasoningConfig(request: IRRequest, report: UpstreamRequestReport): Record<string, unknown> | null {
   const reasoning = request.intent.reasoning.value;
   if (reasoning.mode === "disabled") {
-    losses.record({
+    report.record({
       path: "$.intent.reasoning", kind: "dropped",
       detail: "Responses has no verified switch to turn reasoning off on a reasoning model; the request is sent without a reasoning field and the upstream decides",
     });
@@ -477,27 +520,33 @@ function lowerReasoningConfig(request: IRRequest, losses: UpstreamRequestLosses)
 
   let effort = reasoning.effort;
   if (effort !== undefined && EFFORT_WIRE[effort] !== effort) {
-    losses.record({
+    // **编译事实**：wire 的档位枚举没有 xhigh/max 这两级，夹进可表达区间是唯一的承载
+    // 方式。客户端「尽量多想」的意图仍以最高可表达档位生效，少的只是分辨率，Core 没有
+    // 引入任何客户端没说过的新维度。
+    report.record({
       path: "$.intent.reasoning.effort", kind: "substituted",
       detail: `effort '${effort}' is not an accepted Responses value; clamped to '${EFFORT_WIRE[effort]}'`,
     });
   }
   if (reasoning.budgetTokens !== undefined) {
     if (effort === undefined) {
+      // **编译事实**：Responses 只有档位这一根推理强度轴，token 预算在 wire 上没有位置。
+      // 换算是同一根轴上的降分辨率（`reasoningBudget` 因此在 LOSSY 里声明过），
+      // 不是替客户端引入一个新的意图。
       effort = effortFromBudget(reasoning.budgetTokens);
-      losses.record({
+      report.record({
         path: "$.intent.reasoning.budgetTokens", kind: "substituted",
         detail: `Responses has no reasoning token budget; budget_tokens=${reasoning.budgetTokens} converted to effort '${effort}'`,
       });
     } else {
-      losses.record({
+      report.record({
         path: "$.intent.reasoning.budgetTokens", kind: "dropped",
         detail: `Responses has no reasoning token budget; budget_tokens=${reasoning.budgetTokens} dropped in favour of the explicit effort '${effort}'`,
       });
     }
   }
   if (reasoning.display === "full") {
-    losses.record({
+    report.record({
       path: "$.intent.reasoning.display", kind: "degraded",
       detail: "Responses only ever returns a reasoning summary; the full reasoning text is never exposed",
     });
@@ -521,26 +570,26 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
     profile,
 
     async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const losses = new UpstreamRequestLosses();
+      const report = new UpstreamRequestReport();
       const { conversation, intent } = request;
-      const { instructions, items } = lowerConversation(request, losses);
-      const tools = lowerTools(request, losses);
-      const reasoning = lowerReasoningConfig(request, losses);
+      const { instructions, items } = lowerConversation(request, report);
+      const tools = lowerTools(request, report);
+      const reasoning = lowerReasoningConfig(request, report);
 
       if (intent.stopping.stopSequences !== undefined) {
-        losses.record({
+        report.record({
           path: "$.intent.stopping.stopSequences", kind: "dropped",
           detail: "/v1/responses has no stop parameter (only Chat Completions does); stop sequences are not enforced upstream",
         });
       }
       if (intent.sampling.topK !== undefined) {
-        losses.record({
+        report.record({
           path: "$.intent.sampling.topK", kind: "dropped",
           detail: "Responses exposes temperature and top_p only; top_k has no equivalent",
         });
       }
       if (intent.contextEdits.length > 0) {
-        losses.record({
+        report.record({
           path: "$.intent.contextEdits", kind: "dropped",
           detail: `${intent.contextEdits.length} context edit instruction(s) dropped; Responses has no history-editing directive (truncation:'auto' is not equivalent)`,
         });
@@ -550,20 +599,28 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
       let text: Record<string, unknown> | undefined;
       if (outputFormat.kind === "jsonSchema") {
         if (outputFormat.name === undefined) {
-          // json_schema 格式上游要求带 name，缺了直接 400。补一个并留痕。
-          losses.record({
-            path: "$.intent.outputFormat", kind: "substituted",
-            detail: "Responses requires a name on text.format.json_schema; gateway supplied 'response'",
+          // **策略**，已剥离：name 是上游必填字段，客户端没给。以前补 'response' —— 那个
+          // 名字会随结构化输出回到客户端手里，替它取名等于替它定了一个对外可见的标识。
+          report.reject({
+            kind: "requiredFieldMissing",
+            path: "$.intent.outputFormat",
+            detail: "Responses requires a name on text.format.json_schema and the client stated none; "
+              + "the gateway will not name the client's schema for it",
           });
         }
-        text = {
+        text = outputFormat.name === undefined ? undefined : {
           format: {
             type: "json_schema",
-            name: outputFormat.name ?? "response",
+            name: outputFormat.name,
             schema: outputFormat.schema,
             ...(outputFormat.strict === true ? { strict: true } : {}),
           },
         };
+      }
+
+      // 拒绝时**不构造 body**：半个非法请求体连序列化出来的机会都不该有。
+      if (report.rejected) {
+        return { ok: false, problems: report.drainProblems(), losses: report.drain() };
       }
 
       const body: Record<string, unknown> = {
@@ -591,6 +648,7 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
       };
 
       return {
+        ok: true,
         wire: {
           url: `${options.baseUrl.replace(/\/$/u, "")}/responses`,
           method: "POST",
@@ -602,7 +660,7 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
           },
           body: JSON.stringify(body),
         },
-        losses: losses.drain(),
+        losses: report.drain(),
       };
     },
 

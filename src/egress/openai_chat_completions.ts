@@ -11,6 +11,9 @@
  *      判别位藏在形状里（choices / usage / error）。因此 lift 先把 chunk 归形状，
  *      再对形状做 switch，缺省分支照样产出 unhandled —— 归不了形状的 chunk 就是上游漂移。
  *
+ * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
+ *
  * 真实报文出处：`gateway-traffic-logs/*.ndjson` 里 108115 条
  * `chat.completion.chunk`（deepseek-v4-flash / kimi-k3 / glm-5 等兼容端点）。两个反直觉的
  * 实测点已在下面对应位置注明：`delta.content` 常态是 **null** 而不是缺省；工具调用的
@@ -18,7 +21,8 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart,
+  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss,
+  UpstreamRequestBuildResult, IRPart,
   IRRequest, IRStopReason, IRToolResult, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -85,12 +89,31 @@ export interface ChatCompletionsUpstreamOptions {
 
 // ── lower ──────────────────────────────────────────────────────────────────
 
-class UpstreamRequestLosses {
+/**
+ * 一次构造的全部产出：**有损留痕**与**拒绝理由**收在同一个对象里。
+ *
+ * 分界线只有一条，本文件每一处判定都由它推出：
+ *   - **编译事实**（`record`）：Chat 的 wire 真的没有这个位置，而 Core **不必替客户端
+ *     写出任何值** —— 少掉的是供应商私有字段、结构位或强度分辨率。例如 tool 消息只吃文本、
+ *     没有 is_error、没有 cache_control、effort 只有四档。
+ *   - **策略**（`reject`）：Core 得**发明内容、补默认值或拿占位符顶替**才能凑出一个合法
+ *     body。这类决定换一个调用方就想要不同结果，所以它属于 `src/repair`，不属于编译；
+ *     Core 带着精确 IR 路径拒绝。
+ *
+ * 拒绝是**收集齐再返回**，不是遇到第一个就短路：调用方一次看全才能一次修完。
+ */
+class UpstreamRequestReport {
   readonly #losses: IRLoss[] = [];
+  readonly #problems: IRBuildProblem[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
   }
+  reject(problem: IRBuildProblem): void {
+    this.#problems.push(problem);
+  }
+  get rejected(): boolean { return this.#problems.length > 0; }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
+  drainProblems(): readonly IRBuildProblem[] { return [...this.#problems]; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -103,9 +126,9 @@ function flatToolName(group: string | null, name: string): string {
 }
 
 /** 缓存断点在 Chat 上无处安放。每个带断点的 part 各记一条，路径指到具体位置。 */
-function noteCacheBreakpoint(part: IRPart, path: string, losses: UpstreamRequestLosses): void {
+function noteCacheBreakpoint(part: IRPart, path: string, report: UpstreamRequestReport): void {
   if (part.cacheBreakpoint === undefined) return;
-  losses.record({
+  report.record({
     path: `${path}.cacheBreakpoint`, kind: "dropped",
     detail: "Chat Completions has no cache_control; prefix caching is implicit and cannot be steered",
   });
@@ -118,13 +141,13 @@ function imageUrl(part: Extract<IRPart, { kind: "image" }>): string {
 }
 
 /** system 只能是文本。多个 part 之间用换行拼接，非文本 part 各记一条 loss。 */
-function lowerSystem(parts: readonly IRPart[], losses: UpstreamRequestLosses): string {
+function lowerSystem(parts: readonly IRPart[], report: UpstreamRequestReport): string {
   const chunks: string[] = [];
   parts.forEach((part, index) => {
     const path = `$.conversation.system[${index}]`;
-    noteCacheBreakpoint(part, path, losses);
+    noteCacheBreakpoint(part, path, report);
     if (part.kind === "text") { chunks.push(part.text); return; }
-    losses.record({
+    report.record({
       path, kind: "dropped",
       detail: `system message content must be text on Chat Completions; '${part.kind}' part has no representation`,
     });
@@ -138,12 +161,12 @@ type ChatContent = string | Array<Record<string, unknown>>;
  * user 回合的内容。只要出现非文本元素就切成数组形态，否则保持字符串
  * —— 兼容端点对字符串 content 的支持面最广，能不用数组就不用。
  */
-function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: UpstreamRequestLosses): ChatContent {
+function lowerUserContent(parts: readonly IRPart[], turnPath: string, report: UpstreamRequestReport): ChatContent {
   const blocks: Array<Record<string, unknown>> = [];
   let structured = false;
   parts.forEach((part, index) => {
     const path = `${turnPath}.parts[${index}]`;
-    noteCacheBreakpoint(part, path, losses);
+    noteCacheBreakpoint(part, path, report);
     switch (part.kind) {
       case "text":
         if (part.text.length > 0) blocks.push({ type: "text", text: part.text });
@@ -153,27 +176,27 @@ function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: Up
         blocks.push({ type: "image_url", image_url: { url: imageUrl(part) } });
         break;
       case "document":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "Chat Completions has no portable document part; compatible endpoints reject the OpenAI-only `file` block",
         });
         break;
       case "thinking":
       case "redactedThinking":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "Chat Completions has no place for thinking content inside a user message",
         });
         break;
       case "toolCall":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "a tool call cannot be carried by a user message; Chat puts tool_calls on the assistant message",
         });
         break;
       case "toolResult":
         // 正常路径下工具结果已被 arrangeMessages 摘走并铺成 role:'tool' 消息。
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `tool result ${part.result.callId} could not be placed after its call`,
         });
@@ -185,7 +208,7 @@ function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: Up
           blocks.push(part.raw);
           break;
         }
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `opaque part from ${part.origin} (${part.tag}) has no Chat Completions representation`,
         });
@@ -199,16 +222,17 @@ function lowerUserContent(parts: readonly IRPart[], turnPath: string, losses: Up
 interface AssistantMessage {
   readonly content: string;
   readonly toolCalls: Array<Record<string, unknown>>;
-  readonly callIds: string[];
+  /** 调用 id 连同它的 IR 路径：悬空时拒绝要指到**声明它的那个 part**，不是笼统的回合。 */
+  readonly calls: Array<{ readonly id: string; readonly path: string }>;
 }
 
-function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: UpstreamRequestLosses): AssistantMessage {
+function lowerAssistant(parts: readonly IRPart[], turnPath: string, report: UpstreamRequestReport): AssistantMessage {
   const texts: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
-  const callIds: string[] = [];
+  const calls: Array<{ id: string; path: string }> = [];
   parts.forEach((part, index) => {
     const path = `${turnPath}.parts[${index}]`;
-    noteCacheBreakpoint(part, path, losses);
+    noteCacheBreakpoint(part, path, report);
     switch (part.kind) {
       case "text":
         if (part.text.length > 0) texts.push(part.text);
@@ -216,7 +240,7 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: Upst
       case "thinking":
         // 思考块整块丢。上游没有回传形态：兼容端点的 reasoning_content 是**只出不进**的
         // 响应字段，把它塞回请求里轻则被忽略重则 400。
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: part.signature === undefined
             ? "Chat Completions cannot carry assistant thinking back upstream; reasoning_content is response-only"
@@ -224,7 +248,7 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: Upst
         });
         break;
       case "redactedThinking":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "Chat Completions has no redacted thinking block",
         });
@@ -232,18 +256,18 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: Upst
       case "toolCall": {
         const name = flatToolName(part.call.toolRef.group, part.call.toolRef.name);
         if (part.call.toolRef.group !== null) {
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `tool group '${part.call.toolRef.group}' flattened into the tool name; Chat Completions has no namespace concept`,
           });
         }
         if (part.call.caller !== undefined) {
-          losses.record({
+          report.record({
             path, kind: "dropped",
             detail: "Chat Completions has no caller field on a tool call",
           });
         }
-        callIds.push(part.call.id);
+        calls.push({ id: part.call.id, path });
         toolCalls.push({
           id: part.call.id,
           type: "function",
@@ -259,43 +283,53 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, losses: Upst
       }
       case "image":
       case "document":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `Chat Completions assistant messages carry text and tool_calls only; '${part.kind}' part dropped`,
         });
         break;
       case "toolResult":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `tool result ${part.result.callId} cannot sit on an assistant message`,
         });
         break;
       case "opaque":
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `opaque part from ${part.origin} (${part.tag}) has no assistant-side Chat Completions representation`,
         });
         break;
     }
   });
-  return { content: texts.join(""), toolCalls, callIds };
+  return { content: texts.join(""), toolCalls, calls };
 }
 
-/** tool 消息只吃文本：图片没了，错误状态只能写进正文。 */
-function lowerToolResultContent(result: IRToolResult, path: string, losses: UpstreamRequestLosses): string {
+/**
+ * tool 消息只吃文本：图片没了，错误状态只能写进正文。
+ *
+ * 两处判定：
+ *   - 非文本 part 丢弃 / is_error 折进正文 —— **编译事实**。Chat 的 tool 消息就是一个
+ *     字符串，没有第二个位置可放，而 Core 没有替客户端写出任何内容：`[tool error]` 记的是
+ *     IR 里**已有的** status。
+ *   - 正文为空 —— **策略**，已剥离。原先补 `(empty)` 是网关替客户端说「工具跑成功了且没有
+ *     输出」，而 IR 说的只是「没有内容」，两者不是一回事：agent 会据此认为命令成功。
+ *     想要占位的调用方显式 compose `src/repair` 的 `fillEmptyToolResult`。
+ */
+function lowerToolResultContent(result: IRToolResult, path: string, report: UpstreamRequestReport): string {
   const texts: string[] = [];
   result.parts.forEach((part, index) => {
     const partPath = `${path}.result.parts[${index}]`;
-    noteCacheBreakpoint(part, partPath, losses);
+    noteCacheBreakpoint(part, partPath, report);
     if (part.kind === "text") { texts.push(part.text); return; }
     if (part.kind === "image") {
-      losses.record({
+      report.record({
         path: partPath, kind: "dropped",
         detail: "a Chat Completions tool message cannot carry an image; the model never sees these pixels",
       });
       return;
     }
-    losses.record({
+    report.record({
       path: partPath, kind: "dropped",
       detail: `tool result part '${part.kind}' has no Chat Completions representation`,
     });
@@ -303,20 +337,22 @@ function lowerToolResultContent(result: IRToolResult, path: string, losses: Upst
   let content = texts.join("");
   if (result.status === "error") {
     // is_error 是结构位，Chat 没有。写进正文是唯一的承载方式 —— 模型仍然知道失败了。
-    losses.record({
+    report.record({
       path, kind: "degraded",
       detail: "Chat Completions tool messages have no is_error flag; the failure is folded into the text",
     });
     content = content.length === 0 ? "[tool error]" : `[tool error] ${content}`;
   }
   if (content.length === 0) {
-    // 空 content 在部分兼容端点上会 400，实测（agent-all-sdk-ts openai_compat_provider）
-    // 补占位才稳。占位是替换，必须留痕。
-    losses.record({
-      path, kind: "substituted",
-      detail: "empty tool result replaced with a placeholder; some endpoints reject an empty tool message",
+    // 空 content 在部分兼容端点上会 400（实测 agent-all-sdk-ts openai_compat_provider）。
+    // 补什么是决定，不是编译 —— 拒绝，并把位置指到这条工具结果上。
+    report.reject({
+      kind: "requiredFieldMissing",
+      path,
+      detail: `tool result ${result.callId} lowers to an empty Chat Completions tool message; `
+        + "the endpoint requires content and the gateway will not invent a body for it "
+        + "(compose repair 'fillEmptyToolResult' to choose the wording)",
     });
-    content = "(empty)";
   }
   return content;
 }
@@ -325,12 +361,18 @@ function lowerToolResultContent(result: IRToolResult, path: string, losses: Upst
  * 恢复 Chat 的工具消息位置不变量：
  *   assistant.tool_calls 里的每个 id 都要有一条紧随其后的 role:'tool' 消息。
  *
- * 与 Anthropic 出口同一套做法（先全摘下来再按调用顺序重铺），因为约束同构：
- * 悬空调用会让上游 400，孤儿结果同样会。IR 内部按 id 关联，所以这套排列只在出口做一次。
+ * **重排是编译**：IR 按 id 关联、Chat 按位置关联，这是纯粹的表示转换，没有任何决定，
+ * 所以它只在出口做一次（与 Anthropic 出口同一套做法：先全摘下来再按调用顺序重铺）。
+ *
+ * **补洞与去孤儿是策略**，已剥离成拒绝：
+ *   - 悬空调用：以前补一条「结果未知」的占位 tool 消息 —— 那是网关替客户端编造了一段
+ *     模型会读到的正文，措辞怎么写会直接改变 agent 的下一步；
+ *   - 孤儿结果：以前直接丢 —— 客户端明确送来的工具输出就此蒸发，模型不会知道它存在过。
+ * 两者都会让上游 400，所以两者都不能装作没发生，只能拒绝并指到具体位置。
  */
 function arrangeMessages(
   turns: readonly IRTurn[],
-  losses: UpstreamRequestLosses,
+  report: UpstreamRequestReport,
 ): Array<Record<string, unknown>> {
   const resultsByCallId = new Map<string, { part: Extract<IRPart, { kind: "toolResult" }>; path: string }>();
   const stripped = turns.map((turn, turnIndex) => ({
@@ -348,7 +390,7 @@ function arrangeMessages(
   stripped.forEach((turn, turnIndex) => {
     const turnPath = `$.conversation.turns[${turnIndex}]`;
     if (turn.role === "assistant") {
-      const assistant = lowerAssistant(turn.parts, turnPath, losses);
+      const assistant = lowerAssistant(turn.parts, turnPath, report);
       if (assistant.content.length > 0 || assistant.toolCalls.length > 0) {
         messages.push({
           role: "assistant",
@@ -356,42 +398,41 @@ function arrangeMessages(
           ...(assistant.toolCalls.length === 0 ? {} : { tool_calls: assistant.toolCalls }),
         });
       }
-      for (const callId of assistant.callIds) {
-        const found = resultsByCallId.get(callId);
-        if (found !== undefined) {
-          consumed.add(callId);
-          messages.push({
-            role: "tool",
-            tool_call_id: callId,
-            content: lowerToolResultContent(found.part.result, found.path, losses),
+      for (const call of assistant.calls) {
+        const found = resultsByCallId.get(call.id);
+        if (found === undefined) {
+          report.reject({
+            kind: "danglingToolCall",
+            path: call.path,
+            detail: `tool call ${call.id} has no tool result in the conversation; Chat Completions rejects an `
+              + "assistant tool_call without a following tool message, and the gateway will not invent one "
+              + "(compose repair 'fillDanglingToolCall' to choose the placeholder wording)",
           });
           continue;
         }
-        // 悬空调用：客户端历史缺了结果。措辞要让模型知道结果不可信 —— 假装工具返回空
-        // 会让 agent 以为命令执行成功且无输出。
+        consumed.add(call.id);
         messages.push({
           role: "tool",
-          tool_call_id: callId,
-          content: "[gateway: tool result missing from client history; treat as unknown]",
-        });
-        losses.record({
-          path: turnPath, kind: "substituted",
-          detail: `dangling tool call ${callId} filled with an explicit placeholder tool message`,
+          tool_call_id: call.id,
+          content: lowerToolResultContent(found.part.result, found.path, report),
         });
       }
       return;
     }
 
-    const content = lowerUserContent(turn.parts, turnPath, losses);
+    const content = lowerUserContent(turn.parts, turnPath, report);
     const empty = typeof content === "string" ? content.length === 0 : content.length === 0;
     if (!empty) messages.push({ role: "user", content });
   });
 
   for (const [callId, found] of resultsByCallId) {
     if (consumed.has(callId)) continue;
-    losses.record({
-      path: found.path, kind: "dropped",
-      detail: `orphan tool result ${callId} has no matching tool call; a tool message with an unknown tool_call_id is rejected upstream`,
+    report.reject({
+      kind: "orphanToolResult",
+      path: found.path,
+      detail: `tool result ${callId} has no matching tool call; a Chat Completions tool message with an unknown `
+        + "tool_call_id is rejected upstream, and dropping it would hide an output the client did send "
+        + "(compose repair 'dropOrphanToolResult' to discard it deliberately)",
     });
   }
 
@@ -419,19 +460,19 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
     profile,
 
     async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const losses = new UpstreamRequestLosses();
+      const report = new UpstreamRequestReport();
       const { conversation, intent } = request;
 
       const messages: Array<Record<string, unknown>> = [];
-      const system = lowerSystem(conversation.system, losses);
+      const system = lowerSystem(conversation.system, report);
       if (system.length > 0) messages.push({ role: "system", content: system });
-      messages.push(...arrangeMessages(conversation.turns, losses));
+      messages.push(...arrangeMessages(conversation.turns, report));
 
       const tools = conversation.toolset.tools.flatMap((tool, index) => {
         const path = `$.conversation.toolset.tools[${index}]`;
         const name = flatToolName(tool.ref.group, tool.ref.name);
         if (tool.ref.group !== null) {
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `tool group '${tool.ref.group}' flattened into the tool name; Chat Completions has no namespace concept`,
           });
@@ -449,13 +490,13 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
           // Chat 的工具入参恒是 JSON schema 下的对象。省掉 parameters 是最接近的形态
           // （本仓库 chat 入口正是把「无 parameters」解回 freeform），但模型拿不到
           // 「随便写文本」这个语义。
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `freeform tool '${name}' lowered without a parameters schema; Chat Completions has no freeform argument form`,
           });
           return [{ type: "function", function: { name, description: tool.description } }];
         }
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `builtin tool '${tool.builtin}' is executed upstream and has no Chat Completions equivalent`,
         });
@@ -474,26 +515,29 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       if (reasoning.effort !== undefined) {
         reasoningEffort = EFFORT_WIRE[reasoning.effort];
         if (reasoning.effort === "xhigh" || reasoning.effort === "max") {
-          losses.record({
+          // **编译事实**：wire 的档位枚举只有四级，IR 的第五、六级没有位置，夹进可表达
+          // 区间是唯一的承载方式。Core 没有引入客户端没说过的新维度 ——「尽量多想」这个
+          // 意图仍以最高的可表达档位生效，少掉的只是分辨率（同 stop_sequences 截断）。
+          report.record({
             path: "$.intent.reasoning.effort", kind: "substituted",
             detail: `Chat Completions accepts minimal|low|medium|high; '${reasoning.effort}' clamped to 'high'`,
           });
         }
         if (reasoning.budgetTokens !== undefined) {
-          losses.record({
+          report.record({
             path: "$.intent.reasoning.budgetTokens", kind: "dropped",
             detail: "Chat Completions has no thinking budget; the client's explicit effort took precedence",
           });
         }
       } else if (reasoning.budgetTokens !== undefined) {
         reasoningEffort = effortFromBudget(reasoning.budgetTokens);
-        losses.record({
+        report.record({
           path: "$.intent.reasoning.budgetTokens", kind: "degraded",
           detail: `Chat Completions has no budget_tokens; ${reasoning.budgetTokens} tokens bucketed into reasoning_effort '${reasoningEffort}'`,
         });
       }
       if (reasoning.mode === "disabled" && intent.reasoning.source === "client") {
-        losses.record({
+        report.record({
           path: "$.intent.reasoning.mode", kind: "dropped",
           detail: "the client asked for thinking to be disabled; Chat Completions has no switch to turn a reasoning model off",
         });
@@ -506,16 +550,20 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       let responseFormat: Record<string, unknown> | undefined;
       if (outputFormat.kind === "jsonSchema") {
         if (outputFormat.name === undefined) {
-          // json_schema.name 是必填且受字符集限制，客户端没给就必须补一个。
-          losses.record({
-            path: "$.intent.outputFormat", kind: "substituted",
-            detail: "Chat Completions requires json_schema.name; gateway supplied 'response'",
+          // **策略**，已剥离：json_schema.name 是上游必填且受字符集限制的字段，客户端没给。
+          // 以前补 'response' —— 那个名字会随结构化输出一起回到客户端手里，网关替它取名
+          // 等于替它定了一个对外可见的标识。名字只有客户端知道该叫什么。
+          report.reject({
+            kind: "requiredFieldMissing",
+            path: "$.intent.outputFormat",
+            detail: "Chat Completions requires response_format.json_schema.name and the client stated none; "
+              + "the gateway will not name the client's schema for it",
           });
         }
-        responseFormat = {
+        responseFormat = outputFormat.name === undefined ? undefined : {
           type: "json_schema",
           json_schema: {
-            name: outputFormat.name ?? "response",
+            name: outputFormat.name,
             schema: outputFormat.schema,
             ...(outputFormat.strict === true ? { strict: true } : {}),
           },
@@ -526,7 +574,7 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       if (intent.stopping.stopSequences !== undefined) {
         stop = [...intent.stopping.stopSequences.value];
         if (stop.length > 4) {
-          losses.record({
+          report.record({
             path: "$.intent.stopping.stopSequences", kind: "truncated",
             detail: `Chat Completions accepts at most 4 stop sequences; ${stop.length} supplied, kept the first 4`,
           });
@@ -535,13 +583,13 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       }
 
       if (intent.sampling.topK !== undefined) {
-        losses.record({
+        report.record({
           path: "$.intent.sampling.topK", kind: "dropped",
           detail: "Chat Completions has no top_k sampling parameter",
         });
       }
       for (const [index, edit] of intent.contextEdits.entries()) {
-        losses.record({
+        report.record({
           path: `$.intent.contextEdits[${index}]`, kind: "dropped",
           detail: `Chat Completions has no context_management; the '${edit.kind}' directive is not forwarded upstream`,
         });
@@ -550,10 +598,15 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
         || intent.identity.accountUuid !== undefined) {
         // Chat 只有一个不透明的 `user` 字段，语义是滥用检测标识，不是会话身份；
         // 把 session id 塞进去会改变上游对该字段的用法，宁可丢并留痕。
-        losses.record({
+        report.record({
           path: "$.intent.identity", kind: "dropped",
           detail: "Chat Completions carries no session identity; its only identity field (`user`) means something else upstream",
         });
+      }
+
+      // 拒绝时**不构造 body**：半个非法请求体连序列化出来的机会都不该有。
+      if (report.rejected) {
+        return { ok: false, problems: report.drainProblems(), losses: report.drain() };
       }
 
       const body: Record<string, unknown> = {
@@ -580,6 +633,7 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       };
 
       return {
+        ok: true,
         wire: {
           url: `${options.baseUrl.replace(/\/$/u, "")}/chat/completions`,
           method: "POST",
@@ -590,7 +644,7 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
           },
           body: JSON.stringify(body),
         },
-        losses: losses.drain(),
+        losses: report.drain(),
       };
     },
 

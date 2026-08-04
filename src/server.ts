@@ -128,6 +128,20 @@ async function handle(httpRequest: Request): Promise<Response> {
 
   const lowered = await egress.writeUpstreamRequest(request);
   logLosses(traceId, "egress", lowered.losses);
+  if (!lowered.ok) {
+    // Core 不发明内容：表达不了就带精确 IR 路径拒绝，绝不发一个非法 body。
+    log.warn({
+      event: "egress_refused", trace: traceId, provider: egress.profile.provider,
+      problems: lowered.problems.map((problem) => ({ kind: problem.kind, path: problem.path, detail: problem.detail })),
+    });
+    return Response.json({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: `upstream '${egress.profile.provider}' cannot carry: ${lowered.problems.map((problem) => `${problem.kind} at ${problem.path}`).join("; ")}`,
+      },
+    }, { status: 422 });
+  }
   log.debug({
     event: "egress_lowered", trace: traceId, provider: egress.profile.provider,
     url: lowered.wire.url, body_bytes: lowered.wire.body.length,

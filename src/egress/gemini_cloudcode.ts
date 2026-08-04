@@ -19,6 +19,11 @@
  *    响应，于是它只能走进程内的旁路缓存 —— 每条流首次遇到都记一条 `loss`，让这个缺口
  *    可见而不是隐形。
  *
+ * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
+ * 唯一一处**明知是策略却仍留在这里**的是 `thoughtSignature` 占位符（见文件末尾的长注释）：
+ * IR 侧还没有承载它的位置，剥离它等于让所有带工具历史的请求全部不可用。
+ *
  * wire 知识全部来自实测：`agent-all-sdk-ts/src/providers/antigravity_provider.ts`
  * （639 行踩坑记录）+ `PROTOCOL_REFERENCE.md` §1.1/§4.1/§5.1/§6/§7/§8
  * + 网关流量日志 2026-08-02..04 的 8463 条 `upstream_sse`（part 形态五种、
@@ -29,7 +34,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { tryParseJson } from "../ir/sse.ts";
 import type {
-  IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss, UpstreamRequestBuildResult, IRPart,
+  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss,
+  UpstreamRequestBuildResult, IRPart,
   IRReasoning, IRRequest, IRStopReason, IRToolResult, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -248,12 +254,30 @@ export function createCloudCodeProjectSource(
 
 // ── lower ──────────────────────────────────────────────────────────────────
 
-class UpstreamRequestLosses {
+/**
+ * 一次构造的全部产出：**有损留痕**与**拒绝理由**收在同一个对象里。
+ *
+ * 分界线（本文件每一处判定都由它推出）：
+ *   - **编译事实**（`record`）：v1internal 的 wire 真的没有这个位置，而 Core **不必写出
+ *     任何客户端没说过的内容**。例如 contents 里没有 thinking 通道、functionResponse 没有
+ *     is_error、没有 cachedContent、推理强度只有 token 预算一根轴。
+ *   - **策略**（`reject`）：Core 得**发明内容、补默认值或拿占位符顶替**才能凑出一个合法
+ *     body。这类决定换一个调用方就想要不同结果，归 `src/repair`；Core 带路径拒绝。
+ *
+ * 拒绝**收集齐再返回**，不短路：调用方一次看全才能一次修完。
+ */
+class UpstreamRequestReport {
   readonly #losses: IRLoss[] = [];
+  readonly #problems: IRBuildProblem[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
   }
+  reject(problem: IRBuildProblem): void {
+    this.#problems.push(problem);
+  }
+  get rejected(): boolean { return this.#problems.length > 0; }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
+  drainProblems(): readonly IRBuildProblem[] { return [...this.#problems]; }
 }
 
 function flatToolName(group: string | null, name: string): string {
@@ -314,14 +338,14 @@ type GeminiPart = Record<string, unknown>;
 
 interface LowerContext {
   readonly toolNameByCallId: ReadonlyMap<string, string>;
-  readonly losses: UpstreamRequestLosses;
+  readonly report: UpstreamRequestReport;
 }
 
 /** 一条 IRPart → 0..n 个 Gemini part。返回数组而不是 `T | null`：一个 part 可能落成零个。 */
 function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): GeminiPart[] {
-  const { losses } = ctx;
+  const { report } = ctx;
   if (part.cacheBreakpoint !== undefined) {
-    losses.record({
+    report.record({
       path: `${path}.cacheBreakpoint`, kind: "dropped",
       detail: "cloudcode 私有面不暴露 cachedContent，prompt caching 无显式断点可设"
         + "（PROTOCOL_REFERENCE §7），该断点被忽略",
@@ -335,14 +359,14 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
     case "image":
     case "document": {
       if (part.media.source.kind !== "base64") {
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `${part.kind} 以 url 提供；cloudcode 私有面没有 File API/fileData 通道，无法搬运`,
         });
         return [];
       }
       if (part.kind === "document" && part.title !== undefined) {
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: "Gemini inlineData 只有 mimeType/data，文档标题没有承载字段",
         });
@@ -353,7 +377,7 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
     case "thinking":
       // Gemini 的 contents 里没有 thought part 的回放通道 —— 上游只认挂在 functionCall/text
       // 上的 thoughtSignature（见文件末尾）。整块思考只能丢。
-      losses.record({
+      report.record({
         path, kind: "dropped",
         detail: "Gemini contents 无 thinking part 通道；历史思考文本无法回放"
           + (part.signature === undefined ? "" : "，Anthropic 的 thinking.signature 亦无对应字段"),
@@ -361,7 +385,7 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
       return [];
 
     case "redactedThinking":
-      losses.record({
+      report.record({
         path, kind: "dropped",
         detail: "Gemini 无 redacted_thinking 对应形态",
       });
@@ -370,7 +394,7 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
     case "toolCall": {
       const name = flatToolName(part.call.toolRef.group, part.call.toolRef.name);
       if (part.call.toolRef.group !== null) {
-        losses.record({
+        report.record({
           path, kind: "degraded",
           detail: `tool group '${part.call.toolRef.group}' 拍进函数名；Gemini 无 namespace 概念`,
         });
@@ -380,14 +404,18 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
         args = part.call.input.value;
       } else {
         args = { input: part.call.input.text };
-        losses.record({
+        report.record({
           path, kind: "degraded",
           detail: "freeform 工具入参包成 `{input:<text>}`；Gemini functionCall.args 只能是结构化对象",
         });
       }
       const cached = recallThoughtSignature(part.call.id);
       if (cached === undefined) {
-        losses.record({
+        // **这是策略，而且是本文件唯一一处没有剥离的策略**：占位符是网关替客户端伪造了
+        // 一份推理凭据。剥离它需要 IR 侧先给出承载位（`IRResponsePart` 现在装不下它，
+        // 见文件末尾），在那之前拒绝等于让每一条带工具历史的请求全部不可用。
+        // 结论：保留，但留痕必须显式说清「这一步的推理线索断了」。
+        report.record({
           path, kind: "substituted",
           detail: "该 tool call 没有已知的 thoughtSignature（非本出口产出或已淘汰），"
             + "回填占位符 skip_thought_signature_validator：上游会放行但这一步的推理线索断了",
@@ -399,18 +427,32 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
       }];
     }
 
-    case "toolResult":
+    case "toolResult": {
+      const name = ctx.toolNameByCallId.get(part.result.callId);
+      if (name === undefined) {
+        // **策略**，已剥离：以前把 functionResponse.name 填成 'tool'。那个名字是上游用来
+        // 找函数声明的，编一个等于把「结果对不上调用」这件事伪装成一次正常回传。
+        report.reject({
+          kind: "orphanToolResult",
+          path,
+          detail: `tool result ${part.result.callId} has no matching tool call in the conversation; `
+            + "Gemini functionResponse.name must be the declared function name and the gateway will not invent one "
+            + "(compose repair 'dropOrphanToolResult' to discard it deliberately)",
+        });
+        return [];
+      }
       return [{
         functionResponse: {
           id: part.result.callId,
-          name: ctx.toolNameByCallId.get(part.result.callId) ?? fallbackToolName(part.result.callId, path, losses),
-          response: lowerToolResult(part.result, path, losses),
+          name,
+          response: lowerToolResult(part.result, path, report),
         },
       }];
+    }
 
     case "opaque":
       // IRProtocol 里没有 gemini，任何 opaque 都是异源的，翻译不了。
-      losses.record({
+      report.record({
         path, kind: "dropped",
         detail: `opaque part from ${part.origin} (${part.tag}) 在 Gemini 没有对应形态`,
       });
@@ -418,19 +460,18 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
   }
 }
 
-function fallbackToolName(callId: string, path: string, losses: UpstreamRequestLosses): string {
-  losses.record({
-    path, kind: "substituted",
-    detail: `tool result ${callId} 在历史里找不到对应的调用，functionResponse.name 只能填 'tool'`,
-  });
-  return "tool";
-}
-
 /**
  * tool 结果 → `functionResponse.response`（一个 JSON struct，不是 content 数组）。
  * 形状照抄实测可用的 antigravity_provider：错误走 `{error}`，图片 base64 塞字段。
+ *
+ * 两处判定：
+ *   - `{error:<text>}` 与图片塞字段 —— **编译事实**：response 是 JSON struct，没有 is_error
+ *     这类协议位，也没有 content 数组；写进去的都是 IR 里已有的东西。
+ *   - 正文与图片都为空 —— **策略**，已剥离。原先 `status==='missing'` 时补一句
+ *     `[gateway: tool result missing…]`，`status==='ok'` 时发 `{result:""}`：前者是网关编了
+ *     一段模型会读到的正文，后者是替客户端宣布「工具跑成功且无输出」。
  */
-function lowerToolResult(result: IRToolResult, path: string, losses: UpstreamRequestLosses): Record<string, unknown> {
+function lowerToolResult(result: IRToolResult, path: string, report: UpstreamRequestReport): Record<string, unknown> {
   const texts: string[] = [];
   const images: Array<{ media_type: string; data: string }> = [];
   for (const [index, inner] of result.parts.entries()) {
@@ -439,7 +480,7 @@ function lowerToolResult(result: IRToolResult, path: string, losses: UpstreamReq
       images.push({ media_type: inner.media.mediaType, data: inner.media.source.data });
       continue;
     }
-    losses.record({
+    report.record({
       path: `${path}.result.parts[${index}]`, kind: "dropped",
       detail: `'${inner.kind}' 无法进入 functionResponse.response（它是 JSON struct，不是 content 数组）`,
     });
@@ -447,14 +488,14 @@ function lowerToolResult(result: IRToolResult, path: string, losses: UpstreamReq
   const text = texts.join("\n\n");
 
   if (result.status === "error") {
-    losses.record({
+    report.record({
       path, kind: "degraded",
       detail: "Gemini functionResponse 没有 is_error 这类协议级标志，错误只能约定成 `{error:<text>}`",
     });
     return { error: text };
   }
   if (images.length > 0) {
-    losses.record({
+    report.record({
       path, kind: "degraded",
       detail: `${images.length} 张图片 base64 塞进 functionResponse.response 的字段里；`
         + "Gemini 的工具结果是 JSON struct，模型是否真按图片解读未经实测",
@@ -462,8 +503,14 @@ function lowerToolResult(result: IRToolResult, path: string, losses: UpstreamReq
     const first = images[0] as { media_type: string; data: string };
     return { media_type: first.media_type, data: first.data, text, images };
   }
-  if (result.status === "missing") {
-    return { result: text.length === 0 ? "[gateway: tool result missing from client history; treat as unknown]" : text };
+  if (text.length === 0) {
+    report.reject({
+      kind: "requiredFieldMissing",
+      path,
+      detail: `tool result ${result.callId} (status ${result.status}) lowers to an empty functionResponse.response; `
+        + "the gateway will not invent a body for it "
+        + "(compose repair 'fillEmptyToolResult' to choose the wording)",
+    });
   }
   return { result: text };
 }
@@ -479,9 +526,12 @@ function lowerContents(request: IRRequest, ctx: LowerContext): GeminiContent[] {
     const role: "user" | "model" = turn.role === "assistant" ? "model" : "user";
     const parts = turn.parts.flatMap((part, partIndex) =>
       writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, ctx));
+    // 一个 part 都没落下来的回合不上 wire。它不是「被丢掉的回合」：每个 part 各自要么
+    // 已经记了 loss，要么已经拒绝，这里只是不发一条空 content（wire 上没有这个形状）。
     if (parts.length === 0) return;
     const previous = contents[contents.length - 1];
-    // Gemini 不接受相邻同角色的 content，合并而不是新开一条。
+    // Gemini 不接受相邻同角色的 content，合并而不是新开一条。内容与顺序一字不改，
+    // 变的只是回合边界 —— 这是 wire 的排列规则，不是替客户端做的取舍。
     if (previous !== undefined && previous.role === role) { previous.parts.push(...parts); return; }
     contents.push({ role, parts });
   });
@@ -510,10 +560,10 @@ const MIN_VISIBLE_TOKENS = 4096;
 function resolveThinking(
   reasoning: IRReasoning,
   options: GeminiCloudCodeEgressOptions,
-  losses: UpstreamRequestLosses,
+  report: UpstreamRequestReport,
 ): { config: Record<string, unknown> | null; budget: number } {
   if (reasoning.mode === "disabled") {
-    losses.record({
+    report.record({
       path: "$.intent.reasoning.mode", kind: "dropped",
       detail: "Gemini 的思考档位由模型 id 决定；cloudcode 私有面没有实测过的关闭开关，"
         + "客户端的 disabled 意图被忽略（thinkingConfig 整体不发）",
@@ -521,17 +571,21 @@ function resolveThinking(
     return { config: null, budget: 0 };
   }
 
+  // 下面三条 substituted 都是**编译事实**：Gemini 的推理强度只有 thinkingBudget 一根轴，
+  // effort 在 wire 上没有位置，而档位预算是**出站模型 id 的属性**（由调用方选定的 options
+  // 决定），不是运行时参数 —— 换算与让位都发生在同一根轴上，Core 没有引入客户端没说过的
+  // 新意图，也没有发明任何内容。
   let budget: number;
   if (options.thinkingBudget !== undefined) {
     budget = options.thinkingBudget;
     if (reasoning.budgetTokens !== undefined && reasoning.budgetTokens !== budget) {
-      losses.record({
+      report.record({
         path: "$.intent.reasoning.budgetTokens", kind: "substituted",
         detail: `客户端要 ${reasoning.budgetTokens}，出站模型档位自带 ${budget}；`
           + "Gemini 的档位是模型 id 的属性，档位预算胜出",
       });
     } else if (reasoning.effort !== undefined) {
-      losses.record({
+      report.record({
         path: "$.intent.reasoning.effort", kind: "substituted",
         detail: `effort='${reasoning.effort}' 无对应 wire 字段，改由出站模型档位的 thinkingBudget=${budget} 表达`,
       });
@@ -542,7 +596,7 @@ function resolveThinking(
     // 无 `?? 默认值`：键被 IREffort 穷举，缺档在上面的声明处就编译失败。
     // 留着默认值等于给漏改留一条静默的活路。
     budget = EFFORT_BUDGET[reasoning.effort];
-    losses.record({
+    report.record({
       path: "$.intent.reasoning.effort", kind: "substituted",
       detail: `Gemini 只有 token 预算，effort='${reasoning.effort}' 换算成 thinkingBudget=${budget}`,
     });
@@ -569,7 +623,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
     profile,
 
     async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const losses = new UpstreamRequestLosses();
+      const report = new UpstreamRequestReport();
       const { conversation, intent } = request;
 
       const [accessToken, project, sessionId] = await Promise.all([
@@ -587,7 +641,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
           toolNameByCallId.set(part.call.id, flatToolName(part.call.toolRef.group, part.call.toolRef.name));
         }
       }
-      const ctx: LowerContext = { toolNameByCallId, losses };
+      const ctx: LowerContext = { toolNameByCallId, report };
 
       // systemInstruction 实测形态是 `{role:'user', parts:[{text}]}`，只见过 text。
       const systemTexts: string[] = [];
@@ -595,7 +649,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
         const path = `$.conversation.system[${index}]`;
         if (part.kind === "text") {
           if (part.cacheBreakpoint !== undefined) {
-            losses.record({
+            report.record({
               path: `${path}.cacheBreakpoint`, kind: "dropped",
               detail: "cloudcode 私有面不暴露 cachedContent，system 上的缓存断点被忽略（PROTOCOL_REFERENCE §7）",
             });
@@ -603,7 +657,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
           if (part.text.length > 0) systemTexts.push(part.text);
           return;
         }
-        losses.record({
+        report.record({
           path, kind: "dropped",
           detail: `systemInstruction 实测只承载 text part，'${part.kind}' 无处安放`,
         });
@@ -615,20 +669,20 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
         const path = `$.conversation.toolset.tools[${index}]`;
         const name = flatToolName(tool.ref.group, tool.ref.name);
         if (tool.ref.group !== null) {
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `tool group '${tool.ref.group}' 拍进函数名；Gemini 无 namespace 概念`,
           });
         }
         if (tool.kind === "builtin") {
-          losses.record({
+          report.record({
             path, kind: "dropped",
             detail: `builtin 工具 '${tool.builtin}' 在 cloudcode 私有面没有对应身份，无法转达`,
           });
           return [];
         }
         if (tool.kind === "freeform") {
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `freeform 工具 '${name}' 包成单字段 JSON schema；Gemini 只有结构化入参`,
           });
@@ -638,13 +692,13 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
           }];
         }
         if (tool.strict === true) {
-          losses.record({
+          report.record({
             path, kind: "dropped",
             detail: "Gemini functionDeclarations 无 strict 开关；严格校验意图无法转达",
           });
         }
         if (tool.deferLoading === true) {
-          losses.record({
+          report.record({
             path, kind: "dropped",
             detail: "Gemini 无工具定义延迟加载的表达",
           });
@@ -656,7 +710,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
           dropped,
         );
         if (dropped.size > 0) {
-          losses.record({
+          report.record({
             path, kind: "degraded",
             detail: `schema 键 ${[...dropped].sort().join(", ")} 被剔除；`
               + "Gemini 只接受 type/properties/items/required/description/enum/nullable",
@@ -682,34 +736,54 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
         }
       })();
       if (conversation.toolset.parallel.source === "client" && !conversation.toolset.parallel.value) {
-        losses.record({
+        report.record({
           path: "$.conversation.toolset.parallel", kind: "dropped",
           detail: "Gemini 没有关闭并行调用的开关；一个 candidate 里出多个 functionCall 无法禁止",
         });
       }
 
       const reasoning = intent.reasoning.value;
-      const thinking = resolveThinking(reasoning, options, losses);
+      const thinking = resolveThinking(reasoning, options, report);
 
+      // maxOutputTokens 三种情形，判据各不相同：
+      //   1. 客户端没给      —— **不补默认值**。以前一律发 cap(65536)，那是替客户端定了一个
+      //                        它从没说过的上限；字段不发，额度由服务端按模型自己分配。
+      //   2. 超过上游上限    —— **编译事实**：wire 表达不了更大的值，夹到上限是唯一承载方式
+      //                        （同 stop_sequences 截断），留痕即可。
+      //   3. 低于思考预算下限 —— **策略**，已剥离。CloudCode 把 thinkingBudget 算进
+      //                        maxOutputTokens，客户端给的额度不够时以前**擅自抬高**；抬高
+      //                        是在推翻客户端明确写下的成本上限。这个组合上游会返回
+      //                        200 但正文全空（实测 max=20 + budget=10000），必须拒绝。
       const cap = options.maxOutputTokensCap ?? DEFAULT_MAX_OUTPUT;
       const floor = thinking.budget > 0 ? thinking.budget + MIN_VISIBLE_TOKENS : 0;
       const requestedMax = intent.stopping.maxOutputTokens?.value;
-      const maxOutputTokens = Math.min(cap, Math.max(requestedMax ?? cap, floor));
-      if (requestedMax !== undefined && maxOutputTokens !== requestedMax) {
-        losses.record({
-          path: "$.intent.stopping.maxOutputTokens", kind: "substituted",
-          detail: maxOutputTokens > requestedMax
-            ? `客户端要 ${requestedMax}，抬到 ${maxOutputTokens}：CloudCode 把 thinkingBudget(${thinking.budget}) `
-              + "算在 maxOutputTokens 里，不留正文额度会返回 200 但正文全空"
-            : `客户端要 ${requestedMax}，封到上游上限 ${maxOutputTokens}`,
-        });
+      let maxOutputTokens: number | undefined;
+      if (requestedMax !== undefined) {
+        if (requestedMax < floor) {
+          report.reject({
+            kind: "requiredFieldMissing",
+            path: "$.intent.stopping.maxOutputTokens",
+            detail: `CloudCode counts thinkingBudget(${thinking.budget}) inside maxOutputTokens, so ${requestedMax} `
+              + `leaves no room for visible output (this upstream needs at least ${floor}); it answers 200 with an `
+              + "empty body instead of failing, and the gateway will not raise the client's stated ceiling for it",
+          });
+        } else {
+          maxOutputTokens = Math.min(cap, requestedMax);
+          if (maxOutputTokens !== requestedMax) {
+            report.record({
+              path: "$.intent.stopping.maxOutputTokens", kind: "substituted",
+              detail: `客户端要 ${requestedMax}，封到上游上限 ${maxOutputTokens}`,
+            });
+          }
+        }
       }
 
-      const generationConfig: Record<string, unknown> = { maxOutputTokens };
+      const generationConfig: Record<string, unknown> = {};
+      if (maxOutputTokens !== undefined) generationConfig.maxOutputTokens = maxOutputTokens;
       if (intent.sampling.temperature !== undefined) generationConfig.temperature = intent.sampling.temperature.value;
       if (intent.sampling.topP !== undefined) generationConfig.topP = intent.sampling.topP.value;
       if (intent.sampling.topK !== undefined) {
-        losses.record({
+        report.record({
           path: "$.intent.sampling.topK", kind: "dropped",
           detail: "v1internal 是否接受 generationConfig.topK 未经实测；宁可丢也不冒整条请求 400 的风险",
         });
@@ -722,28 +796,35 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       if (intent.outputFormat.value.kind === "jsonSchema") {
         // 正常路径上准入就拦下了（structuredOutput 不在 supports ∪ lossy）；
         // 绕过准入直接 lower 时也不能静默丢。
-        losses.record({
+        report.record({
           path: "$.intent.outputFormat", kind: "dropped",
           detail: "v1internal 的 responseMimeType/responseSchema 未经实测，结构化输出约束未下发",
         });
       }
       if (intent.contextEdits.length > 0) {
-        losses.record({
+        report.record({
           path: "$.intent.contextEdits", kind: "dropped",
           detail: `${intent.contextEdits.length} 条上下文编辑指令被丢弃；Gemini 无服务端上下文管理通道`,
         });
       }
       if (intent.serviceTier.source === "client" && intent.serviceTier.value === "priority") {
-        losses.record({
+        report.record({
           path: "$.intent.serviceTier", kind: "dropped",
           detail: "cloudcode 私有面没有服务档位概念",
         });
       }
       if (!intent.stream.value) {
-        losses.record({
+        // **编译事实**：上游只有流式端点，非流式在 wire 上不存在。客户端要的整段响应仍
+        // 由入口侧折叠后如实给出，Core 没有改写任何内容，改的只是取回方式。
+        report.record({
           path: "$.intent.stream", kind: "substituted",
           detail: "上游只有 streamGenerateContent；非流式请求改为流式取回后由入口侧折叠成整段响应",
         });
+      }
+
+      // 拒绝时**不构造 body**：半个非法请求体连序列化出来的机会都不该有。
+      if (report.rejected) {
+        return { ok: false, problems: report.drainProblems(), losses: report.drain() };
       }
 
       const requestId = options.requestIdFactory?.()
@@ -769,6 +850,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       };
 
       return {
+        ok: true,
         wire: {
           url: `https://${host}/v1internal:streamGenerateContent?alt=sse`,
           method: "POST",
@@ -789,7 +871,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
             requestType: "agent",
           }),
         },
-        losses: losses.drain(),
+        losses: report.drain(),
       };
     },
 

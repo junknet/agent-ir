@@ -164,26 +164,14 @@ export function mergeAdjacentTurns(turns: readonly IRTurn[]): IRTurn[] {
  *
  * 出参不变量：不存在相邻同角色回合，且没有空回合。
  */
-export function normalizeTurns(turns: readonly IRTurn[], losses: LossRecorder): IRTurn[] {
-  return mergeAdjacentTurns(dropEmptyTurns(mergeAdjacentTurns(turns), losses));
+export function normalizeTurns(turns: readonly IRTurn[]): IRTurn[] {
+  // 只合并，不丢空。**丢空回合是策略不是解码事实** —— 它已剥离到 repair 层的
+  // `dropEmptyTurn`，由调用方显式选择；Core 把空回合原样交给 egress，
+  // 由各 wire 按自己的编译事实处置。
+  //
+  // 为什么不需要「丢空之后再合并一次」：合并的出参恒不含相邻同角色（每个回合
+  // 要么折进上一条、要么角色与上一条不同，是循环不变量），一次即不动点。
+  // 原先那第二次合并只为修复丢空造成的新相邻，不丢空就没有可修的东西。
+  return mergeAdjacentTurns(turns);
 }
 
-/** 空回合会被下游判成非法输入；它们不携带任何语义，在 IR 边界就丢掉并留痕。 */
-function dropEmptyTurns(turns: readonly IRTurn[], losses: LossRecorder): IRTurn[] {
-  const kept: IRTurn[] = [];
-  turns.forEach((turn, index) => {
-    const meaningful = turn.parts.filter(
-      (part) => !(part.kind === "text" && part.text.length === 0 && part.cacheBreakpoint === undefined),
-    );
-    if (meaningful.length === 0) {
-      losses.record({
-        path: `$.conversation.turns[${index}]`,
-        kind: "dropped",
-        detail: `empty ${turn.role} turn carries no semantics and is rejected by every upstream`,
-      });
-      return;
-    }
-    kept.push(meaningful.length === turn.parts.length ? turn : { role: turn.role, parts: meaningful });
-  });
-  return kept;
-}

@@ -8,7 +8,8 @@
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type {
-  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult, IRPart, IRRequest,
+  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult,
+  IRBuildProblem, IRPart, IRRequest,
   IRStopReason, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -39,12 +40,18 @@ export interface AnthropicUpstreamOptions {
   readonly model: string;
 }
 
-class UpstreamRequestLosses {
+class UpstreamRequestReport {
   readonly #losses: IRLoss[] = [];
+  readonly #problems: IRBuildProblem[] = [];
   record(loss: Omit<IRLoss, "stage" | "provider">): void {
     this.#losses.push({ stage: "egress", provider: "anthropic", ...loss });
   }
+  reject(problem: IRBuildProblem): void {
+    this.#problems.push(problem);
+  }
+  get rejected(): boolean { return this.#problems.length > 0; }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
+  drainProblems(): readonly IRBuildProblem[] { return [...this.#problems]; }
 }
 
 /** 分组名拍进工具名。这是有损的（分组结构没了），调用方靠 loss 知道。 */
@@ -52,7 +59,7 @@ function flatToolName(group: string | null, name: string): string {
   return group === null ? name : `${group}__${name}`;
 }
 
-function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequestLosses): Record<string, unknown> | null {
+function writePartToUpstream(part: IRPart, path: string, report: UpstreamRequestReport): Record<string, unknown> | null {
   const cache = part.cacheBreakpoint === undefined ? {} : { cache_control: { type: "ephemeral" } };
   switch (part.kind) {
     case "text":
@@ -77,7 +84,7 @@ function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequest
     case "thinking":
       // 没有 signature 的 thinking 块会被上游拒；宁可丢块也不能让整条请求 400。
       if (part.signature === undefined) {
-        losses.record({ path, kind: "dropped", detail: "thinking block without signature is rejected upstream" });
+        report.record({ path, kind: "dropped", detail: "thinking block without signature is rejected upstream" });
         return null;
       }
       return { type: "thinking", thinking: part.text, signature: part.signature, ...cache };
@@ -94,7 +101,7 @@ function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequest
       };
     case "toolResult": {
       const inner = part.result.parts
-        .map((child, index) => writePartToUpstream(child, `${path}.result.parts[${index}]`, losses))
+        .map((child, index) => writePartToUpstream(child, `${path}.result.parts[${index}]`, report))
         .filter((block): block is Record<string, unknown> => block !== null);
       return {
         type: "tool_result",
@@ -108,7 +115,7 @@ function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequest
     case "opaque":
       // 同源的 opaque 原样放回（无损往返）；异源的没法翻译，丢弃并留痕。
       if (part.origin === "anthropic_messages") return part.raw as Record<string, unknown>;
-      losses.record({
+      report.record({
         path, kind: "dropped",
         detail: `opaque part from ${part.origin} (${part.tag}) has no Anthropic representation`,
       });
@@ -122,15 +129,24 @@ function writePartToUpstream(part: IRPart, path: string, losses: UpstreamRequest
  * 「先全摘下来再重排」而不是「就地打补丁」：就地修补要按每种破坏方式各堵一次，且步骤间
  * 有顺序陷阱（实测踩过：占位块 push 到 user 回合末尾会变成 [tool_result, text, tool_result]，
  * 上游 400；[text, tool_result] 顺序必死，[tool_result, text] 才过）。
+ *
+ * 分界线与 openai_chat_completions 出口一致：
+ *   - 位置重排、空结果补最小合法值 → wire 事实，留在 Core；
+ *   - 悬空调用（缺结果）、孤儿结果（多结果）→ 补什么措辞/丢不丢都是「我替你决定」，
+ *     Core 一律带精确 IR 路径拒绝，由调用方显式 compose `src/repair` 决定。
+ *   两者都会让上游 400，但前者的补法是 wire 强制的，后者是策略。
  */
-function arrangeToolTurns(turns: readonly IRTurn[], losses: UpstreamRequestLosses): IRTurn[] {
-  // 1. 摘出全部工具结果，按 callId 索引
-  const resultsByCallId = new Map<string, IRPart>();
-  const stripped: IRTurn[] = turns.map((turn) => ({
+function arrangeToolTurns(turns: readonly IRTurn[], report: UpstreamRequestReport): IRTurn[] {
+  // 1. 摘出全部工具结果，按 callId 索引（带精确路径，拒绝时要把位置指到那个 part）
+  const resultsByCallId = new Map<string, { part: IRPart; path: string }>();
+  const stripped: IRTurn[] = turns.map((turn, turnIndex) => ({
     role: turn.role,
-    parts: turn.parts.filter((part) => {
+    parts: turn.parts.filter((part, partIndex) => {
       if (part.kind !== "toolResult") return true;
-      resultsByCallId.set(part.result.callId, part);
+      resultsByCallId.set(part.result.callId, {
+        part,
+        path: `$.conversation.turns[${turnIndex}].parts[${partIndex}]`,
+      });
       return false;
     }),
   }));
@@ -138,40 +154,43 @@ function arrangeToolTurns(turns: readonly IRTurn[], losses: UpstreamRequestLosse
   // 2. 每个 assistant 回合之后，按该回合声明的调用顺序重铺结果
   const arranged: IRTurn[] = [];
   const consumed = new Set<string>();
-  for (const turn of stripped) {
+  for (let turnIndex = 0; turnIndex < stripped.length; turnIndex++) {
+    const turn = stripped[turnIndex]!;
     arranged.push(turn);
     if (turn.role !== "assistant") continue;
-    const callIds = turn.parts.flatMap((part) => (part.kind === "toolCall" ? [part.call.id] : []));
-    if (callIds.length === 0) continue;
+    const calls = turn.parts.flatMap((part, partIndex): Array<{ id: string; path: string }> =>
+      part.kind === "toolCall"
+        ? [{ id: part.call.id, path: `$.conversation.turns[${turnIndex}].parts[${partIndex}]` }]
+        : [],
+    );
+    if (calls.length === 0) continue;
     const resultParts: IRPart[] = [];
-    for (const callId of callIds) {
-      const result = resultsByCallId.get(callId);
-      if (result !== undefined) { resultParts.push(result); consumed.add(callId); continue; }
-      // 悬空调用：客户端历史缺了结果。补占位而不是留空 —— 措辞要让模型知道结果不可信，
-      // 假装工具返回空会让 agent 以为命令执行成功且无输出。
-      resultParts.push({
-        kind: "toolResult",
-        result: {
-          callId,
-          parts: [{ kind: "text", text: "[gateway: tool result missing from client history; treat as unknown]" }],
-          status: "missing",
-        },
-      });
-      losses.record({
-        path: `$.conversation.turns`, kind: "substituted",
-        detail: `dangling tool call ${callId} filled with an explicit placeholder result`,
+    for (const call of calls) {
+      const found = resultsByCallId.get(call.id);
+      if (found !== undefined) { resultParts.push(found.part); consumed.add(call.id); continue; }
+      // 悬空调用：客户端历史缺了结果。Anthropic 不接受 tool_use 没有紧随的 tool_result；
+      // 补什么占位措辞是「我替你决定」—— 拒绝，把位置指到这个 toolCall part。
+      report.reject({
+        kind: "danglingToolCall",
+        path: call.path,
+        detail: `tool call ${call.id} has no tool result in the conversation; Anthropic rejects a `
+          + "tool_use without a following tool_result, and the gateway will not invent one "
+          + "(compose repair 'fillDanglingToolCall' to choose the placeholder wording)",
       });
     }
     // tool_result 必须排在紧随其后那条 user 回合的**最前面**
     arranged.push({ role: "user", parts: resultParts });
   }
 
-  // 3. 孤儿结果（前面根本没有对应调用）只能丢：留着上游必 400
-  for (const [callId] of resultsByCallId) {
+  // 3. 孤儿结果（前面根本没有对应调用）留着上游必 400；丢不丢是决定 —— 拒绝，指到那个 part。
+  for (const [callId, found] of resultsByCallId) {
     if (consumed.has(callId)) continue;
-    losses.record({
-      path: "$.conversation.turns", kind: "dropped",
-      detail: `orphan tool result ${callId} has no matching call and is rejected upstream`,
+    report.reject({
+      kind: "orphanToolResult",
+      path: found.path,
+      detail: `tool result ${callId} has no matching tool call; Anthropic rejects an unexpected `
+        + "tool_use_id, and dropping it would hide an output the client did send "
+        + "(compose repair 'dropOrphanToolResult' to discard it deliberately)",
     });
   }
 
@@ -200,23 +219,33 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
     profile,
 
     async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const losses = new UpstreamRequestLosses();
+      const report = new UpstreamRequestReport();
       const { conversation, intent } = request;
 
       const system = conversation.system
-        .map((part, index) => writePartToUpstream(part, `$.conversation.system[${index}]`, losses))
+        .map((part, index) => writePartToUpstream(part, `$.conversation.system[${index}]`, report))
         .filter((block): block is Record<string, unknown> => block !== null);
 
-      const messages = arrangeToolTurns(conversation.turns, losses).map((turn, turnIndex) => ({
+      const messages = arrangeToolTurns(conversation.turns, report).map((turn, turnIndex) => ({
         role: turn.role,
         content: turn.parts
-          .map((part, partIndex) => writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, losses))
+          .map((part, partIndex) => writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, report))
           .filter((block): block is Record<string, unknown> => block !== null),
       })).filter((message) => message.content.length > 0);
 
+      // 全部回合都编不出内容时，产出的是 `messages: []` —— Anthropic 必 400。
+      // 「既不拒绝也不留痕地发一个必然失败的 body」正是这次改造要消灭的形态。
+      if (messages.length === 0) {
+        report.reject({
+          kind: "requiredFieldMissing",
+          path: "$.conversation.turns",
+          detail: "no turn produced any content Anthropic can carry; the request would be rejected upstream as an empty message list",
+        });
+      }
+
       const tools = conversation.toolset.tools.map((tool) => {
         if (tool.ref.group !== null) {
-          losses.record({
+          report.record({
             path: `$.conversation.toolset.tools`, kind: "degraded",
             detail: `tool group '${tool.ref.group}' flattened into the tool name; Anthropic has no namespace concept`,
           });
@@ -226,7 +255,7 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
           return { name, description: tool.description, input_schema: tool.schema };
         }
         if (tool.kind === "freeform") {
-          losses.record({
+          report.record({
             path: `$.conversation.toolset.tools`, kind: "degraded",
             detail: `freeform tool '${name}' wrapped into a single-field JSON schema`,
           });
@@ -260,13 +289,16 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
           : {}),
       };
 
-      // Anthropic 强制要求 max_tokens。客户端没给就必须补一个，并留痕说明这是网关决定的。
-      let maxTokens = intent.stopping.maxOutputTokens?.value;
+      // Anthropic 强制要求 max_tokens。客户端没给（Chat Completions 客户端普遍不带）时，
+      // 补 4096 是「我替你决定」—— 拒绝，把位置指到 intent 上。要兜底就显式 compose
+      // repair（对 Chat→Anthropic 转发，那里有 entry 的 maxOutputTokens 可作真默认值）。
+      const maxTokens = intent.stopping.maxOutputTokens?.value;
       if (maxTokens === undefined) {
-        maxTokens = 4096;
-        losses.record({
-          path: "$.intent.stopping.maxOutputTokens", kind: "substituted",
-          detail: "Anthropic requires max_tokens; gateway supplied a default of 4096",
+        report.reject({
+          kind: "requiredFieldMissing",
+          path: "$.intent.stopping.maxOutputTokens",
+          detail: "Anthropic requires max_tokens; the client did not supply one and the gateway "
+            + "will not invent a value (compose repair to pick a default)",
         });
       }
 
@@ -287,7 +319,13 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
         ...(intent.contextEdits.length === 0 ? {} : { context_management: { edits: intent.contextEdits.map((edit) => edit.raw) } }),
       };
 
+      // 拒绝是收集齐再返回：已经记下的 loss 一并交出（有损是既成事实，拒绝不改写它）。
+      if (report.rejected) {
+        return { ok: false, problems: report.drainProblems(), losses: report.drain() };
+      }
+
       return {
+        ok: true,
         wire: {
           url: `${options.baseUrl.replace(/\/$/u, "")}/v1/messages`,
           method: "POST",
@@ -299,7 +337,7 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
           },
           body: JSON.stringify(body),
         },
-        losses: losses.drain(),
+        losses: report.drain(),
       };
     },
 

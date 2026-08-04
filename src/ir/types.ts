@@ -114,8 +114,13 @@ export type IRPart =
   | (IRPartBase & { readonly kind: "toolCall"; readonly call: IRToolCall })
   | (IRPartBase & { readonly kind: "toolResult"; readonly result: IRToolResult })
   /**
-   * 逃生舱（不变量 2）。任何 egress 遇到它都必须显式决定：透传、降级或丢弃并记 loss。
-   * 类型系统会强制写这个 case —— 这正是 `[key: string]: unknown` 做不到的。
+   * 逃生舱（不变量 2）。任何 egress 遇到它都必须**显式决定**，类型系统强制写这个 case ——
+   * 这正是 `[key: string]: unknown` 做不到的。
+   *
+   * 但「决定」的合法取值只有两个：**同源透传**（无损），或**拒绝**
+   * （`unrepresentablePart`）。**不含「丢弃并记 loss」** —— 客户端明确送来的内容没到达
+   * 模型，就是「本该生效的输入被丢了」，按 Failure surfaces 必须 raise 而不是 drop。
+   * 想要旧的丢弃行为，调用方去 repair 层显式挂一条，那是策略。
    */
   | (IRPartBase & {
       readonly kind: "opaque";
@@ -429,20 +434,69 @@ export interface ClientRequestReadResult {
   readonly losses: readonly IRLoss[];
 }
 
-export interface IRWireRequest {
+export type IRWireBody = string | Uint8Array;
+
+export interface IRWireRequest<TBody extends IRWireBody = string> {
   readonly url: string;
   readonly method: "POST";
   readonly headers: Readonly<Record<string, string>>;
-  readonly body: string;
+  /**
+   * 文本 wire 直接用 string；二进制协议（Connect/protobuf 等）保留原始字节。
+   * 传输层可以不经协议特判地把此值交给 fetch，绝不能把二进制先 base64 化再发送。
+   */
+  readonly body: TBody;
 }
 
-export interface UpstreamRequestBuildResult {
-  readonly wire: IRWireRequest;
-  readonly losses: readonly IRLoss[];
+/**
+ * 目标 wire 承载不了某个 IR 概念时的拒绝理由。
+ *
+ * `kind` 是稳定判别位，供调用方分派（例如决定挂哪条 repair）；`detail` 写给人看，
+ * 不参与分派。`path` 必须精确到 IR 位置 —— 拒绝的价值全在于「是哪个字段」。
+ */
+export const IR_BUILD_PROBLEM_KINDS = [
+  /** 目标 wire 强制要求，而 IR 里没有（如 Anthropic 的 max_tokens）。 */
+  "requiredFieldMissing",
+  /** 声明了工具调用但历史里没有对应结果，目标 wire 不接受悬空。 */
+  "danglingToolCall",
+  /** 工具结果找不到对应调用。 */
+  "orphanToolResult",
+  /** 某个 part 在目标 wire 里根本没有位置。 */
+  "unrepresentablePart",
+] as const;
+
+export type IRBuildProblemKind = (typeof IR_BUILD_PROBLEM_KINDS)[number];
+
+export interface IRBuildProblem {
+  readonly kind: IRBuildProblemKind;
+  readonly path: string;
+  readonly detail: string;
 }
 
-export interface IREgress {
+/**
+ * 出站请求的构造结果 —— **编译或拒绝**。
+ *
+ * Core 不发明内容、不补默认值：目标 wire 表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回一个语义模糊的 4xx。想要「替我兜着」的调用方
+ * 显式 compose `src/repair`，那是策略，不是编译。
+ *
+ * 判别联合而不是抛异常：失败是这个函数的**正常返回值之一**，调用方必须表态。
+ */
+export type UpstreamRequestBuildResult<TBody extends IRWireBody = string> =
+  | {
+      readonly ok: true;
+      readonly wire: IRWireRequest<TBody>;
+      /** 承载了但有损。是关于目标能力的事实，不是策略。 */
+      readonly losses: readonly IRLoss[];
+    }
+  | {
+      readonly ok: false;
+      readonly problems: readonly IRBuildProblem[];
+      /** 拒绝之前已经记下的有损条目，一并交出，便于调用方一次看全。 */
+      readonly losses: readonly IRLoss[];
+    };
+
+export interface IREgress<TBody extends IRWireBody = string> {
   readonly profile: IREgressProfile;
-  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult>;
+  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult<TBody>>;
   readUpstreamResponse(response: Response): AsyncIterable<IREvent>;
 }

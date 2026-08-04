@@ -15,9 +15,10 @@
     "typescript": "latest"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./egress/windsurf": "./src/egress/windsurf/index.ts"
   },
-  "optionalDependencies": {
+  "dependencies": {
     "@bufbuild/protobuf": "^2.2.3"
   }
 }

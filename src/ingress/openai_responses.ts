@@ -343,7 +343,7 @@ export function readResponsesRequest(raw: unknown, traceId: string): ClientReque
     identity: {},
   };
 
-  const conversation = { system, turns: normalizeTurns(turns, losses), toolset };
+  const conversation = { system, turns: normalizeTurns(turns), toolset };
   const partial = { traceId, protocol: PROTOCOL, model: asString(body.model) ?? "", conversation, intent };
   return { request: { ...partial, requires: deriveCapabilityNeeds(partial) }, losses: losses.drain() };
 }

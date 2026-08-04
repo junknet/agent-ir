@@ -13,7 +13,7 @@
  * 它换来的是「全部三个入口都能路由到它」。这是这套 IR 的全部经济意义：
  * 客户端协议的组合爆炸被入口侧一次性吸收，上游侧只按线性付费。
  */
-import type { ClientRequestReadResult, IREgress, IREvent, IRProtocol, IRRequest } from "./types.ts";
+import type { ClientRequestReadResult, IREgress, IREvent, IRProtocol, IRRequest, IRWireBody } from "./types.ts";
 import type { EncodeOptions } from "../ingress/shared.ts";
 
 // ── 入口：封闭集 ────────────────────────────────────────────────────────────
@@ -47,14 +47,14 @@ export type IRIngressRegistry = Readonly<Record<IRProtocol, IRIngressCodec>>;
  * 用 `name` 而不是 `IRProtocol` 作键：出口不必是客户端协议。加 Gemini CloudCode、
  * Windsurf Connect、Bedrock 都只是往这张表里加一行，入口侧零改动。
  */
-export interface IREgressDescriptor<TOptions = unknown> {
+export interface IREgressDescriptor<TOptions = unknown, TBody extends IRWireBody = string> {
   readonly name: string;
   /** 上游的 wire 家族，仅用于诊断与文档，不参与裁决。 */
   readonly wire: string;
-  readonly create: (options: TOptions) => IREgress;
+  readonly create: (options: TOptions) => IREgress<TBody>;
 }
 
-export type IREgressRegistry = Readonly<Record<string, IREgressDescriptor<never>>>;
+export type IREgressRegistry = Readonly<Record<string, IREgressDescriptor<never, IRWireBody>>>;
 
 // ── 路由 ────────────────────────────────────────────────────────────────────
 
