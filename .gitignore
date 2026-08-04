@@ -1,0 +1,6 @@
+node_modules/
+dist/
+# 真实流量语料：含用户会话原文，只在本机用于回放验证，永不进 Git。
+.corpus/
+.dev-logs/
+*.log

@@ -1,0 +1,391 @@
+/**
+ * L0/L1/L2 —— IR 的全部类型契约。
+ *
+ * 设计依据是真实流量，不是任何一家的 wire 文档：
+ * 807 条全量归档（anthropic_messages 611 / openai_chat_completions 116 / openai_responses 80，
+ * 2026-08-01..04，turn_index 最深 1689）+ 5 天 108 万行网关日志。逐条证据见 docs/EVIDENCE.md。
+ *
+ * 五条不变量（每条对应一个已确认的真实故障）：
+ *   1. 关联用 id，不用位置        —— 消灭 tool_result「必须紧邻/必须最前」的排列战争
+ *   2. 未知必须显式装箱           —— 索引签名夹带会让新增出口时字段静默蒸发
+ *   3. 有损必须留痕               —— max_tokens 对 codex 出口静默失效那类问题
+ *   4. 响应是可拉取的事件流        —— 未识别事件是流里的元素，不是 switch 的黑洞
+ *   5. 能力是静态声明             —— 不从运行时值反推（usage 三态坍缩）
+ */
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 通用
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type IRProtocol = "anthropic_messages" | "openai_responses" | "openai_chat_completions";
+
+/** 值的来源。区分「客户端明确要求」与「网关替他决定」——两者冲突时的处理完全不同。 */
+export type IRSource = "client" | "gateway-default" | "gateway-forced";
+
+export interface IRValued<T> {
+  readonly value: T;
+  readonly source: IRSource;
+}
+
+export const clientValue = <T>(value: T): IRValued<T> => ({ value, source: "client" });
+export const defaultValue = <T>(value: T): IRValued<T> => ({ value, source: "gateway-default" });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L0 — 会话骨架
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface IRBlob {
+  readonly source:
+    | { readonly kind: "base64"; readonly data: string }
+    | { readonly kind: "url"; readonly url: string };
+  readonly mediaType: string;
+  /** 已知字节数。让 egress 不解码也能做尺寸预算。 */
+  readonly bytes?: number;
+}
+
+/**
+ * 缓存断点。语料实证 cache_control 出现在 system / user / assistant / tool_use / tool_result
+ * 五个位置（ephemeral，共 1027 次），所以它是 **part 级标注**，不是 message 级开关。
+ */
+export interface IRCacheBreakpoint {
+  readonly scope: "ephemeral";
+  readonly ttlSeconds?: number;
+}
+
+export interface IRPartBase {
+  /** 该 part 之后设一个缓存断点。不支持缓存的 egress 直接忽略并记一条 degraded loss。 */
+  readonly cacheBreakpoint?: IRCacheBreakpoint;
+}
+
+export interface IRToolRef {
+  /** 命名空间/分组。null = 顶层工具。**不是**拍平后的字符串前缀。 */
+  readonly group: string | null;
+  readonly name: string;
+}
+
+export type IRToolInput =
+  /** 结构化参数，对应 JSON Schema 工具。 */
+  | { readonly kind: "json"; readonly value: Record<string, unknown> }
+  /** 自由文本参数，对应 Anthropic custom / codex apply_patch 这类 freeform 工具。 */
+  | { readonly kind: "text"; readonly text: string };
+
+export interface IRToolCall {
+  readonly id: string;
+  readonly toolRef: IRToolRef;
+  readonly input: IRToolInput;
+  /**
+   * 发起方标识。Anthropic `tool_use.caller` 实测形态是 `{type:'direct'}` 的**对象**，
+   * 不是字符串；subagent 变体的完整形状尚未在语料中出现，因此 `kind` 取判别位、
+   * `raw` 原样保留，能表达它的 egress 可以无损还原，不能的记 loss。
+   */
+  readonly caller?: { readonly kind: string; readonly raw: unknown };
+}
+
+/**
+ * 工具结果。
+ * - 靠 `callId` 关联，**与位置无关**（不变量 1）
+ * - `status` 显式表达三态；语料里 is_error=true 出现 709 次，错误结果是常态不是异常
+ * - `parts` 而非 string：语料里 625 条结果是数组，其中 94 条含图片
+ */
+export interface IRToolResult {
+  readonly callId: string;
+  readonly parts: readonly IRPart[];
+  readonly status: "ok" | "error" | "missing";
+}
+
+export type IRPart =
+  | (IRPartBase & { readonly kind: "text"; readonly text: string })
+  | (IRPartBase & { readonly kind: "image"; readonly media: IRBlob })
+  | (IRPartBase & { readonly kind: "document"; readonly media: IRBlob; readonly title?: string })
+  /** 模型思考。`signature` 是回传时的完整性凭据，丢了会被上游拒。 */
+  | (IRPartBase & { readonly kind: "thinking"; readonly text: string; readonly signature?: string })
+  | (IRPartBase & { readonly kind: "redactedThinking"; readonly data: string })
+  | (IRPartBase & { readonly kind: "toolCall"; readonly call: IRToolCall })
+  | (IRPartBase & { readonly kind: "toolResult"; readonly result: IRToolResult })
+  /**
+   * 逃生舱（不变量 2）。任何 egress 遇到它都必须显式决定：透传、降级或丢弃并记 loss。
+   * 类型系统会强制写这个 case —— 这正是 `[key: string]: unknown` 做不到的。
+   */
+  | (IRPartBase & {
+      readonly kind: "opaque";
+      readonly origin: IRProtocol;
+      readonly tag: string;
+      readonly raw: unknown;
+    });
+
+/**
+ * 一个回合。`role` 只有两个值：语料里的 `role:'system'`（1537 次）与 Responses 的
+ * `role:'developer'`（9 次）都是 wire 层的编码技巧，decode 时归位到 `conversation.system`；
+ * OpenAI 的 `role:'tool'`（2355 次）归位成 user turn 里的 toolResult part。
+ *
+ * `parts` 是**无约束序列**：语料里 assistant 回合有 27 种形态，包括 `text+text+tool_use`
+ * 和一条消息 9 个并行 tool_use，任何「最多一个 text」「工具调用必须在末尾」的假设都会被打破。
+ */
+export interface IRTurn {
+  readonly role: "user" | "assistant";
+  readonly parts: readonly IRPart[];
+}
+
+export type IRJsonSchema = Record<string, unknown>;
+
+export type IRTool =
+  | {
+      readonly kind: "function";
+      readonly ref: IRToolRef;
+      readonly description: string;
+      readonly schema: IRJsonSchema;
+      /** 上游按 schema 严格校验参数（Responses 的 strict）。 */
+      readonly strict?: boolean;
+      /** 定义延迟加载（Anthropic defer_loading），是提示不是保证。 */
+      readonly deferLoading?: boolean;
+    }
+  /** 自由文本入参工具（Anthropic custom / codex apply_patch）。 */
+  | { readonly kind: "freeform"; readonly ref: IRToolRef; readonly description: string }
+  /** 上游内建工具（computer_*、web_search…）。只有身份，执行在上游。 */
+  | {
+      readonly kind: "builtin";
+      readonly ref: IRToolRef;
+      readonly builtin: string;
+      readonly config?: Record<string, unknown>;
+    };
+
+/** 分组是结构，不是命名约定 —— 消灭 `${namespace}${name}` + 平行 Map 的往返。 */
+export interface IRToolGroup {
+  readonly name: string;
+  readonly members: readonly string[];
+}
+
+export type IRToolChoice =
+  | { readonly kind: "auto" }
+  | { readonly kind: "none" }
+  | { readonly kind: "required" }
+  | { readonly kind: "specific"; readonly ref: IRToolRef };
+
+export interface IRToolset {
+  readonly tools: readonly IRTool[];
+  readonly groups: readonly IRToolGroup[];
+  readonly choice: IRValued<IRToolChoice>;
+  /** 允许上游一次发起多个工具调用。语料里并行调用最高 9 个，是常态。 */
+  readonly parallel: IRValued<boolean>;
+}
+
+export interface IRConversation {
+  /** 永远是 parts 数组。`system` 的 string 形态（语料 148 次）在 decode 时就消灭。 */
+  readonly system: readonly IRPart[];
+  readonly turns: readonly IRTurn[];
+  readonly toolset: IRToolset;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L1 — 意图层
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type IREffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * 推理开关档。模式来自实测：
+ *   `{type:'disabled'}`                       → disabled
+ *   `{type:'adaptive', display:'summarized'}` → adaptive（Claude Code 2.1.x 的默认）
+ *   `{type:'enabled', budget_tokens:N}`       → enabled
+ */
+export type IRReasoningMode = "disabled" | "auto" | "adaptive" | "enabled";
+
+/** 思考对客户端的可见形态。Anthropic `thinking.display` 与 Responses `reasoning.summary` 同源。 */
+export type IRReasoningDisplay = "hidden" | "summarized" | "full";
+
+/**
+ * 推理意图。
+ *
+ * `mode` / `effort` / `budgetTokens` 是**三个正交维度**，不是一个判别联合 —— 语料实证
+ * `thinking:{type:'adaptive',display:'summarized'}` 与 `output_config:{effort:'high'}`
+ * 在同一条请求里共存（Claude Code 2.1.x 的常规形态）。把它们压成互斥的 union 会在 decode
+ * 阶段就丢掉其中一个，正是「有损发生在 ingress」这个反模式。
+ *
+ * `effort` 与 `budgetTokens` 保持各自的原始表示，**不在 ingress 互转**：
+ * 谁的上游要哪种，谁在 egress 自己换算并记 loss。
+ */
+export interface IRReasoning {
+  readonly mode: IRReasoningMode;
+  readonly effort?: IREffort;
+  readonly budgetTokens?: number;
+  readonly display: IRReasoningDisplay;
+}
+
+/** 结构化输出。语料实证 `output_config.format = {type:'json_schema', schema}`。 */
+export type IROutputFormat =
+  | { readonly kind: "text" }
+  | { readonly kind: "jsonSchema"; readonly name?: string; readonly schema: IRJsonSchema; readonly strict?: boolean };
+
+/**
+ * 上下文管理编辑指令。实测 `context_management.edits = [{type:'clear_thinking_20251015', keep:'all'}]`。
+ * 这是**客户端对历史的处置意图**，不是内容本身，所以留在 L1 而不是 L0。
+ */
+export interface IRContextEdit {
+  readonly kind: "clearThinking" | "clearToolResults" | "unknown";
+  readonly keep: "all" | "none" | { readonly lastTurns: number };
+  /** 原始 wire 指令，供能表达它的 egress 无损还原。 */
+  readonly raw: unknown;
+}
+
+export interface IRSampling {
+  readonly temperature?: IRValued<number>;
+  readonly topP?: IRValued<number>;
+  readonly topK?: IRValued<number>;
+}
+
+export interface IRStopping {
+  /** 单次输出上限。Anthropic 必填，Chat 可选，Codex Responses 直接拒收 —— 差异由 egress 记 loss。 */
+  readonly maxOutputTokens?: IRValued<number>;
+  readonly stopSequences?: IRValued<readonly string[]>;
+}
+
+/** 会话身份。语料里 Claude Code 把它塞进 `metadata.user_id` 的 JSON 字符串里。 */
+export interface IRSessionIdentity {
+  readonly sessionId?: string;
+  readonly deviceId?: string;
+  readonly accountUuid?: string;
+}
+
+export interface IRIntent {
+  readonly reasoning: IRValued<IRReasoning>;
+  readonly outputFormat: IRValued<IROutputFormat>;
+  readonly serviceTier: IRValued<"standard" | "priority">;
+  readonly sampling: IRSampling;
+  readonly stopping: IRStopping;
+  readonly contextEdits: readonly IRContextEdit[];
+  readonly stream: IRValued<boolean>;
+  readonly identity: IRSessionIdentity;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L2 — 能力与损失
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const IR_CAPABILITIES = [
+  "stream", "nonStream",
+  "systemPrompt", "multiTurn",
+  "image", "document",
+  "thinking", "thinkingSignature", "reasoningEffort", "reasoningBudget",
+  "toolFunction", "toolFreeform", "toolBuiltin", "toolGroup", "toolParallel", "toolChoiceSpecific",
+  "toolResultImage", "toolResultError",
+  "structuredOutput", "cacheBreakpoint", "contextEdit",
+  "maxOutputTokens", "stopSequences", "temperature", "topP", "topK", "serviceTier",
+] as const;
+
+export type IRCapability = (typeof IR_CAPABILITIES)[number];
+
+export interface IRCapabilityNeed {
+  readonly capability: IRCapability;
+  /** 触发它的 IR 路径，用于把 422 指到具体位置而不是笼统报错。 */
+  readonly paths: readonly string[];
+}
+
+export interface IREgressProfile {
+  readonly provider: string;
+  readonly supports: ReadonlySet<IRCapability>;
+  /** 能承载但有损（如 toolGroup 靠拍平实现）。放行，但强制记 loss。 */
+  readonly lossy: ReadonlySet<IRCapability>;
+}
+
+export interface IRLoss {
+  readonly stage: "ingress" | "egress" | "lift";
+  readonly provider: string | null;
+  /** IR 路径，如 `$.intent.stopping.maxOutputTokens`。 */
+  readonly path: string;
+  readonly kind: "dropped" | "degraded" | "substituted" | "truncated";
+  readonly detail: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 请求与响应
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface IRRequest {
+  readonly traceId: string;
+  readonly protocol: IRProtocol;
+  readonly model: string;
+  readonly conversation: IRConversation;
+  readonly intent: IRIntent;
+  /** 由 L0/L1 推导，不手写。 */
+  readonly requires: readonly IRCapabilityNeed[];
+}
+
+export type IRStopReason =
+  | "endTurn" | "maxTokens" | "stopSequence" | "toolUse" | "refusal" | "aborted" | "error";
+
+export interface IRUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  /** 三态：undefined = 上游不支持缓存；0 = 支持但没命中；>0 = 命中。 */
+  readonly cacheReadTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly reasoningTokens?: number;
+}
+
+export interface IRUpstreamError {
+  readonly kind:
+    | "invalidRequest" | "permissionDenied" | "rateLimited" | "quotaExhausted"
+    | "contextLengthExceeded" | "contentPolicy" | "upstreamUnavailable" | "transport" | "unknown";
+  readonly httpStatus: number | null;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly raw: unknown;
+}
+
+/**
+ * 响应事件流（不变量 4）。`lift` 返回 AsyncIterable<IREvent> 而不是往 emitter 里推 ——
+ * push 契约的 switch 缺省分支是黑洞：实测曾经一天 126 次 context_length_exceeded 全被静默
+ * 跳过，最后以「200 但空」的形状返回，调用方无法与「没话说」区分，只能盲重试到 retry cap。
+ * `unhandled` 让未识别事件成为流里的一等元素，不可能消失。
+ */
+export type IREvent =
+  | { readonly kind: "messageStart"; readonly model: string }
+  | { readonly kind: "partStart"; readonly index: number; readonly part: IRPart }
+  | { readonly kind: "partDelta"; readonly index: number; readonly delta: IRPartDelta }
+  | { readonly kind: "partEnd"; readonly index: number }
+  | { readonly kind: "usage"; readonly usage: IRUsage }
+  | { readonly kind: "messageStop"; readonly reason: IRStopReason }
+  | { readonly kind: "error"; readonly error: IRUpstreamError }
+  | { readonly kind: "loss"; readonly loss: IRLoss }
+  | { readonly kind: "unhandled"; readonly rawType: string; readonly raw: unknown };
+
+export type IRPartDelta =
+  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "thinking"; readonly text: string }
+  | { readonly kind: "thinkingSignature"; readonly signature: string }
+  | { readonly kind: "toolInputJson"; readonly json: string }
+  | { readonly kind: "toolInputText"; readonly text: string };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 契约
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface IRDecodeResult {
+  readonly request: IRRequest;
+  readonly losses: readonly IRLoss[];
+}
+
+export interface IRIngress {
+  readonly protocol: IRProtocol;
+  decode(raw: unknown, traceId: string): IRDecodeResult;
+  /** 非流式要把整条流聚合完才能成体，因此允许返回 Promise。 */
+  encode(events: AsyncIterable<IREvent>, request: IRRequest): Response | Promise<Response>;
+}
+
+export interface IRWireRequest {
+  readonly url: string;
+  readonly method: "POST";
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: string;
+}
+
+export interface IRLowerResult {
+  readonly wire: IRWireRequest;
+  readonly losses: readonly IRLoss[];
+}
+
+export interface IREgress {
+  readonly profile: IREgressProfile;
+  lower(request: IRRequest): Promise<IRLowerResult>;
+  lift(response: Response): AsyncIterable<IREvent>;
+}

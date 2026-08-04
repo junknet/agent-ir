@@ -1,0 +1,17 @@
+{
+  "name": "agent-ir",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Protocol-neutral IR for multi-protocol LLM gateways: ingress decode -> IR -> egress lower/lift.",
+  "scripts": {
+    "dev": "bun run src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
