@@ -114,6 +114,15 @@ export type IRPart =
     });
 
 /**
+ * 模型**产出**的 part 种类。是 `IRPart` 的真子集：image / document / toolResult / opaque
+ * 是客户端往上送的形态，模型不会生成它们。
+ *
+ * 单独收窄一层，让「响应里出现图片」在编译期就不可能，而不是靠每个 encoder 运行时
+ * `return null` 兜底 —— 那种兜底写几遍就漏几遍。
+ */
+export type IRResponsePart = Extract<IRPart, { kind: "text" | "thinking" | "redactedThinking" | "toolCall" }>;
+
+/**
  * 一个回合。`role` 只有两个值：语料里的 `role:'system'`（1537 次）与 Responses 的
  * `role:'developer'`（9 次）都是 wire 层的编码技巧，decode 时归位到 `conversation.system`；
  * OpenAI 的 `role:'tool'`（2355 次）归位成 user turn 里的 toolResult part。
@@ -121,9 +130,9 @@ export type IRPart =
  * `parts` 是**无约束序列**：语料里 assistant 回合有 27 种形态，包括 `text+text+tool_use`
  * 和一条消息 9 个并行 tool_use，任何「最多一个 text」「工具调用必须在末尾」的假设都会被打破。
  */
-export interface IRTurn {
+export interface IRTurn<TPart extends IRPart = IRPart> {
   readonly role: "user" | "assistant";
-  readonly parts: readonly IRPart[];
+  readonly parts: readonly TPart[];
 }
 
 export type IRJsonSchema = Record<string, unknown>;

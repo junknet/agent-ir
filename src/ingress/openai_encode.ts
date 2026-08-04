@@ -7,7 +7,10 @@
  * response.failed），否则调用方无法区分「模型没话说」与「上游拒绝了」，只能盲重试。
  */
 import { formatSse } from "../ir/sse.ts";
-import type { IREvent, IRPart, IRRequest, IRStopReason, IRUsage } from "../ir/types.ts";
+import type {
+  IREvent, IRPart, IRRequest, IRResponsePart, IRStopReason, IRToolInput, IRUsage,
+} from "../ir/types.ts";
+import { assembleResponse, type IRResponse } from "../ir/response.ts";
 import type { EncodeOptions } from "./shared.ts";
 
 const CHAT_FINISH: Record<IRStopReason, string> = {
@@ -78,6 +81,35 @@ class ResponseAccumulator {
   toolIndex(index: number): number | undefined {
     return this.#toolIndexByPart.get(index);
   }
+
+  /**
+   * 收尾时的 IR 形态。流式路径必须边收边发，用不了 assembleResponse 的整段折叠，
+   * 但**收尾产物仍然是 IRResponse** —— 于是 envelope 构造只有一份，不因流式/非流式分叉。
+   */
+  toIRResponse(fallbackModel: string): IRResponse {
+    const parts: IRResponsePart[] = [];
+    if (this.reasoning.length > 0) parts.push({ kind: "thinking", text: this.reasoning });
+    if (this.text.length > 0) parts.push({ kind: "text", text: this.text });
+    for (const call of this.toolCalls) {
+      let input: IRToolInput = { kind: "text", text: call.arguments };
+      try {
+        const parsed: unknown = JSON.parse(call.arguments.length === 0 ? "{}" : call.arguments);
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          input = { kind: "json", value: parsed as Record<string, unknown> };
+        }
+      } catch { /* 保留 freeform 原文 */ }
+      parts.push({ kind: "toolCall", call: { id: call.id, toolRef: { group: null, name: call.name }, input } });
+    }
+    return {
+      model: fallbackModel,
+      turn: { role: "assistant", parts },
+      stopReason: this.stopReason,
+      usage: this.usage,
+      error: this.failure?.error ?? null,
+      losses: [],
+      unhandled: [],
+    };
+  }
 }
 
 async function consume(
@@ -99,6 +131,33 @@ async function consume(
     onEvent?.(event, accumulator);
   }
   return accumulator;
+}
+
+/**
+ * IRResponse → OpenAI 的扁平视图。两个 OpenAI 协议都要「文本一坨、推理一坨、工具一列」，
+ * 这个压平只此一处；`ResponseAccumulator` 只服务**流式**路径（它必须边收边发，折叠不了）。
+ */
+function flattenForOpenAI(assembled: IRResponse): {
+  readonly text: string;
+  readonly reasoning: string;
+  readonly toolCalls: ReadonlyArray<{ id: string; name: string; arguments: string }>;
+} {
+  let text = "";
+  let reasoning = "";
+  const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+  for (const part of assembled.turn.parts) {
+    if (part.kind === "text") { text += part.text; continue; }
+    if (part.kind === "thinking") { reasoning += part.text; continue; }
+    if (part.kind === "toolCall") {
+      toolCalls.push({
+        id: part.call.id,
+        name: part.call.toolRef.group === null ? part.call.toolRef.name : `${part.call.toolRef.group}__${part.call.toolRef.name}`,
+        arguments: part.call.input.kind === "json" ? JSON.stringify(part.call.input.value) : part.call.input.text,
+      });
+    }
+    // redactedThinking 没有 OpenAI 对应形态，且内容本就不可读，静默略过不记 loss。
+  }
+  return { text, reasoning, toolCalls };
 }
 
 // ── Chat Completions ───────────────────────────────────────────────────────
@@ -184,33 +243,38 @@ function encodeChatStream(events: AsyncIterable<IREvent>, request: IRRequest, op
 async function encodeChatAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
-  const state = await consume(events, options);
-  if (state.failure !== null) {
-    const disclosed = disclose(state.failure);
+  // 折叠只有一个实现（ir/response.ts）；这里只做 IRResponse → Chat wire 的映射。
+  const assembled = await assembleResponse(events, request.model);
+  for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
+
+  if (assembled.error !== null) {
+    const disclosed = disclose({ kind: "error", error: assembled.error });
     return Response.json({ error: { type: disclosed.type, code: disclosed.code, message: disclosed.message } }, { status: disclosed.status });
   }
-  if (state.stopReason === null) {
+  if (assembled.stopReason === null) {
     return Response.json({
       error: { type: "server_error", code: "upstream_disconnected", message: "The upstream connection failed before completion." },
     }, { status: 502 });
   }
+
+  const view = flattenForOpenAI(assembled);
   return Response.json({
-    id: options.messageId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: request.model,
+    id: options.messageId, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: assembled.model,
     choices: [{
       index: 0,
       message: {
         role: "assistant",
-        content: state.text.length === 0 ? null : state.text,
-        ...(state.reasoning.length === 0 ? {} : { reasoning_content: state.reasoning }),
-        ...(state.toolCalls.length === 0 ? {} : {
-          tool_calls: state.toolCalls.map((call) => ({
+        content: view.text.length === 0 ? null : view.text,
+        ...(view.reasoning.length === 0 ? {} : { reasoning_content: view.reasoning }),
+        ...(view.toolCalls.length === 0 ? {} : {
+          tool_calls: view.toolCalls.map((call) => ({
             id: call.id, type: "function", function: { name: call.name, arguments: call.arguments },
           })),
         }),
       },
-      finish_reason: CHAT_FINISH[state.stopReason],
+      finish_reason: CHAT_FINISH[assembled.stopReason],
     }],
-    usage: usageWire(state.usage),
+    usage: usageWire(assembled.usage),
   });
 }
 
@@ -224,29 +288,30 @@ export function encodeResponsesResponse(
     : encodeResponsesAggregate(events, request, options);
 }
 
-function responsesOutput(state: ResponseAccumulator): Array<Record<string, unknown>> {
+function responsesOutput(assembled: IRResponse): Array<Record<string, unknown>> {
+  const view = flattenForOpenAI(assembled);
   const output: Array<Record<string, unknown>> = [];
-  if (state.reasoning.length > 0) {
-    output.push({ type: "reasoning", id: `rs_${output.length}`, summary: [{ type: "summary_text", text: state.reasoning }] });
+  if (view.reasoning.length > 0) {
+    output.push({ type: "reasoning", id: `rs_${output.length}`, summary: [{ type: "summary_text", text: view.reasoning }] });
   }
-  if (state.text.length > 0) {
-    output.push({ type: "message", id: `msg_${output.length}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text, annotations: [] }] });
+  if (view.text.length > 0) {
+    output.push({ type: "message", id: `msg_${output.length}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: view.text, annotations: [] }] });
   }
-  for (const call of state.toolCalls) {
+  for (const call of view.toolCalls) {
     output.push({ type: "function_call", id: `fc_${call.id}`, call_id: call.id, name: call.name, arguments: call.arguments, status: "completed" });
   }
   return output;
 }
 
 function responsesEnvelope(
-  state: ResponseAccumulator, request: IRRequest, options: EncodeOptions, status: string,
+  assembled: IRResponse, request: IRRequest, options: EncodeOptions, status: string,
 ): Record<string, unknown> {
   return {
     id: options.messageId, object: "response", created_at: Math.floor(Date.now() / 1000),
-    status, model: request.model, output: responsesOutput(state),
-    usage: state.usage === null ? null : {
-      input_tokens: state.usage.inputTokens, output_tokens: state.usage.outputTokens,
-      total_tokens: state.usage.inputTokens + state.usage.outputTokens,
+    status, model: assembled.model.length > 0 ? assembled.model : request.model, output: responsesOutput(assembled),
+    usage: assembled.usage === null ? null : {
+      input_tokens: assembled.usage.inputTokens, output_tokens: assembled.usage.outputTokens,
+      total_tokens: assembled.usage.inputTokens + assembled.usage.outputTokens,
     },
   };
 }
@@ -275,11 +340,11 @@ function encodeResponsesStream(events: AsyncIterable<IREvent>, request: IRReques
           // Responses 的失败必须走 response.failed；只发 [DONE] 会被调用方当成空成功。
           send("response.failed", {
             type: "response.failed", sequence_number: next(),
-            response: { ...responsesEnvelope(state, request, options, "failed"), error: { code: disclosed.code, message: disclosed.message } },
+            response: { ...responsesEnvelope(state.toIRResponse(request.model), request, options, "failed"), error: { code: disclosed.code, message: disclosed.message } },
           });
           finished = true;
         } else if (state.stopReason !== null) {
-          send("response.completed", { type: "response.completed", sequence_number: next(), response: responsesEnvelope(state, request, options, "completed") });
+          send("response.completed", { type: "response.completed", sequence_number: next(), response: responsesEnvelope(state.toIRResponse(request.model), request, options, "completed") });
           finished = true;
         }
       } catch (error) {
@@ -304,15 +369,17 @@ function encodeResponsesStream(events: AsyncIterable<IREvent>, request: IRReques
 async function encodeResponsesAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
-  const state = await consume(events, options);
-  if (state.failure !== null) {
-    const disclosed = disclose(state.failure);
+  const assembled = await assembleResponse(events, request.model);
+  for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
+
+  if (assembled.error !== null) {
+    const disclosed = disclose({ kind: "error", error: assembled.error });
     return Response.json({ error: { type: disclosed.type, code: disclosed.code, message: disclosed.message } }, { status: disclosed.status });
   }
-  if (state.stopReason === null) {
+  if (assembled.stopReason === null) {
     return Response.json({
       error: { type: "server_error", code: "upstream_disconnected", message: "The upstream connection failed before completion." },
     }, { status: 502 });
   }
-  return Response.json(responsesEnvelope(state, request, options, "completed"));
+  return Response.json(responsesEnvelope(assembled, request, options, "completed"));
 }

@@ -5,7 +5,8 @@
  * 「非流式」不是另一套解析，只是同一个流的收敛 —— 这样两条路径不会长出两种行为。
  */
 import { formatSse } from "../ir/sse.ts";
-import type { IREvent, IRPart, IRRequest, IRStopReason, IRUsage } from "../ir/types.ts";
+import type { IREvent, IRRequest, IRResponsePart, IRStopReason, IRUsage } from "../ir/types.ts";
+import { asResponsePart, assembleResponse } from "../ir/response.ts";
 import type { EncodeOptions } from "./shared.ts";
 
 const STOP_REASON_WIRE: Record<IRStopReason, string> = {
@@ -28,7 +29,9 @@ function discloseError(event: Extract<IREvent, { kind: "error" }>): { type: stri
   }
 }
 
-function partToBlock(part: IRPart): Record<string, unknown> | null {
+// IRResponsePart → Anthropic wire 块。**全函数**：收窄由 asResponsePart 一处负责，
+// 这里不再需要 `return null` 兜底 —— 那种兜底写几遍就漏几遍。
+function responsePartToBlock(part: IRResponsePart): Record<string, unknown> {
   switch (part.kind) {
     case "text": return { type: "text", text: part.text };
     case "thinking": return { type: "thinking", thinking: part.text, ...(part.signature === undefined ? {} : { signature: part.signature }) };
@@ -37,9 +40,6 @@ function partToBlock(part: IRPart): Record<string, unknown> | null {
       type: "tool_use", id: part.call.id, name: part.call.toolRef.name,
       input: part.call.input.kind === "json" ? part.call.input.value : { input: part.call.input.text },
     };
-    case "image": case "document": case "toolResult": case "opaque":
-      // 这些形态不会出现在**响应**里；出现说明 lift 映射错了，交给 unhandled 计数而不是静默塞出去。
-      return null;
   }
 }
 
@@ -96,9 +96,9 @@ function encodeStream(events: AsyncIterable<IREvent>, request: IRRequest, option
 
             case "partStart": {
               ensureStart(request.model);
-              const block = partToBlock(event.part);
-              if (block === null) { options.onUnhandled?.("response_part", event.part); break; }
-              send("content_block_start", { type: "content_block_start", index: event.index, content_block: block });
+              const responsePart = asResponsePart(event.part);
+              if (responsePart === null) { options.onUnhandled?.("response_part", event.part); break; }
+              send("content_block_start", { type: "content_block_start", index: event.index, content_block: responsePartToBlock(responsePart) });
               break;
             }
 
@@ -174,65 +174,19 @@ function encodeStream(events: AsyncIterable<IREvent>, request: IRRequest, option
 async function encodeAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
-  const blocks: Array<Record<string, unknown>> = [];
-  const toolJson = new Map<number, string>();
-  const indexToBlock = new Map<number, number>();
-  let usage: IRUsage | null = null;
-  let stopReason: IRStopReason | null = null;
-  let model = request.model;
-  let failure: Extract<IREvent, { kind: "error" }> | null = null;
+  // 折叠只有一个实现（ir/response.ts）。此处只做 IRResponse → Anthropic wire 的映射，
+  // 不再自己维护一份累积状态 —— 那样两个协议会各折各的，且都落不到 IR 上。
+  const assembled = await assembleResponse(events, request.model);
+  for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
-  for await (const event of events) {
-    switch (event.kind) {
-      case "messageStart":
-        if (event.model.length > 0) model = event.model;
-        break;
-      case "partStart": {
-        const block = partToBlock(event.part);
-        if (block === null) { options.onUnhandled?.("response_part", event.part); break; }
-        indexToBlock.set(event.index, blocks.length);
-        blocks.push(block);
-        if (event.part.kind === "toolCall") toolJson.set(event.index, "");
-        break;
-      }
-      case "partDelta": {
-        const position = indexToBlock.get(event.index);
-        if (position === undefined) break;
-        const block = blocks[position];
-        if (block === undefined) break;
-        if (event.delta.kind === "text") block.text = `${String(block.text ?? "")}${event.delta.text}`;
-        else if (event.delta.kind === "thinking") block.thinking = `${String(block.thinking ?? "")}${event.delta.text}`;
-        else if (event.delta.kind === "thinkingSignature") block.signature = event.delta.signature;
-        else if (event.delta.kind === "toolInputJson") toolJson.set(event.index, (toolJson.get(event.index) ?? "") + event.delta.json);
-        else toolJson.set(event.index, (toolJson.get(event.index) ?? "") + event.delta.text);
-        break;
-      }
-      case "partEnd": {
-        const buffered = toolJson.get(event.index);
-        const position = indexToBlock.get(event.index);
-        if (buffered === undefined || position === undefined || buffered.length === 0) break;
-        const block = blocks[position];
-        if (block === undefined) break;
-        try { block.input = JSON.parse(buffered); }
-        catch { block.input = { input: buffered }; }
-        break;
-      }
-      case "usage": usage = event.usage; break;
-      case "messageStop": stopReason = event.reason; break;
-      case "error": failure = event; break;
-      case "loss": break;
-      case "unhandled": options.onUnhandled?.(event.rawType, event.raw); break;
-    }
-  }
-
-  if (failure !== null) {
-    const disclosed = discloseError(failure);
+  if (assembled.error !== null) {
+    const disclosed = discloseError({ kind: "error", error: assembled.error });
     return Response.json(
       { type: "error", error: { type: disclosed.type, message: disclosed.message } },
       { status: disclosed.status },
     );
   }
-  if (stopReason === null) {
+  if (assembled.stopReason === null) {
     // 没有终止事件 = 上游中途断了。返回真实错误，绝不回一个「200 但空」的假成功。
     return Response.json(
       { type: "error", error: { type: "api_error", message: "The upstream connection failed before completion." } },
@@ -244,10 +198,10 @@ async function encodeAggregate(
     id: options.messageId,
     type: "message",
     role: "assistant",
-    model,
-    content: blocks,
-    stop_reason: STOP_REASON_WIRE[stopReason],
+    model: assembled.model,
+    content: assembled.turn.parts.map(responsePartToBlock),
+    stop_reason: STOP_REASON_WIRE[assembled.stopReason],
     stop_sequence: null,
-    usage: usageWire(usage),
+    usage: usageWire(assembled.usage),
   });
 }

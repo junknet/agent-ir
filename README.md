@@ -24,6 +24,30 @@ POST /v1/chat/completions  ┘         ▲          └
 | 4 | **响应是可拉取的事件流** | 一天 126 次静默 `context_length_exceeded`，全被 switch 缺省分支吞掉，返回「200 但空」 |
 | 5 | **能力是静态声明** | usage 三态坍缩（「上游不支持缓存」与「这轮没命中」不可区分） |
 
+## 请求与响应，两侧都是 IR
+
+请求天然是**文档**（发之前整段对话就在手上），响应天然是**流**（增量到达）。
+这个不对称是 domain 固有的，但「响应组装完之后长什么样」同样必须是 IR ——
+否则每个出站协议都要自己从事件流折一遍，各折各的形状。
+
+```
+请求  IRRequest              L0 会话 + L1 意图 + L2 能力需求
+响应  IREvent 流             messageStart / partStart / partDelta / partEnd
+                             / usage / messageStop / error / loss / unhandled
+      ↓ assembleResponse()   唯一的折叠实现
+      IRResponse             { turn, stopReason, usage, error, losses, unhandled }
+```
+
+**闭环在 `IRResponse.turn`**：它是一个 assistant `IRTurn`，与请求历史里的回合同类型，
+可以直接 append 进下一轮的 `conversation.turns`，不必绕一圈 wire 再 decode。
+`IRTurn` 对 part 类型协变，所以它同时是「比历史回合窄」（`IRResponsePart`：模型不会
+生成 image / document / toolResult / opaque）和「是历史回合」。
+
+测试锁死了这条：组装出的回合与把同一段产出走 Anthropic wire 再 decode 回来的结果**完全相等**。
+
+流式路径不能用整段折叠（必须边收边发），但它的**收尾产物仍然是 `IRResponse`** ——
+于是 envelope 构造只有一份，不因流式/非流式分叉。
+
 ## 三层结构
 
 ```
@@ -83,7 +107,7 @@ ingress_received → ingress_decoded → admission_decided → egress_lowered
 ## 测试
 
 ```bash
-bun test          # 43 项：38 边界用例 + 5 项 807 条真实语料回放
+bun test          # 52 项：38 边界用例 + 9 项请求↔响应对称性 + 5 项 807 条真实语料回放
 bun run typecheck
 ```
 
