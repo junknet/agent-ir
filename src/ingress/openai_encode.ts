@@ -53,7 +53,7 @@ function usageWire(usage: IRUsage | null): Record<string, unknown> {
 class ResponseAccumulator {
   text = "";
   reasoning = "";
-  readonly toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+  readonly toolCalls: Array<{ id: string; group: string | null; name: string; arguments: string }> = [];
   readonly #toolIndexByPart = new Map<number, number>();
   usage: IRUsage | null = null;
   stopReason: IRStopReason | null = null;
@@ -64,7 +64,8 @@ class ResponseAccumulator {
     this.#toolIndexByPart.set(index, this.toolCalls.length);
     this.toolCalls.push({
       id: part.call.id,
-      name: part.call.toolRef.group === null ? part.call.toolRef.name : `${part.call.toolRef.group}__${part.call.toolRef.name}`,
+      group: part.call.toolRef.group,
+      name: part.call.toolRef.name,
       arguments: part.call.input.kind === "json" && Object.keys(part.call.input.value).length > 0
         ? JSON.stringify(part.call.input.value)
         : part.call.input.kind === "text" ? part.call.input.text : "",
@@ -86,6 +87,11 @@ class ResponseAccumulator {
     return this.#toolIndexByPart.get(index);
   }
 
+  toolCall(index: number): Readonly<{ id: string; group: string | null; name: string; arguments: string }> | undefined {
+    const position = this.#toolIndexByPart.get(index);
+    return position === undefined ? undefined : this.toolCalls[position];
+  }
+
   /**
    * 收尾时的 IR 形态。流式路径必须边收边发，用不了 assembleResponse 的整段折叠，
    * 但**收尾产物仍然是 IRResponse** —— 于是 envelope 构造只有一份，不因流式/非流式分叉。
@@ -102,7 +108,7 @@ class ResponseAccumulator {
           input = { kind: "json", value: parsed as Record<string, unknown> };
         }
       } catch { /* 保留 freeform 原文 */ }
-      parts.push({ kind: "toolCall", call: { id: call.id, toolRef: { group: null, name: call.name }, input } });
+      parts.push({ kind: "toolCall", call: { id: call.id, toolRef: { group: call.group, name: call.name }, input } });
     }
     return {
       model: fallbackModel,
@@ -144,24 +150,29 @@ async function consume(
 function flattenForOpenAI(assembled: IRResponse): {
   readonly text: string;
   readonly reasoning: string;
-  readonly toolCalls: ReadonlyArray<{ id: string; name: string; arguments: string }>;
+  readonly toolCalls: ReadonlyArray<{ id: string; group: string | null; name: string; arguments: string }>;
 } {
   let text = "";
   let reasoning = "";
-  const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+  const toolCalls: Array<{ id: string; group: string | null; name: string; arguments: string }> = [];
   for (const part of assembled.turn.parts) {
     if (part.kind === "text") { text += part.text; continue; }
     if (part.kind === "thinking") { reasoning += part.text; continue; }
     if (part.kind === "toolCall") {
       toolCalls.push({
         id: part.call.id,
-        name: part.call.toolRef.group === null ? part.call.toolRef.name : `${part.call.toolRef.group}__${part.call.toolRef.name}`,
+        group: part.call.toolRef.group,
+        name: part.call.toolRef.name,
         arguments: part.call.input.kind === "json" ? JSON.stringify(part.call.input.value) : part.call.input.text,
       });
     }
     // redactedThinking 没有 OpenAI 对应形态，且内容本就不可读，静默略过不记 loss。
   }
   return { text, reasoning, toolCalls };
+}
+
+function chatToolName(call: { readonly group: string | null; readonly name: string }): string {
+  return call.group === null ? call.name : `${call.group}__${call.name}`;
 }
 
 // ── Chat Completions ───────────────────────────────────────────────────────
@@ -277,7 +288,7 @@ async function encodeChatAggregate(
         ...(view.reasoning.length === 0 ? {} : { reasoning_content: view.reasoning }),
         ...(view.toolCalls.length === 0 ? {} : {
           tool_calls: view.toolCalls.map((call) => ({
-            id: call.id, type: "function", function: { name: call.name, arguments: call.arguments },
+            id: call.id, type: "function", function: { name: chatToolName(call), arguments: call.arguments },
           })),
         }),
       },
@@ -307,7 +318,7 @@ function responsesOutput(assembled: IRResponse): Array<Record<string, unknown>> 
     output.push({ type: "message", id: `msg_${output.length}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: view.text, annotations: [] }] });
   }
   for (const call of view.toolCalls) {
-    output.push({ type: "function_call", id: `fc_${call.id}`, call_id: call.id, name: call.name, arguments: call.arguments, status: "completed" });
+    output.push({ type: "function_call", id: `fc_${call.id}`, call_id: call.id, name: call.name, arguments: call.arguments, status: "completed", ...(call.group === null ? {} : { namespace: call.group }) });
   }
   return output;
 }
@@ -335,15 +346,58 @@ function writeClientResponsesStream(events: AsyncIterable<IREvent>, request: IRR
       let sequence = 0;
       const next = (): number => sequence++;
       let finished = false;
+      const toolStreamItems = new Map<number, { readonly outputIndex: number; readonly itemId: string; readonly freeform: boolean }>();
+      let nextOutputIndex = 0;
       try {
         send("response.created", { type: "response.created", sequence_number: next(), response: { id: options.messageId, object: "response", status: "in_progress", model: request.model, output: [] } });
-        const state = await consume(events, options, (event) => {
+        const state = await consume(events, options, (event, accumulator) => {
           if (event.kind === "heartbeat") { send("response.in_progress", { type: "response.in_progress", sequence_number: next() }); return; }
           if (event.kind === "partDelta" && event.delta.kind === "text") {
             send("response.output_text.delta", { type: "response.output_text.delta", sequence_number: next(), output_index: 0, delta: event.delta.text });
           }
           if (event.kind === "partDelta" && event.delta.kind === "thinking") {
             send("response.reasoning_summary_text.delta", { type: "response.reasoning_summary_text.delta", sequence_number: next(), output_index: 0, delta: event.delta.text });
+          }
+          if (event.kind === "partStart" && event.part.kind === "toolCall") {
+            const freeform = event.part.call.input.kind === "text";
+            const outputIndex = nextOutputIndex++;
+            const itemId = `fc_${event.part.call.id}`;
+            toolStreamItems.set(event.index, { outputIndex, itemId, freeform });
+            const item = freeform
+              ? { id: itemId, type: "custom_tool_call", status: "in_progress", call_id: event.part.call.id, name: event.part.call.toolRef.name, input: "" }
+              : { id: itemId, type: "function_call", status: "in_progress", call_id: event.part.call.id, name: event.part.call.toolRef.name, arguments: "", ...(event.part.call.toolRef.group === null ? {} : { namespace: event.part.call.toolRef.group }) };
+            send("response.output_item.added", { type: "response.output_item.added", sequence_number: next(), output_index: outputIndex, item });
+            const initial = freeform
+              ? event.part.call.input.text
+              : Object.keys(event.part.call.input.value).length === 0 ? "" : JSON.stringify(event.part.call.input.value);
+            if (initial.length > 0) {
+              send(freeform ? "response.custom_tool_call_input.delta" : "response.function_call_arguments.delta", {
+                type: freeform ? "response.custom_tool_call_input.delta" : "response.function_call_arguments.delta",
+                sequence_number: next(), output_index: outputIndex, item_id: itemId, delta: initial,
+              });
+            }
+          }
+          if (event.kind === "partDelta" && (event.delta.kind === "toolInputJson" || event.delta.kind === "toolInputText")) {
+            const item = toolStreamItems.get(event.index);
+            if (item !== undefined) {
+              const type = item.freeform ? "response.custom_tool_call_input.delta" : "response.function_call_arguments.delta";
+              send(type, { type, sequence_number: next(), output_index: item.outputIndex, item_id: item.itemId, delta: event.delta.kind === "toolInputJson" ? event.delta.json : event.delta.text });
+            }
+          }
+          if (event.kind === "partEnd") {
+            const item = toolStreamItems.get(event.index);
+            const call = accumulator.toolCall(event.index);
+            if (item !== undefined && call !== undefined) {
+              const doneType = item.freeform ? "response.custom_tool_call_input.done" : "response.function_call_arguments.done";
+              const input = item.freeform ? { input: call.arguments } : { arguments: call.arguments };
+              send(doneType, { type: doneType, sequence_number: next(), output_index: item.outputIndex, item_id: item.itemId, ...input });
+              send("response.output_item.done", {
+                type: "response.output_item.done", sequence_number: next(), output_index: item.outputIndex,
+                item: item.freeform
+                  ? { id: item.itemId, type: "custom_tool_call", status: "completed", call_id: call.id, name: call.name, input: call.arguments }
+                  : { id: item.itemId, type: "function_call", status: "completed", call_id: call.id, name: call.name, arguments: call.arguments, ...(call.group === null ? {} : { namespace: call.group }) },
+              });
+            }
           }
         });
 

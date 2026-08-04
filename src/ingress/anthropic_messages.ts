@@ -31,6 +31,9 @@ function decodeBlock(block: unknown, path: string, losses: LossRecorder): IRPart
 
   switch (block.type) {
     case "text":
+      if (asString(block.text) === null) {
+        losses.record({ path: `${path}.text`, kind: "substituted", detail: "text block without a string text value" });
+      }
       return withCache({ kind: "text", text: asString(block.text) ?? "" });
 
     case "thinking": {
@@ -74,6 +77,9 @@ function decodeBlock(block: unknown, path: string, losses: LossRecorder): IRPart
         ? { kind: asString(block.caller.type) ?? "unknown", raw: block.caller }
         : null;
       // input 恒为对象；freeform 工具的调用在 wire 上仍走 input，由工具定义决定语义。
+      if (!isRecord(block.input)) {
+        losses.record({ path: `${path}.input`, kind: "substituted", detail: "tool_use input is not an object; substituted with an empty object" });
+      }
       return withCache({
         kind: "toolCall",
         call: {
@@ -278,6 +284,9 @@ export function readAnthropicMessagesRequest(raw: unknown, traceId: string): Cli
   const system: IRPart[] = decodeContent(body.system, "$.system", losses);
 
   const turns: IRTurn[] = [];
+  if (body.messages !== undefined && !Array.isArray(body.messages)) {
+    losses.record({ path: "$.messages", kind: "dropped", detail: "messages is not an array" });
+  }
   const rawMessages = Array.isArray(body.messages) ? body.messages : [];
   rawMessages.forEach((message, index) => {
     if (!isRecord(message)) {
@@ -296,6 +305,9 @@ export function readAnthropicMessagesRequest(raw: unknown, traceId: string): Cli
     });
   });
 
+  if (body.tools !== undefined && !Array.isArray(body.tools)) {
+    losses.record({ path: "$.tools", kind: "dropped", detail: "tools is not an array" });
+  }
   const rawTools = Array.isArray(body.tools) ? body.tools : [];
   const tools = rawTools
     .map((tool, index) => decodeTool(tool, `$.tools[${index}]`, losses))

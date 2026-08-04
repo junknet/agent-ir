@@ -476,13 +476,27 @@ describe("lower：每一处降级都留痕", () => {
     expect(body(budget.wire).reasoning_effort).toBe("high");
     expect(findLoss(budget.losses, "bucketed into reasoning_effort")?.kind).toBe("degraded");
 
-    const clamped = await compiled(irRequest({
-      intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", effort: "xhigh", display: "summarized" }) },
+    // 夹档是编译事实（同一根强度轴降分辨率），但**必须留痕，且 detail 要含原值与夹后值**：
+    // 只写结果的留痕，事后无法从日志还原客户端当初要的是哪一档。
+    // 越界的两档都跑一遍：判断与夹后值都由 `EFFORT_WIRE` 派生，任何一档漏表态都会在这里现形。
+    for (const effort of ["xhigh", "max"] as const) {
+      const clamped = await compiled(irRequest({
+        intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", effort, display: "summarized" }) },
+      }));
+      expect(body(clamped.wire).reasoning_effort).toBe("high");
+      const clampLoss = findLoss(clamped.losses, "clamped to");
+      expect(clampLoss?.kind).toBe("substituted");
+      expect(clampLoss?.path).toBe("$.intent.reasoning.effort");
+      expect(clampLoss?.detail).toContain(`'${effort}'`);  // 原值
+      expect(clampLoss?.detail).toContain("'high'");       // 夹后值
+    }
+
+    // 反面：wire 原样承得住的档位**不记** loss —— 有损留痕不等于逢 effort 就留痕。
+    const exact = await compiled(irRequest({
+      intent: { reasoning: clientValue<IRReasoning>({ mode: "enabled", effort: "medium", display: "summarized" }) },
     }));
-    expect(body(clamped.wire).reasoning_effort).toBe("high");
-    const clampLoss = findLoss(clamped.losses, "clamped to 'high'");
-    expect(clampLoss?.kind).toBe("substituted");
-    expect(clampLoss?.path).toBe("$.intent.reasoning.effort");
+    expect(body(exact.wire).reasoning_effort).toBe("medium");
+    expect(findLoss(exact.losses, "clamped to")).toBeUndefined();
   });
 
   it("stop 超过 4 条截断（编译事实：wire 的容量就是 4）", async () => {

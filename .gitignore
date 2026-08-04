@@ -4,3 +4,6 @@ dist/
 .corpus/
 .dev-logs/
 *.log
+
+# 审查基准：从上游按 docs/STANDARDS.md 指定版本取得，本地使用，不纳入网关源码。
+docs/standards/

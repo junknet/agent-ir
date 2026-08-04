@@ -453,12 +453,18 @@ describe("lower：IR → v1internal wire", () => {
         stopping: { maxOutputTokens: clientValue(20) },
       }),
     }));
-    expect(problems.map((problem) => problem.kind).sort()).toEqual(["orphanToolResult", "requiredFieldMissing"]);
+    expect(problems.map((problem) => problem.kind).sort()).toEqual(["orphanToolResult", "unsatisfiableValue"]);
 
-    const ceiling = problems.find((problem) => problem.kind === "requiredFieldMissing");
+    // kind 是 `unsatisfiableValue` 不是 `requiredFieldMissing`：maxOutputTokens 与
+    // thinkingBudget **都在**，无解的是两者的组合。分错 kind 会把调用方指向「补一个值」，
+    // 而这里要改的是已经存在的那个值（或与它冲突的那个字段）。
+    const ceiling = problems.find((problem) => problem.kind === "unsatisfiableValue");
     expect(ceiling?.path).toBe("$.intent.stopping.maxOutputTokens");
-    expect(ceiling?.detail).toContain("thinkingBudget(10000)");
-    expect(ceiling?.detail).toContain("14096");
+    // detail 必须同时给出**冲突双方与下界**，否则调用方不知道该把哪一边改到多少
+    expect(ceiling?.detail).toContain("thinkingBudget(10000)");   // 冲突的另一方
+    expect(ceiling?.detail).toContain("20");                      // 客户端给的值
+    expect(ceiling?.detail).toContain("14096");                   // 这条 wire 的下界
+    expect(problems.some((problem) => problem.kind === "requiredFieldMissing")).toBe(false);
     // 拒绝前记下的有损条目照样交出
     expect(losses.some((loss) => loss.path === "$.intent.sampling.topK")).toBe(true);
   });

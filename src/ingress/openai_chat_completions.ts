@@ -58,7 +58,12 @@ function decodeContent(content: unknown, path: string, losses: LossRecorder): IR
 
 /** `tool_calls[].function.arguments` 是 JSON **字符串**；解析失败保留原文当 freeform 入参。 */
 function decodeToolCallParts(message: Record<string, unknown>, path: string, losses: LossRecorder): IRPart[] {
-  if (!Array.isArray(message.tool_calls)) return [];
+  if (!Array.isArray(message.tool_calls)) {
+    if (message.tool_calls !== undefined) {
+      losses.record({ path: `${path}.tool_calls`, kind: "dropped", detail: "tool_calls is not an array" });
+    }
+    return [];
+  }
   const parts: IRPart[] = [];
   message.tool_calls.forEach((call, index) => {
     if (!isRecord(call)) return;
@@ -105,7 +110,12 @@ function decodeTool(tool: unknown, path: string, losses: LossRecorder): IRTool |
   const ref: IRToolRef = { group: null, name };
   const description = asString(fn.description) ?? "";
   const schema = isRecord(fn.parameters) ? fn.parameters : null;
-  if (schema === null) return { kind: "freeform", ref, description };
+  if (schema === null) {
+    if (fn.parameters !== undefined) {
+      losses.record({ path: `${path}.function.parameters`, kind: "degraded", detail: "function parameters are not an object; treated as freeform" });
+    }
+    return { kind: "freeform", ref, description };
+  }
   return {
     kind: "function", ref, description, schema,
     ...(fn.strict === true ? { strict: true } : {}),
@@ -162,6 +172,9 @@ export function readChatCompletionsRequest(raw: unknown, traceId: string): Clien
 
   const system: IRPart[] = [];
   const turns: IRTurn[] = [];
+  if (body.messages !== undefined && !Array.isArray(body.messages)) {
+    losses.record({ path: "$.messages", kind: "dropped", detail: "messages is not an array" });
+  }
   const rawMessages = Array.isArray(body.messages) ? body.messages : [];
 
   rawMessages.forEach((message, index) => {
@@ -215,6 +228,9 @@ export function readChatCompletionsRequest(raw: unknown, traceId: string): Clien
     losses.record({ path: `${path}.role`, kind: "dropped", detail: `unknown message role '${String(role)}'` });
   });
 
+  if (body.tools !== undefined && !Array.isArray(body.tools)) {
+    losses.record({ path: "$.tools", kind: "dropped", detail: "tools is not an array" });
+  }
   const rawTools = Array.isArray(body.tools) ? body.tools : [];
   const tools = rawTools
     .map((tool, index) => decodeTool(tool, `$.tools[${index}]`, losses))

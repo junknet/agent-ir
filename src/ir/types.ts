@@ -456,6 +456,17 @@ export interface IRWireRequest<TBody extends IRWireBody = string> {
 export const IR_BUILD_PROBLEM_KINDS = [
   /** 目标 wire 强制要求，而 IR 里没有（如 Anthropic 的 max_tokens）。 */
   "requiredFieldMissing",
+  /**
+   * IR 里**有**这个值，但目标 wire 装不下这个取值 —— 取值域、上下界、或**跨字段组合**。
+   *
+   * 与 `requiredFieldMissing` 的分界只有一句话：**缺不缺**。缺了才是 missing；
+   * 值在、只是它与 wire 的约束冲突，是 unsatisfiable。两者在 wire 上的补法完全不同：
+   * 前者要有人补一个值，后者要有人改已有的值（或改与它冲突的那个字段）。
+   *
+   * 实例：CloudCode 把 thinkingBudget 算进 maxOutputTokens，客户端的 max_tokens 低于
+   * `budget + 可见正文下限` 时，两个字段各自都合法，是**组合**无解 —— 什么都没缺。
+   */
+  "unsatisfiableValue",
   /** 声明了工具调用但历史里没有对应结果，目标 wire 不接受悬空。 */
   "danglingToolCall",
   /** 工具结果找不到对应调用。 */

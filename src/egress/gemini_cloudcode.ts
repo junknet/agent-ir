@@ -754,6 +754,10 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       //                        maxOutputTokens，客户端给的额度不够时以前**擅自抬高**；抬高
       //                        是在推翻客户端明确写下的成本上限。这个组合上游会返回
       //                        200 但正文全空（实测 max=20 + budget=10000），必须拒绝。
+      //                        拒绝的 kind 是 `unsatisfiableValue` 而不是
+      //                        `requiredFieldMissing`：**什么都没缺** —— maxOutputTokens 与
+      //                        thinkingBudget 各自都在，是这两个字段的**组合**在这条 wire 上
+      //                        无解。分错了 kind，调用方会去补一个它已经有的值。
       const cap = options.maxOutputTokensCap ?? DEFAULT_MAX_OUTPUT;
       const floor = thinking.budget > 0 ? thinking.budget + MIN_VISIBLE_TOKENS : 0;
       const requestedMax = intent.stopping.maxOutputTokens?.value;
@@ -761,7 +765,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       if (requestedMax !== undefined) {
         if (requestedMax < floor) {
           report.reject({
-            kind: "requiredFieldMissing",
+            kind: "unsatisfiableValue",
             path: "$.intent.stopping.maxOutputTokens",
             detail: `CloudCode counts thinkingBudget(${thinking.budget}) inside maxOutputTokens, so ${requestedMax} `
               + `leaves no room for visible output (this upstream needs at least ${floor}); it answers 200 with an `

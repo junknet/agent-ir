@@ -282,6 +282,10 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
         : undefined;
 
       const outputFormat = intent.outputFormat.value;
+      // effort **原样下发，不夹档、不记 loss**：`IREffort` 的六档就是 Anthropic 自己的档位
+      // 集合（`output_config.effort`），这条路上没有更窄的枚举要夹。`reasoningEffort` 因此
+      // 落在 SUPPORTED 而不是 LOSSY —— 另两个 OpenAI 出口的夹档 loss 在这里没有对应物，
+      // 不是漏记。
       const outputConfig = {
         ...(reasoning.effort === undefined ? {} : { effort: reasoning.effort }),
         ...(outputFormat.kind === "jsonSchema"

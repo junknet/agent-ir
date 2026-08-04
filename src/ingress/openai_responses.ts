@@ -285,6 +285,9 @@ export function readResponsesRequest(raw: unknown, traceId: string): ClientReque
   if (instructions !== null && instructions.length > 0) system.push(textPart(instructions));
 
   const turns: IRTurn[] = [];
+  if (body.input !== undefined && typeof body.input !== "string" && !Array.isArray(body.input)) {
+    losses.record({ path: "$.input", kind: "dropped", detail: "input is neither a string nor an array" });
+  }
   const rawInput = typeof body.input === "string"
     ? [{ type: "message", role: "user", content: body.input }]
     : Array.isArray(body.input) ? body.input : [];
@@ -296,6 +299,9 @@ export function readResponsesRequest(raw: unknown, traceId: string): ClientReque
     turns.push({ role: decoded.role, parts: decoded.parts });
   });
 
+  if (body.tools !== undefined && !Array.isArray(body.tools)) {
+    losses.record({ path: "$.tools", kind: "dropped", detail: "tools is not an array" });
+  }
   const rawTools = Array.isArray(body.tools) ? body.tools : [];
   const tools: IRTool[] = [];
   const groups: IRToolGroup[] = [];

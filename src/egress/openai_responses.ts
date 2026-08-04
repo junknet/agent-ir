@@ -43,7 +43,7 @@ const PROVIDER = "openai_responses";
 const SUPPORTED = [
   "stream", "nonStream", "systemPrompt", "multiTurn", "image",
   "thinking", "reasoningEffort",
-  "toolFunction", "toolFreeform", "toolBuiltin", "toolGroup", "toolParallel", "toolChoiceSpecific",
+  "toolFunction", "toolFreeform", "toolBuiltin", "toolGroup", "toolParallel", "toolChoiceSpecific", "toolResultImage",
   "structuredOutput", "maxOutputTokens", "temperature", "topP", "serviceTier",
 ] as const satisfies readonly IRCapability[];
 
@@ -72,8 +72,6 @@ const LOSSY = [
 //                    以前它在 lossy 里，靠一句文本占位符「承载」—— 那不是承载，是网关替
 //                    客户端决定让模型看一句转述。占位是策略（`textualizeUnsupportedDocument`），
 //                    所以这条能力的诚实结论是：这条路线载不动。
-//   toolResultImage  `function_call_output.output` 实测只有 string 与 input_text 两种形态
-//                    （rollout 7901+1176 条无一例外）。同上：占位文本不等于把像素送到了。
 
 export interface ResponsesUpstreamOptions {
   readonly baseUrl: string;
@@ -184,7 +182,7 @@ function lowerContentPart(
   }
 }
 
-/** 工具结果 parts → 输出 item 的 `output`。实测形态：字符串，或 `input_text` 数组。 */
+/** 工具结果 parts → 输出 item 的 `output`。文本与图片都以 input 内容块原样承载。 */
 function lowerToolOutput(
   parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, report: UpstreamRequestReport,
 ): Array<WireItem> {
@@ -196,17 +194,7 @@ function lowerToolOutput(
       return;
     }
     if (part.kind === "image") {
-      // **策略**，已剥离：rollout 里 7901 条 custom_tool_call_output + 1176 条
-      // function_call_output 的 output 只有 string 与 input_text 两种形态，没有一条带图片
-      // —— 工具输出**载不动像素**，这是编译事实。但把它换成一句占位文本是网关替客户端
-      // 决定「模型看一句转述就够了」，而截图类工具的全部价值恰恰在像素上。
-      report.reject({
-        kind: "unrepresentablePart",
-        path: childPath,
-        detail: `tool result image (${part.media.mediaType}) has no carrier in a Responses tool output (verified over `
-          + "9077 rollout output items: string or input_text only), and the gateway will not substitute a text marker "
-          + "(compose repair 'textualizeUnsupportedImage' to accept that trade)",
-      });
+      blocks.push({ type: "input_image", image_url: dataUrl(part) });
       return;
     }
     report.record({ path: childPath, kind: "dropped", detail: `'${part.kind}' has no representation inside a Responses tool output` });
@@ -522,7 +510,10 @@ function lowerReasoningConfig(request: IRRequest, report: UpstreamRequestReport)
   if (effort !== undefined && EFFORT_WIRE[effort] !== effort) {
     // **编译事实**：wire 的档位枚举没有 xhigh/max 这两级，夹进可表达区间是唯一的承载
     // 方式。客户端「尽量多想」的意图仍以最高可表达档位生效，少的只是分辨率，Core 没有
-    // 引入任何客户端没说过的新维度。
+    // 引入任何客户端没说过的新维度 —— 同一根强度轴降分辨率，与 stop_sequences 截断同类。
+    // 反过来拒绝才是替调用方做了**更大**的决定：为了保住一档分辨率，让整个上游不可用。
+    // 判断与夹后值都只从 `EFFORT_WIRE` 读，detail 必须同时带上**原值与夹后值** ——
+    // 只说结果的留痕，事后没人能从日志里还原客户端到底要的是哪一档。
     report.record({
       path: "$.intent.reasoning.effort", kind: "substituted",
       detail: `effort '${effort}' is not an accepted Responses value; clamped to '${EFFORT_WIRE[effort]}'`,

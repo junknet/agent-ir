@@ -513,14 +513,20 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       const reasoning = intent.reasoning.value;
       let reasoningEffort: string | undefined;
       if (reasoning.effort !== undefined) {
-        reasoningEffort = EFFORT_WIRE[reasoning.effort];
-        if (reasoning.effort === "xhigh" || reasoning.effort === "max") {
+        const clampedEffort = EFFORT_WIRE[reasoning.effort];
+        reasoningEffort = clampedEffort;
+        // 「有没有被夹」由 `EFFORT_WIRE` 自己回答（值变了就是夹了），不另写一份
+        // `effort === 'xhigh' || effort === 'max'` 的档位清单：那是同一个概念的第二份手抄，
+        // 新增一档时表里会被逼着表态，而手抄的判断会安静地不再命中 —— 夹档照旧发生，loss
+        // 却消失了，正是「有损无痕」。夹后值同样取自表，detail 里不出现硬编码的 'high'。
+        if (clampedEffort !== reasoning.effort) {
           // **编译事实**：wire 的档位枚举只有四级，IR 的第五、六级没有位置，夹进可表达
           // 区间是唯一的承载方式。Core 没有引入客户端没说过的新维度 ——「尽量多想」这个
           // 意图仍以最高的可表达档位生效，少掉的只是分辨率（同 stop_sequences 截断）。
+          // 反过来拒绝才是替调用方做了**更大**的决定：为了保住一档分辨率，让整个上游不可用。
           report.record({
             path: "$.intent.reasoning.effort", kind: "substituted",
-            detail: `Chat Completions accepts minimal|low|medium|high; '${reasoning.effort}' clamped to 'high'`,
+            detail: `Chat Completions accepts minimal|low|medium|high; effort '${reasoning.effort}' clamped to '${clampedEffort}'`,
           });
         }
         if (reasoning.budgetTokens !== undefined) {

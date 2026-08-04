@@ -135,12 +135,12 @@ describe("能力声明", () => {
       expect(egress.profile.supports.has(capability)).toBe(false);
       expect(egress.profile.lossy.has(capability)).toBe(true);
     }
-    // document 与 toolResultImage 以前挂在 lossy 上，靠一句文本占位符「承载」——
-    // 占位是策略不是承载，剥离之后它们两个集合都不在，由准入层带路径拒。
-    for (const capability of ["document", "toolResultImage"] as const) {
-      expect(egress.profile.supports.has(capability)).toBe(false);
-      expect(egress.profile.lossy.has(capability)).toBe(false);
-    }
+    // document 没有经验证的 wire 载体，必须在准入层拒绝。
+    expect(egress.profile.supports.has("document")).toBe(false);
+    expect(egress.profile.lossy.has("document")).toBe(false);
+    // function_call_output 原生接受 input_image；图像工具结果无需降级。
+    expect(egress.profile.supports.has("toolResultImage")).toBe(true);
+    expect(egress.profile.lossy.has("toolResultImage")).toBe(false);
     // supports 与 lossy 不相交，否则 admission 的三条规则会退化成两条。
     for (const capability of egress.profile.supports) expect(egress.profile.lossy.has(capability)).toBe(false);
   });
@@ -422,10 +422,8 @@ describe("lower：损失必须留痕", () => {
     expect(losses.some((loss) => loss.kind === "degraded" && loss.detail.includes("no error flag"))).toBe(true);
   });
 
-  // 旧行为：工具结果里的图片换成一句「这条路线载不动图片」的占位文本。截图类工具的全部
-  // 价值就在像素上，用一句转述顶替是网关替客户端做的取舍 —— 已剥离成拒绝。
-  it("工具结果里的图片拒绝，不再拿占位文本顶替", async () => {
-    const { problems } = await rejected(makeRequest({
+  it("工具结果里的图片保留为 input_image，不降级成文本", async () => {
+    const { items } = await lowerBody(makeRequest({
       turns: [
         { role: "assistant", parts: [{ kind: "toolCall", call: { id: "c1", toolRef: { group: null, name: "T" }, input: { kind: "json", value: {} } } }] },
         { role: "user", parts: [{ kind: "toolResult", result: {
@@ -435,12 +433,8 @@ describe("lower：损失必须留痕", () => {
         } }] },
       ],
     }));
-    // 图片没了 → 输出也空了：两条问题都要报出来，客户端才知道「换个上游」还是「改内容」。
-    expect(problems.map((problem) => problem.kind)).toEqual(["unrepresentablePart", "requiredFieldMissing"]);
-    const image = problems[0];
-    expect(image?.path).toBe("$.conversation.turns[1].parts[0].result.parts[0]");
-    expect(image?.detail).toContain("image/png");
-    expect(image?.detail).toContain("textualizeUnsupportedImage");
+    const output = items.find((item) => item.type === "function_call_output");
+    expect(output?.output).toEqual([{ type: "input_image", image_url: "data:image/png;base64,AAA" }]);
   });
 
   it("文档拒绝：input_file 的形状从未在真实报文里出现过，占位文本不等于送到了", async () => {
@@ -497,6 +491,21 @@ describe("lower：损失必须留痕", () => {
     }));
     expect(clamped.body.reasoning).toEqual({ effort: "high", summary: "detailed" });
     expect(clamped.losses.map((loss) => loss.kind).sort()).toEqual(["degraded", "substituted"]);
+    // 夹档留痕的 detail 必须**同时**含原值与夹后值，否则日志里还原不出客户端要的档位。
+    const clampLoss = clamped.losses.find((loss) => loss.path === "$.intent.reasoning.effort");
+    expect(clampLoss?.kind).toBe("substituted");
+    expect(clampLoss?.detail).toContain("'max'");   // 原值
+    expect(clampLoss?.detail).toContain("'high'");  // 夹后值
+
+    // 另一档越界值同样留痕：判断由 `EFFORT_WIRE` 派生，不是手写的档位清单。
+    const xhigh = await lowerBody(makeRequest({
+      intent: { reasoning: clientValue({ mode: "enabled", effort: "xhigh", display: "summarized" }) },
+    }));
+    expect(xhigh.body.reasoning).toEqual({ effort: "high", summary: "auto" });
+    const xhighLoss = xhigh.losses.find((loss) => loss.path === "$.intent.reasoning.effort");
+    expect(xhighLoss?.kind).toBe("substituted");
+    expect(xhighLoss?.detail).toContain("'xhigh'");
+    expect(xhighLoss?.detail).toContain("'high'");
 
     const hidden = await lowerBody(makeRequest({
       intent: { reasoning: clientValue({ mode: "enabled", effort: "high", display: "hidden" }) },
