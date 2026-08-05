@@ -8,7 +8,7 @@
  *
  * 一次请求的裁决链（每一步都在 debug 级别留一条结构化记录，同一个 trace 串起来就是全链）：
  *   inbox_received → inbox_decoded → model_routed → repair_applied → admission_decided
- *   → outbox_lowered → outbox_responded → outbox_lifted(unhandled 计数) → inbox_response_encoded
+ *   → outbox_written → outbox_responded → outbox_response_read(unhandled 计数) → inbox_response_encoded
  * 排查协议问题不需要客户端配合带任何 debug 头 —— 真实客户端注入不了自定义头，
  * 这是上一轮踩过的坑。
  */
@@ -271,13 +271,13 @@ export function createGatewayRequestResponder(
       for await (const event of guarded) {
         if (event.kind === "unhandled") { onUnhandled(event.rawType, event.raw); continue; }
         if (event.kind === "error") {
-          log.warn({ event: "outbox_error_lifted", trace: traceId, error_kind: event.error.kind, http_status: event.error.httpStatus, message: event.error.message });
+          log.warn({ event: "outbox_response_error", trace: traceId, error_kind: event.error.kind, http_status: event.error.httpStatus, message: event.error.message });
         }
         if (log.isLevelEnabled("trace")) log.trace({ event: "ir_event", trace: traceId, ir_event: event });
         yield event;
       }
       log.debug({
-        event: "outbox_lifted", trace: traceId,
+        event: "outbox_response_read", trace: traceId,
         unhandled: unhandledCount, elapsed_ms: Math.round(performance.now() - started),
       });
     }

@@ -102,7 +102,7 @@ describe("响应文档形态", () => {
       .toEqual(["response.brand_new", "partDelta-without-partStart"]);
   });
 
-  it("非模型产出形态出现在响应里会被丢弃并留痕（lift 映射错了的信号）", async () => {
+  it("非模型产出形态出现在响应里会被丢弃并留痕（响应读取映射错了的信号）", async () => {
     const assembled = await assembleResponse(streamOf([
       { kind: "partStart", index: 0, part: { kind: "image", media: { source: { kind: "base64", data: "AAA" }, mediaType: "image/png" } } },
       { kind: "messageStop", reason: "endTurn" },

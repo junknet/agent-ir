@@ -13,6 +13,7 @@ export { createGatewayRequestResponder, startGateway } from "./server.ts";
 export * from "./ir/admission.ts";
 export * from "./ir/capabilities.ts";
 export * from "./ir/stream_guard.ts";
+export * from "./ir/outbox_response_to_inbox.ts";
 export { iterateSse, formatSse, tryParseJson, type SseEvent } from "./ir/sse.ts";
 export {
   OUTBOX_REGISTRY, INBOX_CODECS, INBOX_PATHS, INBOX_PATH_BY_PROTOCOL,

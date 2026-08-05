@@ -471,7 +471,7 @@ export function createAnthropicMessagesOutbox(dialect: AnthropicMessagesDialect)
     },
 
     readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
-      return liftAnthropicStream(response, readOptions);
+      return readAnthropicStream(response, readOptions);
     },
   };
 }
@@ -601,7 +601,7 @@ function usageFrom(raw: unknown): IRUsage | null {
   };
 }
 
-async function* liftAnthropicStream(
+async function* readAnthropicStream(
   response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
 ): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。

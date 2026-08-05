@@ -213,7 +213,7 @@ const TRAJECTORY_STEP_TYPE = 14;
  *
  * 4/5/6/7/8/12 是补全（FIM）产品线留下的枚举值，聊天路径上不该出现；但「不该出现」
  * 不等于「可以不映射」—— 留一个 `?? endTurn` 的默认值，等于把一次异常收尾伪装成正常收尾。
- * 映射到 `"error"` 的两个值不会变成 messageStop，而是走 `error` 事件（见 lift 末尾）。
+ * 映射到 `"error"` 的两个值不会变成 messageStop，而是走 `error` 事件（见读回末尾）。
  */
 const STOP_REASON_IR: Readonly<Record<number, IRStopReason>> = {
   0: "endTurn",       // UNSPECIFIED：上游没说，按正常收尾
@@ -1208,12 +1208,12 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
     },
 
     readOutboxResponse(response: Response): AsyncIterable<IREvent> {
-      return liftWindsurfStream(response, loadSchema, options.model);
+      return readWindsurfStream(response, loadSchema, options.model);
     },
   };
 }
 
-// ── lift ────────────────────────────────────────────────────────────────────
+// ── readOutboxResponse ──────────────────────────────────────────────────────
 
 /**
  * 文本/思考的块游标。上游没有 `content_block_start/stop` 这类生命周期事件，
@@ -1361,7 +1361,7 @@ type Terminal =
   | { readonly kind: "stop" }
   | { readonly kind: "error"; readonly event: IREvent };
 
-async function* liftWindsurfStream(
+async function* readWindsurfStream(
   response: Response,
   loadSchema: () => WindsurfSchema,
   fallbackModel: string,

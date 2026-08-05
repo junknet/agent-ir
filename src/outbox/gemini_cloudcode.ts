@@ -909,7 +909,7 @@ export function createGeminiCloudCodeOutbox(options: GeminiCloudCodeOutboxOption
     },
 
     readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
-      return liftGeminiStream(response, options.model, readOptions);
+      return readGeminiStream(response, options.model, readOptions);
     },
   };
 }
@@ -939,7 +939,7 @@ const THOUGHT_SIGNATURE_CACHE_MAX = 4096;
  *
  * 于是只能落到进程内、按 callId 索引的旁路缓存 —— callId 端到端稳定
  * （gemini functionCall.id → IR toolCall.id → 客户端 tool_use.id → 回来还是它）。
- * 每条流首次遇到签名时 lift 会 yield 一条 `loss`，让这个旁路是**可见**的。
+ * 每条流首次遇到签名时读回逻辑会 yield 一条 `loss`，让这个旁路是**可见**的。
  */
 const thoughtSignatureByCallId = new Map<string, string>();
 
@@ -962,7 +962,7 @@ export function clearThoughtSignatureCache(): void {
   thoughtSignatureByCallId.clear();
 }
 
-// ── lift ───────────────────────────────────────────────────────────────────
+// ── readOutboxResponse ─────────────────────────────────────────────────────
 
 /**
  * finishReason → IRStopReason。
@@ -1102,7 +1102,7 @@ class PartCursor {
   }
 }
 
-async function* liftGeminiStream(
+async function* readGeminiStream(
   response: Response, fallbackModel: string, readOptions?: OutboxResponseReadInterceptionOptions,
 ): AsyncGenerator<IREvent> {
   if (!response.ok) {

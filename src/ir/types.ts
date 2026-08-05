@@ -395,7 +395,7 @@ export type IRStopReason =
  *
  * 这条必须写死在类型上，因为两家 wire 的口径是相反的：OpenAI 的 `prompt_tokens` /
  * Responses 的 `input_tokens` **都包含** cached（实测 40,926 个样本零反例，缓存占比
- * 62%–91%）。lift 进来时要减出去，lower/encode 出去时要加回来 —— 少做任何一边，
+ * 62%–91%）。readOutboxResponse 进来时要减出去，writeOutboxRequest / encode 出去时要加回来 —— 少做任何一边，
  * 输入 token 就会虚增或少报最高九成，下游 harness 的上下文压缩阈值全部算错。
  */
 export interface IRUsage {
@@ -424,7 +424,7 @@ export interface IROutboxError {
 }
 
 /**
- * 响应事件流（不变量 4）。`lift` 返回 AsyncIterable<IREvent> 而不是往 emitter 里推 ——
+ * 响应事件流（不变量 4）。`readOutboxResponse` 返回 AsyncIterable<IREvent> 而不是往 emitter 里推 ——
  * push 契约的 switch 缺省分支是黑洞：实测一天 126 次 context_length_exceeded 全被静默
  * 跳过，最后以「200 但空」的形状返回，调用方无法与「没话说」区分，只能盲重试到 retry cap。
  * `unhandled` 让未识别事件成为流里的一等元素，不可能消失。

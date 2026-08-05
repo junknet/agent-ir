@@ -66,7 +66,7 @@ describe("Codex WebSocket response.create", () => {
     const input = payload.input as Array<Record<string, unknown>>;
     expect(payload.type).toBe("response.create");
     expect(built.frame.url).toBe("wss://chatgpt.com/backend-api/codex/responses");
-    expect(input[0]).toEqual({ type: "additional_tools", role: "assistant", tools: [
+    expect(input[0]).toEqual({ type: "additional_tools", role: "developer", tools: [
       { type: "custom", name: "exec", description: "Run a command." },
     ] });
     const message = input[1] as Record<string, unknown>;
@@ -108,6 +108,15 @@ describe("Codex WebSocket response.create", () => {
     expect((payload.input as Array<Record<string, unknown>>).map((item) => item.type)).toEqual([
       "custom_tool_call_output", "custom_tool_call_output", "custom_tool_call_output",
     ]);
+  });
+
+  it("格式化为多行的 WebSocket JSON 仍作为一整个 SSE data 事件读取", async () => {
+    const events = await collectEvents([
+      JSON.stringify({ type: "response.created", response: { id: "resp-multiline", model: "gpt-5-codex" } }, null, 2),
+      JSON.stringify({ type: "response.completed", response: { status: "completed" } }, null, 2),
+    ]);
+    expect(events.some((event) => event.kind === "messageStart")).toBe(true);
+    expect(events.some((event) => event.kind === "messageStop")).toBe(true);
   });
 });
 

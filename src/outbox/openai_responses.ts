@@ -1,14 +1,12 @@
 /**
- * OpenAI Responses 出口：IR → wire（lower）+ 上游 SSE / JSON → IREvent（lift）。
+ * OpenAI Responses 出口：IR → wire（writeOutboxRequest）+ 上游 SSE / JSON → IREvent（readOutboxResponse）。
  *
- * 面向的是**标准 `/v1/responses`**（`baseUrl` + `Authorization: Bearer`），不是 ChatGPT 的
- * 私有 codex 端点（`chatgpt.com/backend-api/codex/responses`，需要 `chatgpt-account-id` /
- * `originator` 头且 URL 固定，根本用不上 baseUrl/apiKey）。这个区分直接决定一个字段的归属：
+ * 面向标准 `/v1/responses`，也可通过明确的端点能力选项对接 ChatGPT Codex Responses
+ * 端点（认证头与模型路由仍由调用方装配）。两者的字段差异必须在 Outbox 中显式声明：
  *
  *   标准端点   接受 `max_output_tokens`   →  `maxOutputTokens` 进 supports，照实下发
  *   codex 端点 拒收（400 "Unsupported parameter: max_output_tokens"）且无等价参数
- *              →  真接那个端点时它只能进 lossy 并记 dropped loss（见 agent-all-sdk-ts
- *                 codex_provider.ts:113 的实测注释）
+ *              →  调用方设 `supportsMaxOutputTokens:false`，它进 lossy 并记 dropped loss
  *
  * 两条轴上这个出口的**价值**在于它原生表达了 Anthropic 出口只能拍平的两件事：
  *   - 工具分组：定义侧 `{type:'namespace', name, tools:[…]}`，调用侧 `function_call.namespace`
@@ -80,6 +78,16 @@ export interface OpenAIResponsesOutboxOptions {
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
   readonly model: string;
   readonly extraHeaders?: Readonly<Record<string, string>>;
+  /**
+   * Responses 原生支持 service_tier=priority。未声明时默认走 priority；客户端显式
+   * standard 则覆盖此默认，避免网关把客户端的降档请求又抬回去。
+   */
+  readonly defaultServiceTier?: "standard" | "priority";
+  /**
+   * 目标 Responses 端点是否接受标准 `max_output_tokens` 字段。标准 OpenAI 端点为 true；
+   * ChatGPT Codex 端点实测会以 400 拒绝，调用方必须显式设为 false，Outbox 会记录 IRLoss。
+   */
+  readonly supportsMaxOutputTokens?: boolean;
 }
 
 /**
@@ -253,7 +261,7 @@ function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: st
  *
  * **没有 encrypted_content 就不发**：rollout 里 10204 条 reasoning 无一例外都带它，
  * summary-only 的形状从未在真实报文里出现过，赌它能过等于赌整条请求。跨协议进来的
- * Anthropic 签名思考正好落在这一支，丢弃并留痕（codex_provider 的做法也是整段不译）。
+ * Anthropic 签名思考正好落在这一支，丢弃并留痕。
  */
 function lowerReasoningRun(run: readonly IRPart[], path: string, report: OutboxRequestReport): WireItem | null {
   const summary: WireItem[] = [];
@@ -565,9 +573,13 @@ const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
  */
 
 export function createOpenAIResponsesOutbox(options: OpenAIResponsesOutboxOptions): IROutbox {
+  const supportsMaxOutputTokens = options.supportsMaxOutputTokens ?? true;
   const profile: IROutboxProfile = {
-    supports: new Set(SUPPORTED),
-    lossy: new Set(LOSSY),
+    supports: new Set(SUPPORTED.filter((capability) => supportsMaxOutputTokens || capability !== "maxOutputTokens")),
+    lossy: new Set([
+      ...LOSSY,
+      ...(supportsMaxOutputTokens ? [] : ["maxOutputTokens" as const]),
+    ]),
     mandatory: MANDATORY,
   };
 
@@ -597,6 +609,12 @@ export function createOpenAIResponsesOutbox(options: OpenAIResponsesOutboxOption
         report.record({
           path: "$.intent.contextEdits", kind: "dropped",
           detail: `${intent.contextEdits.length} context edit instruction(s) dropped; Responses has no history-editing directive (truncation:'auto' is not equivalent)`,
+        });
+      }
+      if (!supportsMaxOutputTokens && intent.stopping.maxOutputTokens !== undefined) {
+        report.record({
+          path: "$.intent.stopping.maxOutputTokens", kind: "dropped",
+          detail: "this Responses endpoint rejects max_output_tokens (HTTP 400) and has no equivalent output-length field; the limit is not enforced upstream",
         });
       }
 
@@ -653,11 +671,11 @@ export function createOpenAIResponsesOutbox(options: OpenAIResponsesOutboxOption
         ...(reasoning === null ? {} : { reasoning, include: ["reasoning.encrypted_content"] }),
         ...(text === undefined ? {} : { text }),
         // 标准 /v1/responses 接受 max_output_tokens；私有 codex 端点会 400 拒收（文件头）。
-        ...(intent.stopping.maxOutputTokens === undefined
+        ...(intent.stopping.maxOutputTokens === undefined || !supportsMaxOutputTokens
           ? {} : { max_output_tokens: intent.stopping.maxOutputTokens.value }),
         ...(intent.sampling.temperature === undefined ? {} : { temperature: intent.sampling.temperature.value }),
         ...(intent.sampling.topP === undefined ? {} : { top_p: intent.sampling.topP.value }),
-        ...(intent.serviceTier.source === "client" && intent.serviceTier.value === "priority"
+        ...(resolveServiceTier(intent.serviceTier, options.defaultServiceTier) === "priority"
           ? { service_tier: "priority" } : {}),
         // 实测 prompt_cache_key == 会话 uuid，是这个端点唯一的身份/缓存抓手。
         // device_id / account_uuid 没有对应位（`user` 的语义是滥用检测标识，不是会话身份），
@@ -683,13 +701,20 @@ export function createOpenAIResponsesOutbox(options: OpenAIResponsesOutboxOption
     },
 
     readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
-      return liftResponsesStream(response, readOptions);
+      return readResponsesStream(response, readOptions);
     },
   };
 }
 
+function resolveServiceTier(
+  requested: IRRequest["intent"]["serviceTier"],
+  defaultServiceTier: OpenAIResponsesOutboxOptions["defaultServiceTier"],
+): "standard" | "priority" {
+  return requested.source === "client" ? requested.value : defaultServiceTier ?? "priority";
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-// lift
+// readOutboxResponse
 // ═══════════════════════════════════════════════════════════════════════════
 
 function mapOutboxError(payload: unknown, httpStatus: number | null): IROutboxError {
@@ -871,7 +896,7 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-async function* liftResponsesStream(
+async function* readResponsesStream(
   response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
 ): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
@@ -882,8 +907,10 @@ async function* liftResponsesStream(
   }
 
   const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/event-stream")) {
-    yield* liftResponsesJson(response);
+  // ChatGPT Codex 的实际流式 200 会遗漏 Content-Type；空头不是 JSON 证据，按 JSON
+  // 读取会把整段 `event:/data:` 当成一个错误。只有明确的 application/json 才走非流式。
+  if (contentType.includes("application/json")) {
+    yield* readResponsesJson(response);
     return;
   }
 
@@ -1115,7 +1142,7 @@ async function* liftResponsesStream(
   }
 }
 
-async function* liftResponsesJson(response: Response): AsyncGenerator<IREvent> {
+async function* readResponsesJson(response: Response): AsyncGenerator<IREvent> {
   const text = await response.text();
   const payload = tryParseJson<Record<string, unknown>>(text);
   if (payload === null || !isRecord(payload)) {

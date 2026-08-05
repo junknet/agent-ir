@@ -104,7 +104,7 @@ describe("outbox SSE frame interceptor chain", () => {
     expect(frames).toEqual([{ event: null, data: "after" }]);
   });
 
-  it("出口 lift 确实把完整 frame interceptor 接到解码前", async () => {
+  it("出口 readOutboxResponse 确实把完整 frame interceptor 接到解码前", async () => {
     const outbox = createOpenAIChatOutbox({ baseUrl: "https://example.invalid/v1", apiKey: "test", model: "test" });
     const source = new Response([
       'data: {"model":"test","choices":[{"delta":{"content":"original"},"finish_reason":null}]}',

@@ -1,5 +1,5 @@
 /**
- * OpenAI Responses 出口的 lower / lift。
+ * OpenAI Responses 出口的 writeOutboxRequest / readOutboxResponse。
  *
  * 报文形状全部取自真实来源，不写臆想用例：
  *   - 请求侧：80 条归档 `/v1/responses` 请求（`{type:'namespace', name, description, tools:[…]}`、
@@ -8,7 +8,7 @@
  *   - input item：94 份 codex rollout（reasoning 10204 / custom_tool_call 7901 /
  *     custom_tool_call_output 7901 / function_call 1176（其中 872 条带 `namespace`）/
  *     function_call_output 1176；输出既有 string 也有 input_text 数组）
- *   - 事件流：PROTOCOL_REFERENCE §11 的真实抓包序列 + codex_provider.ts 里踩过坑的
+ *   - 事件流：PROTOCOL_REFERENCE §11 的真实抓包序列，以及已回归为 Outbox 契约的
  *     `keepalive` / `response.failed` / 顶层 `error` 三例
  */
 import { describe, expect, it } from "bun:test";
@@ -18,6 +18,7 @@ import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
+import { writeInboxResponseFromOutbox } from "../src/ir/outbox_response_to_inbox.ts";
 import {
   clientValue, defaultValue,
   type IRBuildProblem, type IRConversation, type IREvent, type IRIntent, type IRPart, type IRRequest,
@@ -114,6 +115,13 @@ function sse(frames: ReadonlyArray<Record<string, unknown>>): Response {
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+function headerlessSse(frames: ReadonlyArray<Record<string, unknown>>): Response {
+  const body = frames
+    .map((frame) => `event: ${String(frame.type)}\ndata: ${JSON.stringify(frame)}\n\n`)
+    .join("");
+  return new Response(body, { status: 200 });
+}
+
 async function collect(response: Response): Promise<IREvent[]> {
   const events: IREvent[] = [];
   for await (const event of outbox.readOutboxResponse(response)) events.push(event);
@@ -162,6 +170,65 @@ describe("能力声明", () => {
     const verdict = checkOutboxSupport(request, outbox.profile);
     expect(verdict.admitted).toBe(true);
     expect(verdict.losses).toHaveLength(0);
+  });
+});
+
+describe("端点能力差异", () => {
+  it("禁用 max_output_tokens 的 Responses 端点将上限降级为可审计 loss", async () => {
+    const codexEndpoint = createOpenAIResponsesOutbox({
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      apiKey: "token",
+      model: "gpt-5.6-terra",
+      supportsMaxOutputTokens: false,
+    });
+    const request = makeRequest({ intent: { stopping: { maxOutputTokens: clientValue(1024) } } });
+    expect(codexEndpoint.profile.supports.has("maxOutputTokens")).toBe(false);
+    expect(codexEndpoint.profile.lossy.has("maxOutputTokens")).toBe(true);
+
+    const lowered = await codexEndpoint.writeOutboxRequest(request);
+    if (!lowered.ok) throw new Error("expected Codex endpoint request to compile");
+    expect(JSON.parse(lowered.wire.body).max_output_tokens).toBeUndefined();
+    expect(lowered.losses).toContainEqual(expect.objectContaining({
+      path: "$.intent.stopping.maxOutputTokens", kind: "dropped",
+    }));
+  });
+
+  it("流式 200 缺少 Content-Type 时仍按 SSE readOutboxResponse", async () => {
+    const events = await collect(headerlessSse([
+      { type: "response.created", response: { model: "gpt-5.6-terra" } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "OK" },
+      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } },
+    ]));
+    expect(events).toContainEqual(expect.objectContaining({ kind: "partDelta", delta: { kind: "text", text: "OK" } }));
+    expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+});
+
+describe("Responses service tier", () => {
+  it("默认请求 priority，客户端显式 standard 时不擅自升档", async () => {
+    const defaultPriority = await lowerBody(makeRequest({}));
+    expect(defaultPriority.body.service_tier).toBe("priority");
+
+    const explicitStandard = await lowerBody(makeRequest({
+      intent: { serviceTier: clientValue("standard") },
+    }));
+    expect(explicitStandard.body.service_tier).toBeUndefined();
+  });
+
+  it("配置可关闭默认 priority，客户端显式 priority 仍原样透传", async () => {
+    const standardOutbox = createOpenAIResponsesOutbox({
+      baseUrl: "https://api.openai.com/v1", apiKey: "sk-test", model: "gpt-5.6-sol", defaultServiceTier: "standard",
+    });
+    const defaultRequest = makeRequest({});
+    const defaultLowered = await standardOutbox.writeOutboxRequest(defaultRequest);
+    if (!defaultLowered.ok) throw new Error("expected a compiled request");
+    expect(JSON.parse(defaultLowered.wire.body).service_tier).toBeUndefined();
+
+    const explicitPriority = await standardOutbox.writeOutboxRequest(makeRequest({
+      intent: { serviceTier: clientValue("priority") },
+    }));
+    if (!explicitPriority.ok) throw new Error("expected a compiled request");
+    expect(JSON.parse(explicitPriority.wire.body).service_tier).toBe("priority");
   });
 });
 
@@ -338,6 +405,7 @@ describe("lower：会话 → 扁平 item 序列", () => {
       reasoning: { summary: "auto" },
       include: ["reasoning.encrypted_content"],
       max_output_tokens: 256,
+      service_tier: "priority",
     });
     expect(rawBody.length).toBeGreaterThan(0);
   });
@@ -626,7 +694,7 @@ describe("lower：损失必须留痕", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：正常流", () => {
+describe("readOutboxResponse：正常流", () => {
   // 帧序取自 PROTOCOL_REFERENCE §11 的真实抓包。
   const frames = [
     { type: "response.created", response: { id: "resp_1", model: "gpt-5.6-sol", status: "in_progress" } },
@@ -735,7 +803,7 @@ describe("lift：正常流", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：失败形态一个都不能吞", () => {
+describe("readOutboxResponse：失败形态一个都不能吞", () => {
   it("流截断没有终止事件 → error 而不是「200 但空」的假成功", async () => {
     const events = await collect(sse([
       { type: "response.created", response: { model: "m" } },
@@ -790,7 +858,7 @@ describe("lift：失败形态一个都不能吞", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：非流式 JSON 合成等价事件序列", () => {
+describe("readOutboxResponse：非流式 JSON 合成等价事件序列", () => {
   it("output item 逐个还原成 part，下游 encode 不需要区分两条路径", async () => {
     const payload = {
       id: "resp_1", object: "response", status: "completed", model: "gpt-5.6-sol",
@@ -829,7 +897,7 @@ describe("lift：非流式 JSON 合成等价事件序列", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：HTTP 层失败映射", () => {
+describe("readOutboxResponse：HTTP 层失败映射", () => {
   const cases: ReadonlyArray<{
     readonly status: number;
     readonly payload: unknown;
@@ -858,4 +926,34 @@ describe("lift：HTTP 层失败映射", () => {
       expect(event.error.httpStatus).toBe(testCase.status);
     });
   }
+});
+
+describe("Outbox → Inbox 单轨观察", () => {
+  it("守卫后的事件逐个旁路给观察器，观察器异常不截断客户端响应", async () => {
+    const observed: string[] = [];
+    const response = await writeInboxResponseFromOutbox({
+      protocol: "openai_responses",
+      clientRequest: makeRequest({}),
+      outbox,
+      outboxResponse: sse([
+        { type: "response.created", response: { model: "gpt-5.6-sol" } },
+        { type: "response.output_item.added", output_index: 0, item: { type: "message", content: [] } },
+        { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "" } },
+        { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "ok" },
+        { type: "response.output_text.done", output_index: 0, content_index: 0, text: "ok" },
+        { type: "response.completed", response: { status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } },
+      ]),
+      observeGuardedIREvent: (event) => {
+        observed.push(event.kind);
+        if (event.kind === "partDelta") throw new Error("observation must be isolated");
+      },
+      encodeOptions: { messageId: "msg_observed" },
+    });
+    const body = await response.text();
+
+    expect(observed).toContain("committed");
+    expect(observed).toContain("partDelta");
+    expect(body).toContain("response.created");
+    expect(body).toContain("response.failed");
+  });
 });

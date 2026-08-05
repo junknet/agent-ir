@@ -1,5 +1,5 @@
 /**
- * OpenAI Chat Completions 出口：IR → wire（lower）+ 上游响应 → IREvent（lift）。
+ * OpenAI Chat Completions 出口：IR → wire（writeOutboxRequest）+ 上游响应 → IREvent（readOutboxResponse）。
  *
  * 与 Anthropic 出口同构，但两处结构差异决定了这份实现的形状：
  *
@@ -8,7 +8,7 @@
  *      紧跟在声明该 id 的 assistant 消息之后，所以这里同样要靠 callId 重铺一次
  *      —— IR 内部按 id 关联，位置约束只在出口恢复一次。
  *   2. **响应没有事件类型**。Anthropic 的 SSE 每帧自带 `type`，Chat 的每帧长得一样，
- *      判别位藏在形状里（choices / usage / error）。因此 lift 先把 chunk 归形状，
+ *      判别位藏在形状里（choices / usage / error）。因此读回逻辑先把 chunk 归形状，
  *      再对形状做 switch，缺省分支照样产出 unhandled —— 归不了形状的 chunk 就是上游漂移。
  *
  * `writeOutboxRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
@@ -669,12 +669,12 @@ export function createOpenAIChatOutbox(options: OpenAIChatOutboxOptions): IROutb
     },
 
     readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
-      return liftOpenAIChatStream(response, readOptions);
+      return readOpenAIChatStream(response, readOptions);
     },
   };
 }
 
-// ── lift ───────────────────────────────────────────────────────────────────
+// ── readOutboxResponse ─────────────────────────────────────────────────────
 
 /** 未识别的 finish_reason 返回 null，由调用方产出 unhandled 而不是悄悄当成 endTurn。 */
 function mapFinishReason(raw: unknown): IRStopReason | null {
@@ -767,7 +767,7 @@ function transportError(message: string): Extract<IREvent, { kind: "error" }> {
   return { kind: "error", error: { kind: "transport", httpStatus: null, message, retryable: true, raw: null } };
 }
 
-function liftLoss(path: string, kind: IRLoss["kind"], detail: string): Extract<IREvent, { kind: "loss" }> {
+function readResponseLoss(path: string, kind: IRLoss["kind"], detail: string): Extract<IREvent, { kind: "loss" }> {
   return { kind: "loss", loss: { stage: "outbox", outbox: OUTBOX, path, kind, detail } };
 }
 
@@ -824,7 +824,7 @@ function classifyChunk(payload: Record<string, unknown>, hasUsage: boolean): Chu
   return "unknown";
 }
 
-async function* liftOpenAIChatStream(
+async function* readOpenAIChatStream(
   response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
 ): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
@@ -836,7 +836,7 @@ async function* liftOpenAIChatStream(
 
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream")) {
-    yield* liftNonStreaming(response);
+    yield* readOpenAIChatNonStreaming(response);
     return;
   }
 
@@ -914,7 +914,7 @@ async function* liftOpenAIChatStream(
                 const slot = indexer.text();
                 if (!slot.started) yield { kind: "partStart", index: slot.index, part: { kind: "text", text: "" } };
                 yield { kind: "partDelta", index: slot.index, delta: { kind: "text", text: value } };
-                yield liftLoss("$.choices[0].delta.refusal", "substituted",
+                yield readResponseLoss("$.choices[0].delta.refusal", "substituted",
                   "refusal text surfaced as assistant text; IR has no separate refusal part");
                 break;
               }
@@ -981,7 +981,7 @@ async function* liftOpenAIChatStream(
           }
           for (const fragment of tools.values()) {
             if (fragment.index !== null) continue;
-            yield liftLoss("$.choices[0].delta.tool_calls", "dropped",
+            yield readResponseLoss("$.choices[0].delta.tool_calls", "dropped",
               `tool call fragment ${fragment.id.length > 0 ? fragment.id : "<no id>"} never carried a function name and cannot be reconstructed`);
           }
           for (const index of indexer.close()) yield { kind: "partEnd", index };
@@ -1007,7 +1007,7 @@ async function* liftOpenAIChatStream(
  * 非流式：一次性 chat.completion JSON 转成**等价事件序列**，
  * 下游 encode 不需要区分两条路径。
  */
-async function* liftNonStreaming(response: Response): AsyncGenerator<IREvent> {
+async function* readOpenAIChatNonStreaming(response: Response): AsyncGenerator<IREvent> {
   const text = await response.text();
   const payload = tryParseJson<Record<string, unknown>>(text);
   if (payload === null || !isRecord(payload)) {
@@ -1055,7 +1055,7 @@ async function* liftNonStreaming(response: Response): AsyncGenerator<IREvent> {
   }
   if (typeof message.refusal === "string" && message.refusal.length > 0) {
     yield* emit({ kind: "text", text: message.refusal });
-    yield liftLoss("$.choices[0].message.refusal", "substituted",
+    yield readResponseLoss("$.choices[0].message.refusal", "substituted",
       "refusal text surfaced as assistant text; IR has no separate refusal part");
   }
   if (Array.isArray(message.tool_calls)) {

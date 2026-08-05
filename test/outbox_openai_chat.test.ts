@@ -1,7 +1,7 @@
 /**
  * OpenAI Chat Completions 出口。
  *
- * lift 用的 SSE 报文是**真实形状**，逐帧照抄自 `gateway-traffic-logs/`
+ * readOutboxResponse 用的 SSE 报文是**真实形状**，逐帧照抄自 `gateway-traffic-logs/`
  * 里 108115 条 `chat.completion.chunk`（deepseek-v4-flash / kimi-k3 等兼容端点，
  * 2026-07-31..08-04），包括三个容易被臆想掉的细节：
  *   - `delta.content` 常态是 **null**（107486 条带这个键，大量为 null），不是省略；
@@ -585,7 +585,7 @@ describe("lower：每一处降级都留痕", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：正常流", () => {
+describe("readOutboxResponse：正常流", () => {
   // 帧形状照抄 deepseek-v4-flash 的真实流量。
   const first = {
     id: "chatcmpl-real", object: "chat.completion.chunk", created: 1785600127,
@@ -668,7 +668,7 @@ describe("lift：正常流", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：没匹配上的一律进 unhandled", () => {
+describe("readOutboxResponse：没匹配上的一律进 unhandled", () => {
   it("未知 delta 字段 / 未知 finish_reason / 认不出形状的 chunk / 非 JSON 帧", async () => {
     const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "hi", audio: { id: "a" } }, finish_reason: null }] },
@@ -702,7 +702,7 @@ describe("lift：没匹配上的一律进 unhandled", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：流被截断绝不伪装成成功", () => {
+describe("readOutboxResponse：流被截断绝不伪装成成功", () => {
   it("没有 finish_reason 就结束 → error，而不是「200 但空」", async () => {
     const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "half a sen" }, finish_reason: null }] },
@@ -739,7 +739,7 @@ describe("lift：流被截断绝不伪装成成功", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：非流式合成等价事件序列", () => {
+describe("readOutboxResponse：非流式合成等价事件序列", () => {
   it("chat.completion JSON → messageStart / partStart+partEnd / usage / messageStop", async () => {
     const response = Response.json({
       id: "chatcmpl-x", object: "chat.completion", created: 1785600127, model: "deepseek-v4-flash",
@@ -792,7 +792,7 @@ describe("lift：非流式合成等价事件序列", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("lift：上游 4xx/5xx", () => {
+describe("readOutboxResponse：上游 4xx/5xx", () => {
   const cases: ReadonlyArray<{
     readonly status: number;
     readonly payload: unknown;

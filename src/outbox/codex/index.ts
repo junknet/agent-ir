@@ -9,7 +9,7 @@
  * 已核实的 wire 来自 codex_20260805T021301Z-3991747.mitm：首帧含 input_image 和
  * additional_tools；后续三帧各回送一个 custom_tool_call_output，并以 previous_response_id
  * 续接。服务端事件 payload 与 Responses SSE 同构，只是每个 JSON payload 是一条 WebSocket
- * 文本消息；本模块将它无损喂给既有 Responses event lifter，避免复制 IR 语义。
+ * 文本消息；本模块将它无损喂给既有 Responses event reader，避免复制 IR 语义。
  */
 import { createOpenAIResponsesOutbox } from "../openai_responses.ts";
 import type { OutboxResponseReadInterceptionOptions } from "../../ir/ir_message_interception_extensions.ts";
@@ -24,13 +24,13 @@ const TEXT_DECODER = new TextDecoder();
 
 export interface CodexWebSocketResponseClientMetadata {
   readonly installationId: string;
-  readonly turnId: string;
   readonly sessionId: string;
   readonly threadId: string;
-  readonly turnMetadata: string;
   readonly windowId: string;
-  readonly responsesLite: string;
-  readonly streamRequestStartedAtMilliseconds: string;
+  readonly turnId?: string;
+  readonly turnMetadata?: string;
+  readonly responsesLite?: string;
+  readonly streamRequestStartedAtMilliseconds?: string;
 }
 
 export interface CodexWebSocketResponseOutboxOptions {
@@ -39,6 +39,8 @@ export interface CodexWebSocketResponseOutboxOptions {
   /** 此端点的访问头（例如账户和 originator）由已登录宿主提取后显式注入。 */
   readonly webSocketHeaders: Readonly<Record<string, string>>;
   readonly clientMetadata: CodexWebSocketResponseClientMetadata;
+  /** Codex 私有 WebSocket 与 HTTP Responses 一样不接受 max_output_tokens。 */
+  readonly supportsMaxOutputTokens?: boolean;
   readonly webSocketUrl?: string;
 }
 
@@ -69,13 +71,17 @@ function readCodexWebSocketResponseId(frame: CodexWebSocketMessage): string | nu
 function createCodexWebSocketClientMetadata(metadata: CodexWebSocketResponseClientMetadata): JsonRecord {
   return {
     "x-codex-installation-id": metadata.installationId,
-    turn_id: metadata.turnId,
     session_id: metadata.sessionId,
     thread_id: metadata.threadId,
-    "x-codex-turn-metadata": metadata.turnMetadata,
     "x-codex-window-id": metadata.windowId,
-    ws_request_header_x_openai_internal_codex_responses_lite: metadata.responsesLite,
-    "x-codex-ws-stream-request-start-ms": metadata.streamRequestStartedAtMilliseconds,
+    ...(metadata.turnId === undefined ? {} : { turn_id: metadata.turnId }),
+    ...(metadata.turnMetadata === undefined ? {} : { "x-codex-turn-metadata": metadata.turnMetadata }),
+    ...(metadata.responsesLite === undefined
+      ? {}
+      : { ws_request_header_x_openai_internal_codex_responses_lite: metadata.responsesLite }),
+    ...(metadata.streamRequestStartedAtMilliseconds === undefined
+      ? {}
+      : { "x-codex-ws-stream-request-start-ms": metadata.streamRequestStartedAtMilliseconds }),
   };
 }
 
@@ -113,6 +119,9 @@ export function createCodexWebSocketResponseOutbox(options: CodexWebSocketRespon
     baseUrl: STANDARD_RESPONSES_COMPILER_URL,
     apiKey: "not-sent-to-codex-websocket",
     model: options.model,
+    ...(options.supportsMaxOutputTokens === undefined
+      ? {}
+      : { supportsMaxOutputTokens: options.supportsMaxOutputTokens }),
   });
   const responseIdsBySessionId = new Map<string, string>();
 
@@ -134,7 +143,7 @@ export function createCodexWebSocketResponseOutbox(options: CodexWebSocketRespon
       ...responseCreateFields,
       client_metadata: createCodexWebSocketClientMetadata(options.clientMetadata),
       input: previousResponseId === undefined && tools.length > 0
-        ? [{ type: "additional_tools", role: "assistant", tools }, ...input]
+        ? [{ type: "additional_tools", role: "developer", tools }, ...input]
         : previousResponseId === undefined ? input : selectCodexWebSocketContinuationInput(request, input),
       ...(previousResponseId === undefined ? {} : { previous_response_id: previousResponseId }),
     };
@@ -162,7 +171,10 @@ export function createCodexWebSocketResponseOutbox(options: CodexWebSocketRespon
             const responseId = readCodexWebSocketResponseId(frame);
             if (sessionId !== undefined && responseId !== null) responseIdsBySessionId.set(sessionId, responseId);
             const text = typeof frame === "string" ? frame : TEXT_DECODER.decode(frame);
-            controller.enqueue(TEXT_ENCODER.encode(`data: ${text}\n\n`));
+            // WebSocket JSON 可以格式化为多行；SSE 的每一物理行都必须有 data: 前缀，
+            // 否则第二行会被当作 SSE 字段而丢掉，留下无法解析的半个 JSON。
+            const sseFrame = text.split(/\r?\n/).map((line) => `data: ${line}`).join("\n");
+            controller.enqueue(TEXT_ENCODER.encode(`${sseFrame}\n\n`));
           }
           controller.close();
         } catch (error) {

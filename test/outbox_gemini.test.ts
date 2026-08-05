@@ -626,9 +626,9 @@ describe("lower：IR → v1internal wire", () => {
   });
 });
 
-// ── lift ────────────────────────────────────────────────────────────────────
+// ── readOutboxResponse ──────────────────────────────────────────────────────
 
-describe("lift：v1internal SSE → IREvent", () => {
+describe("readOutboxResponse：v1internal SSE → IREvent", () => {
   it("正常文本流：思考累加 + 正文累加 + finishReason 终止 + usage", async () => {
     const events = await collect(outbox.readOutboxResponse(sse(REAL_TEXT_STREAM)));
     const kinds = events.map((event) => event.kind);

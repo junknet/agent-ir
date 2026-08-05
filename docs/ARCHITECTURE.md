@@ -78,6 +78,16 @@ flowchart TB
 `readOutboxResponse` 负责供应商 wire → `IREvent`。`IROutboxProfile` 仅声明每个出口都能
 共同解释的 wire 事实：`supports`、`lossy`、`mandatory`。
 
+宿主若需要把已经收到的 Outbox HTTP 响应立刻回写给客户端，使用公开的
+`writeInboxResponseFromOutbox`：它固定组合 `readOutboxResponse`、流守卫与目标 Inbox
+编码器。认证、URL、模型路由和 HTTP 发起仍属于宿主；SSE 状态机、提交点、心跳与协议回写
+不允许在宿主另起平行实现。
+
+这条单轨同时提供两个**旁路** AOP 观察点：`readOptions.inspectCompleteSseFrame` 观察已完整
+分帧、尚未读回事件的 Outbox SSE；`observeGuardedIREvent` 观察 readOutboxResponse 后、流守卫注入提交点/心跳
+后的 IR 事件。观察器的异常被隔离，绝不能截断客户端流。宿主可以在这些点注入 Pino 并与自己
+的 trace 关联；Core 不依赖具体日志框架，也不把账户、认证或落盘策略带进 IR。
+
 这条边界是强约束，不是命名偏好：不得用 `egress`、`upstream` 或 `provider` 充当新的 Core
 方向名；客户端侧使用 `inbox`，供应商 wire 侧使用 `outbox`。外部协议原文字段、错误码和
 历史证据可保留原名。
@@ -123,7 +133,7 @@ flowchart TB
 | **Windsurf 的 `web_search` 执行器** | `src/outbox/windsurf/web_search.ts` | 它不是「把 IR 编译成 wire」，而是**执行一个工具**：`GetChatMessage` 只把 `web_search` 当普通 function tool 发下去，真实客户端在模型返回该调用后另行调 `GetWebSearchResults`，再把结果当普通 `IRToolResult` 回灌。这是宿主工具循环的事，不是协议翻译 |
 
 两者都复用已有件而不是复制语义：codex 把 WebSocket 文本消息里的 JSON payload 直接喂给既有的
-Responses event lifter；web_search 的产物是普通 `IRToolResult`，不新增任何 IR 概念。
+Responses event reader；web_search 的产物是普通 `IRToolResult`，不新增任何 IR 概念。
 
 注意 `webfetch`：真实客户端把它和 `web_search` 一样声明成普通 function tool，但抓包里
 **没有它的执行报文**，所以本仓库不实现它 —— 没有证据的东西不写。
@@ -287,6 +297,7 @@ flowchart TB
 | 能力需求推导 | `src/ir/capabilities.ts` |
 | 响应折叠 | `src/ir/response.ts` |
 | 流守卫（提交点/保活/退避） | `src/ir/stream_guard.ts` |
+| Outbox 响应 → Inbox 回写组合 | `src/ir/outbox_response_to_inbox.ts` |
 | SSE 分帧 | `src/ir/sse.ts` |
 | IRMessage 审计 interceptor chain | `src/ir/ir_message_interception_extensions.ts` |
 | 三个 Inbox codec | `src/inbox/**` |

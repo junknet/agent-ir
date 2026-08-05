@@ -238,7 +238,7 @@ describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同"
 
 describe("出口构造：确定性的边界 —— 进程内缓存是唯一的外部输入", () => {
   /**
-   * gemini 的 `thoughtSignature` 缓存是**进程内全局状态**：上一轮 lift 记住的签名
+   * gemini 的 `thoughtSignature` 缓存是**进程内全局状态**：上一轮响应读取记住的签名
    * 会在下一轮 lower 时被回填进 wire。这是有意的设计（IR 没有承载它的位置），
    * 但它意味着「同一个 IR」并不足以决定 wire —— 还要加上进程历史。
    *

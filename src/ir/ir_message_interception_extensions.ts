@@ -45,7 +45,7 @@ export async function runCompleteIRResponseInterception(
   if (processor !== undefined) await processor(response as MutableIRResponse);
 }
 
-/** Outbox lift 的可选读入拦截；非 SSE wire（如 ConnectRPC）不会调用它。 */
+/** Outbox readOutboxResponse 的可选读入拦截；非 SSE wire（如 ConnectRPC）不会调用它。 */
 export interface OutboxResponseReadInterceptionOptions {
   readonly inspectCompleteSseFrame?: CompleteOutboxSseFrameInspector;
 }
@@ -132,7 +132,7 @@ class MutableIRMessageInterceptorChain<T, Context> implements IRMessageIntercept
  * 网关默认即可直接使用的三条 interceptor chain：
  *
  * - `inboxRequestInterceptorChain`：decode 后、模型路由/repair/outbox 前；
- * - `outboxSseFrameInterceptorChain`：共享分帧器完成一帧（空行）后、各出口 lift 前；
+ * - `outboxSseFrameInterceptorChain`：共享分帧器完成一帧（空行）后、各出口读回事件前；
  * - `inboxCompletedResponseInterceptorChain`：完整 IRResponse 已形成；流式场景在终止事件下发前触发。
  */
 export interface IRMessageInterceptionExtensions {
