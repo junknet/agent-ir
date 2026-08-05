@@ -68,7 +68,7 @@ need ∉ supports ∪ lossy  → 该出口不可用（多出口换一家，单�
 | `POST /v1/chat/completions` | `openai_chat_completions` | **OpenAI-compatible / Chat Completions** |
 
 第三项固定称为 **OpenAI-compatible**，不称 “OpenAI-compact”。三条路径都由
-`INGRESS_PATH_BY_PROTOCOL` 单一注册表派生并已在服务器默认启用。
+`INBOX_PATH_BY_PROTOCOL` 单一注册表派生并已在服务器默认启用。
 
 ## IRMessage 审计 interceptor chain（内置）
 
@@ -209,7 +209,7 @@ interface IROutbox {
 ```
 
 `IROutboxProfile` 只声明所有 Outbox 都能共同解释的 wire 事实（`supports` / `lossy` / `mandatory`）。
-供应商自己的鉴权、编码、内建工具映射、内容策略统统留在该出口的 `src/egress/` 模块里，
+供应商自己的鉴权、编码、内建工具映射、内容策略统统留在该出口的 `src/outbox/` 模块里，
 不往 profile 上挂布尔开关 —— 判据见 [AGENTS.md](AGENTS.md) 的「接口边界」。
 
 三条硬要求：
@@ -217,7 +217,7 @@ interface IROutbox {
 1. `readOutboxResponse` 的 switch **必须有 default 产出 `{kind:'unhandled'}`**。上游协议漂移要能自己冒头，
    不能等故障反推。
 2. 任何丢弃/降级/替换都要 `IRLoss`。「这个字段这个上游不支持」是设计信息，不是可以省略的细节。
-3. `test/egress_<outbox>.test.ts` 要覆盖三样：wire 形状、失败边界（编译拒绝 + 错误分类），
+3. `test/outbox_<outbox>.test.ts` 要覆盖三样：wire 形状、失败边界（编译拒绝 + 错误分类），
    以及**不影响其他 Outbox 的反例**。第三样最容易漏：一条特化如果没人证明它不外溢，
    下一个人就会把它当通用规则上提进 Core。反例长这样 —— 同一条 IR 换一个出口，
    结局必须不同（Anthropic 给空工具结果补 `""`，`openai_chat` / `openai_responses`

@@ -7,7 +7,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   readAnthropicMessagesRequest, readChatCompletionsRequest, readResponsesRequest,
-} from "../src/ingress/index.ts";
+} from "../src/inbox/index.ts";
 import type { IRPart, IRRequest } from "../src/ir/types.ts";
 
 const TRACE = "tr-test";
@@ -23,7 +23,7 @@ function capabilities(request: IRRequest): string[] {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("anthropic messages ingress", () => {
+describe("anthropic messages inbox", () => {
   it("归位 messages 里的 role:'system'（语料 1537 次）到 conversation.system", () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
@@ -246,7 +246,7 @@ describe("anthropic messages ingress", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("openai chat completions ingress", () => {
+describe("openai chat completions inbox", () => {
   it("role:'tool' 归位成 user 回合里的 toolResult，连续多条合并成一个回合", () => {
     // 这正是 agent-all-sdk-ts 上炸过的形态：并行工具调用 → 连续多条 role:'tool' →
     // 不合并就变成多条 user 消息 → 转回 Anthropic 被判「漏了结果」，补占位后与真结果撞成 400。
@@ -348,7 +348,7 @@ describe("openai chat completions ingress", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("openai responses ingress", () => {
+describe("openai responses inbox", () => {
   it("instructions 与 developer 消息都是系统提示载体", () => {
     const { request } = readResponsesRequest({
       model: "m", instructions: "top",

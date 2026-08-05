@@ -21,8 +21,8 @@ import {
 } from "./ir/ir_message_interception_extensions.ts";
 import { superviseUpstreamStream } from "./ir/stream_guard.ts";
 import { createLogger, type Logger } from "./obs/log.ts";
-import { readClientRequestForProtocol } from "./ingress/index.ts";
-import { INGRESS_CODECS, INGRESS_PATHS } from "./protocols.ts";
+import { readClientRequestForProtocol } from "./inbox/index.ts";
+import { INBOX_CODECS, INBOX_PATHS } from "./protocols.ts";
 import { describeRepairsAsLosses, repairForAdmission } from "./repair/index.ts";
 import { readGatewayRuntimeSettings, type GatewayRuntimeSettings } from "./gateway/config.ts";
 import { GatewaySettingsError, type EnvLookup } from "./gateway/env.ts";
@@ -101,7 +101,7 @@ export function createGatewayRequestResponder(
 
   return async function respondToInboxRequest(httpRequest: Request): Promise<Response> {
     const url = new URL(httpRequest.url);
-    const protocol: IRProtocol | undefined = INGRESS_PATHS[url.pathname];
+    const protocol: IRProtocol | undefined = INBOX_PATHS[url.pathname];
 
     if (url.pathname === "/readyz") return new Response("ok");
     if (protocol === undefined) {
@@ -232,7 +232,7 @@ export function createGatewayRequestResponder(
       outboxResponse = await fetch(lowered.wire.url, {
         method: lowered.wire.method,
         headers: lowered.wire.headers,
-        body: lowered.wire.body as unknown as BodyInit,
+        body: lowered.wire.body,
         signal: httpRequest.signal,
       });
     } catch (error) {
@@ -284,7 +284,7 @@ export function createGatewayRequestResponder(
 
     // 出站编码按**入口协议**分发：客户端说哪种协议就回哪种，与上游用什么无关。
     // 查注册表而不是写 if 链：旧的三元链最后一档是兜底分支，新增协议会被静默塞进 Responses 编码器；
-    // `INGRESS_CODECS` 的键由 IRProtocol 穷举，漏一个协议在 protocols.ts 就编译失败。
+    // `INBOX_CODECS` 的键由 IRProtocol 穷举，漏一个协议在 protocols.ts 就编译失败。
     //
     // 交给 encoder 的是**客户端那份请求**而不是修复后的：响应是写给客户端看的，
     // 里面回显的 model 必须是他自己说的那个名字。
@@ -295,7 +295,7 @@ export function createGatewayRequestResponder(
           traceId, protocol, outbox: config.outbox.name, stream: clientRequest.intent.stream.value,
         }),
     };
-    const response = await INGRESS_CODECS[protocol].writeClientResponse(observed(), clientRequest, encodeOptions);
+    const response = await INBOX_CODECS[protocol].writeClientResponse(observed(), clientRequest, encodeOptions);
     log.info({
       event: "inbox_response_completed", trace: traceId, protocol, status: response.status,
       stream: clientRequest.intent.stream.value, elapsed_ms: Math.round(performance.now() - started),
@@ -333,7 +333,7 @@ export function startGateway(
     model_fallback: config.models.fallback.kind,
     repair_kinds: config.repairKinds,
     stream_policy: config.streamPolicy,
-    endpoints: Object.keys(INGRESS_PATHS),
+    endpoints: Object.keys(INBOX_PATHS),
   });
   return server;
 }

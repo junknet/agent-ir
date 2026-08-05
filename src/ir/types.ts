@@ -208,9 +208,9 @@ export interface IRConversation {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * 推理强度档。常量数组是唯一授权定义 —— 因为 ingress 要**在运行时逐个校验**客户端送来的
+ * 推理强度档。常量数组是唯一授权定义 —— 因为 inbox 要**在运行时逐个校验**客户端送来的
  * 字符串（`parseEffort`），手写联合逼着那边自己抄一份档位清单，抄漏一档的后果是：客户端
- * 明确要求的 effort 被解成 undefined 静默丢掉，正是本文件反复强调的「有损发生在 ingress」。
+ * 明确要求的 effort 被解成 undefined 静默丢掉，正是本文件反复强调的「有损发生在 inbox」。
  *
  * 从这里派生之后，加一档会同时点亮三个出口的 `Record<IREffort, …>` 换算表，逼每家表态。
  */
@@ -235,9 +235,9 @@ export type IRReasoningDisplay = "hidden" | "summarized" | "full";
  * `mode` / `effort` / `budgetTokens` 是**三个正交维度**，不是一个判别联合 —— 语料实证
  * `thinking:{type:'adaptive',display:'summarized'}` 与 `output_config:{effort:'high'}`
  * 在同一条请求里共存（Claude Code 2.1.x 的常规形态）。把它们压成互斥的 union 会在 decode
- * 阶段就丢掉其中一个，正是「有损发生在 ingress」这个反模式。
+ * 阶段丢掉其中一个，就是把损失提前到了 inbox —— 两个都要原样带到出口再各自表态。
  *
- * `effort` 与 `budgetTokens` 保持各自的原始表示，**不在 ingress 互转**：
+ * `effort` 与 `budgetTokens` 保持各自的原始表示，**不在 inbox 互转**：
  * 谁的上游要哪种，谁在 outbox 自己换算并记 loss。
  */
 export interface IRReasoning {
@@ -425,7 +425,7 @@ export interface IROutboxError {
 
 /**
  * 响应事件流（不变量 4）。`lift` 返回 AsyncIterable<IREvent> 而不是往 emitter 里推 ——
- * push 契约的 switch 缺省分支是黑洞：实测曾经一天 126 次 context_length_exceeded 全被静默
+ * push 契约的 switch 缺省分支是黑洞：实测一天 126 次 context_length_exceeded 全被静默
  * 跳过，最后以「200 但空」的形状返回，调用方无法与「没话说」区分，只能盲重试到 retry cap。
  * `unhandled` 让未识别事件成为流里的一等元素，不可能消失。
  */

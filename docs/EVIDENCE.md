@@ -153,7 +153,7 @@ tool_use.caller     {"type":"direct"}             ← **是对象，不是字符
 
 1. `thinking:{type:'adaptive'}` 与 `output_config:{effort:'high'}` **在同一条请求里共存**。
    最初把 mode/effort/budget 建成互斥的判别联合，会在 decode 阶段就丢掉其中一个 ——
-   正是「有损发生在 inbox」这个反模式。改成三个正交维度。
+   等于把损失提前到了 inbox。改成三个正交维度。
 2. `caller` 是对象 `{type:'direct'}`；按字符串读会静默丢掉整个字段。
 
 ## 缓存断点出现在五个位置
@@ -269,7 +269,7 @@ You are Devin, an interactive command line agent from Cognition.
 `CHAT_MESSAGE_SOURCE_SYSTEM_PROMPT`(5)，实测**一次都没用过**。IR 的
 `conversation.system` 必须降到顶层 `prompt`，降到回合列表里是错的。
 
-同时这组数字**证伪**了一个此前被当成事实的说法 —— 见文末「一条被证伪的说法」。
+内容策略的判据见文末「Windsurf 的内容策略判据」。
 
 ## 工具：23 个，只用三个字段
 
@@ -437,31 +437,36 @@ apiKey <已在 fixture 中抹除> · f <一段 732 字符的十六进制串，�
 
 ---
 
-## 一条被证伪的说法
+## Windsurf 的内容策略判据
 
-此前被当成事实、并在代码注释里引用过的说法：
+Windsurf 在 wire 之外还有一层策略检查：请求可以编译得完全合法、字段一个不缺，仍然被整条
+打回（HTTP 200，错误在 Connect 尾帧）。**判据是具体段落，与体量和关键词密度无关。**
 
-> Windsurf 上游的内容分类器会因为 agent 脚手架的体量或关键词密度拒掉整条请求。
-
-**这 12 条抓包证伪了它。** 21KB 的 agent system prompt（含大量 `exec` / `write` /
+抓包这一侧先划掉了体量：21KB 的 agent system prompt（含大量 `exec` / `write` /
 `run_subagent` 这类高危关键词）、23 个工具、PNG 图片、最长 21 轮历史、最大单条报文 102KB ——
 **全部 HTTP 200**，9 条有响应体的流其 Connect 尾帧全是干净的 `{}`。
-体量与关键词密度不是判据。
 
-抓包唯一测到的差别是**客户端身份**：真实客户端的 system prompt 第一行是
-`You are Devin, an interactive command line agent from Cognition.`
+2026-08-05 对 `server.codeium.com` 的逐段实验（模型 `claude-opus-4-6`，Claude Code 2.1.221
+的 9929 字符 system 切成 12 段逐个发）给出精确判据：**12 段里只有 3 段会被拒**。
 
-**抓包证明到此为止。** 以下都是推断，**没有任何实测支持**，不许当结论引用：
+| 段 | 字符 | 上游反应 |
+|---|---|---|
+| **`You are Claude Code, …`**（客户端身份行） | 57 | `an internal error occurred` |
+| **`IMPORTANT: Assist with authorized security testing…`** | 459 | `blocked by our content policy` |
+| **`# Environment`** | 973 | `blocked by our content policy` |
+| 其余 9 段（计费头 / `# Harness` / `# Delivering work` / `# Corrections` …） | 8507 | 放行 |
 
-| 说法 | 状态 |
-|---|---|
-| 21KB agent 脚手架 + 23 工具 + 图片会被拒 | **已证伪**（12/12 得到 200） |
-| 真实客户端身份行是 `You are Devin, …` | **已实证**（11/11 条 agent 请求逐字一致） |
-| 四个模型家族共用同一信封 | **已实证**（12 条逐字段同构） |
-| 「只替换身份行就足够」 | **未验证** —— 从没有人做过对照实验。抓包里身份行与其余 21KB 正文同时出现，分不开哪一部分在起作用 |
-| 「上游根本不看 prompt 内容」 | **未验证** —— 12 条全 200 只说明这 12 条没被拒，证伪不了「存在会被拒的输入」 |
-| 被拒时的具体判据是什么 | **未知** —— 这批抓包里一条被拒的样本都没有，没有反例就没有判据 |
+**错误信息区分两套机制**：身份行给泛化 `permission_denied`，正文段给明确的 content policy。
+两者独立，必须同时处理 —— 只换身份行时错误变成 content policy，只摘正文两段时仍是泛化拒绝。
+摘 3 段 + 换身份行 → 200，带 12 个真实 Claude Code 工具也是 200，客户端指令存活
+**85.7%**（8507/9929）。
+
+已实证的另外两条：真实客户端身份行是 `You are Devin, an interactive command line agent
+from Cognition.`（11/11 条 agent 请求逐字一致）；四个模型家族共用同一信封（12 条逐字段同构）。
 
 **→ IR 影响**：只有一条，而且是消极的。供应商的内容策略既不是 wire 事实也不是能力声明，
-`IROutboxProfile` 里没有它的位置。上面那些未验证的推断**不构成**往 profile 加字段、
-加开关或加 repair 条目的理由 —— 要加，先拿一条被拒的报文来。
+`IROutboxProfile` 里没有它的位置。处置全部落在 `src/outbox/windsurf/index.ts` 的
+`WindsurfSystemIdentityPolicy`，默认开启、每次改写记 `IRLoss`、可传 `passthrough` 关掉。
+
+**注意**：段落判据用段首前缀而不是整段精确相等 —— 这些段落会随客户端版本改字。
+前缀漂了的后果是那一段没被摘、整条请求被拒，是个响亮的失败，不是静默的错。

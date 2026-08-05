@@ -8,10 +8,10 @@
  * IR 一律由入口 decode 真实请求体得到，不手搓 —— 手搓的 IR 只能验证我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/ingress/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/inbox/index.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import type { IRBuildProblem, IRRequest, OutboxRequestBuildResult } from "../src/ir/types.ts";
 
@@ -370,12 +370,12 @@ describe("会话身份：wire 有承载位就发", () => {
     }),
   };
 
-  it("metadata.user_id 原样往返 —— ingress 解出来的三段身份，outbox 逐字装回去", async () => {
+  it("metadata.user_id 原样往返 —— inbox 解出来的三段身份，outbox 逐字装回去", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16, metadata: CLIENT_METADATA,
       messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    // account_uuid 是空串，ingress 按「有但为空 = 没有」处理，所以 IR 里只剩两段。
+    // account_uuid 是空串，inbox 按「有但为空 = 没有」处理，所以 IR 里只剩两段。
     expect(request.intent.identity).toEqual({
       deviceId: "5378180456032bae90ae4ca4c77928756c9f3285caa54abbf81064f108a09818",
       sessionId: "c508c824-8120-43b6-bec1-a569bf91d5d6",

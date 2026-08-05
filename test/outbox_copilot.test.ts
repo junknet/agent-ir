@@ -12,9 +12,9 @@
  * IR 一律由入口 decode 真实请求体得到，不手搓 —— 手搓的 IR 只能验证我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createCopilotOutbox } from "../src/egress/copilot.ts";
-import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/ingress/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createCopilotOutbox } from "../src/outbox/copilot.ts";
+import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/inbox/index.ts";
 import type {
   IRBuildProblem, IRCapability, IREvent, IRRequest, IROutboxError, OutboxRequestBuildResult,
 } from "../src/ir/types.ts";
@@ -559,9 +559,8 @@ describe("readOutboxResponse：与 Anthropic 同一条 wire", () => {
     expect(error.httpStatus).toBe(502);
     expect(error.raw).toBe("<html>502 Bad Gateway</html>");
     // 正文里没有判别位时**状态码就是判据**：5xx 一律 outboxUnavailable + 可重试。
-    // 这条曾经断言 unknown/不可重试，那是 DEFECT-7 修好之前的旧行为 —— nginx/Cloudflare
-    // 插进来的 502 是瞬时故障，判成 unknown 会让本该退避重试的请求直接失败
-    // （同一条断言在 egress_error_classification.test.ts 的 DEFECT-7e 里对五个出口都成立）。
+    // nginx/Cloudflare 插进来的 502 是瞬时故障，判成 unknown 会让本该退避重试的请求直接失败。
+    // 同一条断言在 outbox_error_classification.test.ts 里对五个出口都成立。
     expect(error.kind).toBe("outboxUnavailable");
     expect(error.retryable).toBe(true);
   });

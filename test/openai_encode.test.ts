@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/ingress/openai_encode.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/inbox/openai_encode.ts";
 import { defaultValue, type IREvent, type IRRequest } from "../src/ir/types.ts";
 
 async function* streamOf(events: readonly IREvent[]): AsyncGenerator<IREvent> {

@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { readClientRequestForProtocol } from "../src/ingress/index.ts";
+import { readClientRequestForProtocol } from "../src/inbox/index.ts";
 import { IR_LOSS_KINDS } from "../src/ir/types.ts";
 import type { IRPart, IRProtocol, IRRequest } from "../src/ir/types.ts";
 

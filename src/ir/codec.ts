@@ -1,7 +1,8 @@
 /**
  * 两条**不同的轴**：入口协议与出口供应商。
  *
- * 早先的版本把 `createOutbox` 挂在协议 codec 上，等于假设「出口 ⊆ 入口协议」——这是错的。
+ * `createOutbox` 不挂在协议 codec 上：那等于假设「出口 ⊆ 入口协议」，而 gemini_cloudcode
+ * 与 windsurf 根本不是任何客户端协议。两条轴独立，各用各的键。
  * Windsurf 的 Connect/protobuf、Gemini 的 `v1internal:streamGenerateContent` 根本不是任何
  * 客户端协议，它们**只能当出口**；Anthropic Messages 恰好两边都是，那是巧合（它既是客户端
  * 协议又是上游 API），不是结构规律。
@@ -14,7 +15,7 @@
  * 客户端协议的组合爆炸被入口侧一次性吸收，上游侧只按线性付费。
  */
 import type { ClientRequestReadResult, IROutbox, IREvent, IRProtocol, IRRequest, IRWireBody } from "./types.ts";
-import type { EncodeOptions } from "../ingress/shared.ts";
+import type { EncodeOptions } from "../inbox/shared.ts";
 
 // ── 入口：封闭集 ────────────────────────────────────────────────────────────
 
@@ -30,14 +31,14 @@ export type ClientResponseWriter = (
  * 一个客户端协议的两个方向。本库支持的主流 Agent 对话入口固定为三种，因此这是封闭集：
  * 补齐后，新增上游再也不需要碰它。
  */
-export interface IRIngressCodec {
+export interface IRInboxCodec {
   readonly protocol: IRProtocol;
   readonly readClientRequest: ClientRequestReader;
   readonly writeClientResponse: ClientResponseWriter;
 }
 
 /** 键必须覆盖全部三个协议，缺一个编译期报错。 */
-export type IRIngressRegistry = Readonly<Record<IRProtocol, IRIngressCodec>>;
+export type IRInboxRegistry = Readonly<Record<IRProtocol, IRInboxCodec>>;
 
 // ── 出口：开放集 ────────────────────────────────────────────────────────────
 
@@ -70,11 +71,11 @@ export interface IRRoute {
  * 一次性多出 3 条路由，而不是一条。
  */
 export function availableRoutes(
-  ingress: IRIngressRegistry,
+  inbox: IRInboxRegistry,
   outbox: IROutboxRegistry,
 ): IRRoute[] {
   const routes: IRRoute[] = [];
-  for (const protocol of Object.keys(ingress) as IRProtocol[]) {
+  for (const protocol of Object.keys(inbox) as IRProtocol[]) {
     for (const outboxName of Object.keys(outbox)) {
       routes.push({ from: protocol, to: outboxName });
     }
@@ -83,6 +84,6 @@ export function availableRoutes(
 }
 
 /** 接一家新上游的边际收益：恒等于入口数。用于把这套架构的经济性写成可断言的数字。 */
-export function routesPerNewOutbox(inbox: IRIngressRegistry): number {
+export function routesPerNewOutbox(inbox: IRInboxRegistry): number {
   return Object.keys(inbox).length;
 }

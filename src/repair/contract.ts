@@ -170,7 +170,7 @@ export const IR_REPAIR_POLICY_NONE: IRRepairPolicy = Object.freeze({});
  * 模态降级是「目标**没有**这个能力才修」；补必填字段问的却是另一个维度上的另一个问题
  * ——「目标**要求**这个字段吗」。
  *
- * 这两个问题曾经被同一个 `capabilities` 回答（「目标认识 `maxOutputTokens` 就填」），
+ * 两个问题必须分开问。用「目标认识 `maxOutputTokens` 就填」来回答「目标要不要它」，
  * 那正是 DEFECT-10 的根因：Gemini 认识它但不要求它，替它填一个默认值反而撞上
  * 「thinkingBudget 算在 maxOutputTokens 里」的组合约束，把 18/807 条真实请求变成 422。
  * 「认识」与「要求」是两个维度，闸门必须问对那一个。

@@ -18,13 +18,13 @@ import { describe, expect, it } from "bun:test";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   CHISEL_PROFILE, createWindsurfOutbox, WINDSURF_OBSERVED_IDENTITY_LINE,
-} from "../src/egress/windsurf/index.ts";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+} from "../src/outbox/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
 import {
   CONNECT_FRAME_HEADER_BYTES, createDeframeState, deframe, enframe, parseConnectTrailer,
-} from "../src/egress/windsurf/connect_frame.ts";
-import { getSharedWindsurfSchema, WINDSURF_TYPES } from "../src/egress/windsurf/schema.ts";
-import { normalizeConnectCode } from "../src/egress/windsurf/errors.ts";
+} from "../src/outbox/windsurf/connect_frame.ts";
+import { getSharedWindsurfSchema, WINDSURF_TYPES } from "../src/outbox/windsurf/schema.ts";
+import { normalizeConnectCode } from "../src/outbox/windsurf/errors.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { clientValue, defaultValue } from "../src/ir/types.ts";
@@ -503,7 +503,7 @@ describe("writeOutboxRequest 构造真实 GetChatMessage", () => {
       (loss) => loss.path === "$.conversation.turns[0]" && loss.detail.includes("signature_type"),
     );
     expect(signatureLoss?.kind).toBe("degraded");
-    // 损的是家族标签，不是「上游会不会消费思考」——后者已被抓包证伪。
+    // 损的是家族标签，不是思考本身：thinking 照常送达，只有 signature_type 无处安放。
     expect(signatureLoss?.detail).toContain("openai");
 
     // 没有签名的纯思考回合：wire 照常带 thinking，一条回合级 loss 都不记。
@@ -1026,7 +1026,7 @@ describe("Connect 尾帧里的应用错误", () => {
 // 前面所有用例的报文都是本仓库自己编出来的 —— 它们能证明「我们编得自洽」，
 // 证明不了「我们对上游的形状认知是对的」。这一段拿的是 mitmproxy 从真实 Devin CLI
 // 抓下来的字节（`test/fixtures/windsurf_capture/`，`metadata.apiKey` 已抹），
-// 12 条**全部得到上游 HTTP 200**。`src/egress/windsurf/index.ts` 里每一条标「抓包」的
+// 12 条**全部得到上游 HTTP 200**。`src/outbox/windsurf/index.ts` 里每一条标「抓包」的
 // 能力声明，判据都锁在下面这些断言上：夹具被换掉、或者本地 FDS 与真实 wire 对不上，
 // 这里就会红，而不是等到线上收到一个语义模糊的 4xx。
 // ════════════════════════════════════════════════════════════════════════════
@@ -1300,9 +1300,8 @@ describe("抓包：thinking / signature / geminiThoughtSignature", () => {
   });
 
   it("geminiThoughtSignature 在 135 个回合上**全为空** —— 零行为实证，不做任何处理", () => {
-    // 这条用例是防复发的：曾经有一份简报把它读成「每个回合都带、非空」，
-    // 原因是拿 `!== ""` 判一个 bytes 字段（空 Uint8Array 恒不等于空串）。
-    // 正确的判空是看 length。
+    // 判空注意：这是 bytes 字段，必须看 `length`。
+    // 用 `!== ""` 判会恒为真（空 Uint8Array 不等于空串），把「从未设置」读成「每条都带」。
     for (const { prompt } of CAPTURED_PROMPTS) {
       const signature = prompt.geminiThoughtSignature as Uint8Array;
       expect(signature).toBeInstanceOf(Uint8Array);

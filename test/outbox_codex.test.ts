@@ -6,7 +6,7 @@ import {
   createCodexAlphaSearchWireRequest,
   executeCodexAlphaSearch,
   readCodexAlphaSearchResults,
-} from "../src/egress/codex/index.ts";
+} from "../src/outbox/codex/index.ts";
 import { defaultValue, type IRIntent, type IRRequest, type IRToolset, type IRTurn } from "../src/ir/types.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 

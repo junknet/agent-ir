@@ -17,12 +17,12 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
-import { readClientRequestForProtocol } from "../src/ingress/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/outbox/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
+import { readClientRequestForProtocol } from "../src/inbox/index.ts";
 import { checkOutboxSupport, describeUnsupportedCapabilities } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { repairForAdmission, IR_REPAIR_KINDS } from "../src/repair/index.ts";
@@ -46,7 +46,7 @@ function buildEgresses(): Readonly<Record<string, IROutbox<IRWireBody>>> {
   };
 }
 
-const EGRESSES = buildEgresses();
+const OUTBOXES = buildEgresses();
 
 function wireText(body: IRWireBody): string {
   return typeof body === "string" ? body : new TextDecoder().decode(body);
@@ -187,14 +187,14 @@ describe("同一个 IR 送进五个出口", () => {
     const derived = deriveCapabilityNeeds(request);
     expect(derived).toEqual([...request.requires]);
     // 出口只读它，不改它：把 requires 交给每个出口裁决前后必须一模一样。
-    for (const outbox of Object.values(EGRESSES)) {
+    for (const outbox of Object.values(OUTBOXES)) {
       checkOutboxSupport(request, outbox.profile);
       expect(request.requires).toEqual(derived);
     }
   });
 
   it("拒绝的理由集合可解释：每条 unsupported 都确实落在 supports ∪ lossy 之外", () => {
-    for (const [name, outbox] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(OUTBOXES)) {
       const verdict = checkOutboxSupport(request, outbox.profile, name);
       for (const need of verdict.unsupported) {
         expect({ name, capability: need.capability, inSupports: outbox.profile.supports.has(need.capability) })
@@ -214,7 +214,7 @@ describe("同一个 IR 送进五个出口", () => {
   });
 
   it("supports 与 lossy 必须不相交 —— 重叠会让「强制留痕」静默失效", () => {
-    for (const [name, outbox] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(OUTBOXES)) {
       const overlap = [...outbox.profile.supports].filter((capability) => outbox.profile.lossy.has(capability));
       expect({ name, overlap }).toEqual({ name, overlap: [] });
       for (const capability of [...outbox.profile.supports, ...outbox.profile.lossy]) {
@@ -224,7 +224,7 @@ describe("同一个 IR 送进五个出口", () => {
   });
 
   it("这段普通对话五个出口全都编译得出来，且 wire 里一个 marker 都不少", async () => {
-    for (const [name, outbox] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(OUTBOXES)) {
       clearThoughtSignatureCache();
       const verdict = checkOutboxSupport(request, outbox.profile);
       expect({ name, admitted: verdict.admitted }).toEqual({ name, admitted: true });
@@ -243,7 +243,7 @@ describe("同一个 IR 送进五个出口", () => {
   });
 
   it("客户端没说的东西不许出现在 wire 上 —— Core 不发明内容", async () => {
-    for (const outbox of Object.values(EGRESSES)) {
+    for (const outbox of Object.values(OUTBOXES)) {
       clearThoughtSignatureCache();
       const built = await outbox.writeOutboxRequest(request);
       if (!built.ok) continue;
@@ -275,7 +275,7 @@ describe("表达不了的内容：拒绝必须指到那个 part，绝不静默�
 
   it("每个出口要么承载、要么在准入或构造阶段带路径拒绝 —— 没有第三种结局", async () => {
     const request = withMedia();
-    for (const [name, outbox] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(OUTBOXES)) {
       clearThoughtSignatureCache();
       const verdict = checkOutboxSupport(request, outbox.profile);
       if (!verdict.admitted) {
@@ -371,7 +371,7 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
 
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, outbox] of Object.entries(EGRESSES)) {
+      for (const [name, outbox] of Object.entries(OUTBOXES)) {
         clearThoughtSignatureCache();
         const repaired = repairForAdmission(request, outbox.profile, MAXIMAL_POLICY);
 
@@ -413,7 +413,7 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
     const problemKinds = new Set<IRBuildProblemKind>();
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [, outbox] of Object.entries(EGRESSES)) {
+      for (const [, outbox] of Object.entries(OUTBOXES)) {
         clearThoughtSignatureCache();
         if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
         const built = await outbox.writeOutboxRequest(request);
@@ -429,7 +429,7 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
     let improved = 0;
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [, outbox] of Object.entries(EGRESSES)) {
+      for (const [, outbox] of Object.entries(OUTBOXES)) {
         clearThoughtSignatureCache();
         const before = await outbox.writeOutboxRequest(request);
         if (before.ok) continue;
@@ -445,13 +445,11 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
   }, 180_000);
 
   /**
-   * `unsatisfiableValue` 曾经是**一条修复都覆盖不到**的 problem kind：422 里那句
-   * 「no repair kind covers this problem」是当时唯一诚实的回答。`raiseMaxOutputTokens`
-   * 就是给它的答案，这条测的是它在真实语料上真的有用 —— 建议一条修不动的修复，
-   * 比不给建议更贵。
+   * `unsatisfiableValue` 的修复是 `raiseMaxOutputTokens`。这条测它在真实语料上真的有用：
+   * 建议一条修不动的修复，比不给建议更贵。
    */
   it.skipIf(corpus.length === 0)("raiseMaxOutputTokens 真的救得回 unsatisfiableValue", async () => {
-    const gemini = EGRESSES.gemini_cloudcode;
+    const gemini = OUTBOXES.gemini_cloudcode;
     if (gemini === undefined) throw new Error("gemini outbox missing");
     let rejectedByCombination = 0;
     let rescued = 0;
@@ -485,24 +483,19 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 已知缺陷 —— 断言的是应有行为，当前实现做不到，故意保留失败
+// 单调性：开一条修复不许把本来能编译的请求弄成不能
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * **单调性**：修复只会让更多请求通过，绝不会让本来能编的请求编不出来。
  *
  * 这是修复层的核心不变量，`src/repair/index.ts` 的文件头写的「原本被拒的请求变得可通过」
- * 说的只是它的正方向；反方向一样是约束，而且曾经真的被打破过（DEFECT-10）：
+ * 说的只是它的正方向；反方向一样是约束。
  *
- *   `defaultMaxOutputTokens` 的闸门曾是 `repairWhenPresent: ["maxOutputTokens"]`，
- *   问的是「目标**认识**这个参数吗」。gemini_cloudcode 认识它，于是闸门放行、填进 4096。
- *   但 CloudCode 把 `thinkingBudget` **算在** `maxOutputTokens` 里面：客户端要
- *   effort:'high'（budget 10000）时 4096 连可见正文的下限都不够，构造阶段抛
- *   `unsatisfiableValue` —— 而**不修**的时候同一条请求编得好好的（出口用自己的 65536）。
- *   语料实测 18/807 条真实 gemini 请求因此从「能用」变成 422。
- *
- * 根因是契约缺了一个维度：闸门只能问 supports（认识），问不出 mandatory（要求）。
- * 补上 `IROutboxProfile.mandatory` 之后闸门改问后者，下面两条就是它的守卫。
+ * 关键在闸门问对维度：`defaultMaxOutputTokens` 必须问 `mandatory`（目标**要求**这个字段吗），
+ * 不能问 `supports`（目标**认识**它吗）。gemini_cloudcode 认识 `maxOutputTokens` 但不要求它，
+ * 而 CloudCode 把 `thinkingBudget` **算在**这个上限里 —— 替它填一个默认值反而会让
+ * 本来编得好好的请求抛 `unsatisfiableValue`。语料实测这个差别影响 18/807 条真实 gemini 请求。
  */
 describe("单调性：开一条修复不许把本来能编译的请求弄成不能", () => {
   const geminiOutbox = createGeminiCloudCodeOutbox({
@@ -520,7 +513,7 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     return request;
   }
 
-  it("DEFECT-10a 最小复现：目标只是「认识」max_tokens，就不许替它填", async () => {
+  it("最小复现：目标只是「认识」max_tokens，就不许替它填", async () => {
     const request = highEffortWithoutCeiling();
     expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
 
@@ -553,11 +546,11 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     expect(after.ok).toBe(true);
   });
 
-  it.skipIf(corpus.length === 0)("DEFECT-10b 语料规模：全开策略下一条都不许回退", async () => {
+  it.skipIf(corpus.length === 0)("语料规模：全开策略下一条都不许回退", async () => {
     const regressed: string[] = [];
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, outbox] of Object.entries(EGRESSES)) {
+      for (const [name, outbox] of Object.entries(OUTBOXES)) {
         // 基线必须与修复后**同口径**：准入通过 **且** 构造成功才算「本来能用」。
         if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
         clearThoughtSignatureCache();
@@ -591,7 +584,7 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     const compilable: Baseline[] = [];
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, outbox] of Object.entries(EGRESSES)) {
+      for (const [name, outbox] of Object.entries(OUTBOXES)) {
         if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
         clearThoughtSignatureCache();
         const before = await outbox.writeOutboxRequest(request);

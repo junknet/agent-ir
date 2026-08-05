@@ -4,7 +4,7 @@
 
 边界要分两层说，混为一谈会读错这个仓库：
 
-- **Core**（`src/ir` · `src/ingress` · `src/egress`）只做协议翻译与准入裁决。**不做**账号选择、配额、重试编排、模型映射、任何形式的内容修补 —— 它对「上游是谁、有没有额度、这次该不该重试」一无所知，这是它能保持确定性的前提。
+- **Core**（`src/ir` · `src/inbox` · `src/outbox`）只做协议翻译与准入裁决。**不做**账号选择、配额、重试编排、模型映射、任何形式的内容修补 —— 它对「上游是谁、有没有额度、这次该不该重试」一无所知，这是它能保持确定性的前提。
 - **参考网关**（`src/gateway` · `src/server.ts`）做上面那些里的一部分：模型名映射、出口选择、修复策略装配、流策略。它是**可选层**，随仓库发布只是为了让 Core 有一个能跑起来的宿主；把 agent-ir 当库用的调用方可以整个不要它，自己拿 Core 的三个 API 拼。
 
 「不做模型映射」说的是 Core，不是这个仓库 —— 见 §6。
@@ -82,13 +82,11 @@ flowchart TB
 方向名；客户端侧使用 `inbox`，供应商 wire 侧使用 `outbox`。外部协议原文字段、错误码和
 历史证据可保留原名。
 
-**目录名是唯一的例外，而且是有意保留的**：磁盘上仍然是 `src/ingress/` 与 `src/egress/`。
-契约名（`IROutbox` / `writeOutboxRequest` / `IRLoss.stage`）已经全部换成方向名，目录改名
-是一次纯路径扰动，收益不抵它在评审里制造的噪音。引用源码位置时照实写路径，不要按新术语
-臆造一个 `src/outbox/`。
+**目录名与文件名同样受这条约束**：磁盘上是 `src/inbox/` 与 `src/outbox/`，
+测试是 `test/inbox_*.test.ts` 与 `test/outbox_*.test.ts`。全仓库只有一套方向词汇。
 
 任何一家 Outbox 的私有逻辑——Windsurf 的 Connect/protobuf、供应商鉴权、内建工具映射、
-供应商策略限制——只放在该 Outbox 自己的 `src/egress/` 模块，由自己的 Outbox 实现处理。不要为一家
+供应商策略限制——只放在该 Outbox 自己的 `src/outbox/` 模块，由自己的 Outbox 实现处理。不要为一家
 供应商向 `IROutboxProfile` 添加布尔字段、全局枚举、通用 repair 条目或含糊 callback；只有
 至少两家具有相同语义、相同输入输出和相同调用方时，才能抽取新接口，并须同时交付两家实现
 与契约测试。
@@ -121,8 +119,8 @@ flowchart TB
 
 | | 源码 | 为什么不能是 `IROutbox` |
 |---|---|---|
-| **ChatGPT Codex 私有 Responses** | `src/egress/codex/` | 传输是 WebSocket `response.create` 帧，不是 POST；续轮靠 `previous_response_id`，工具定义放在 `input` 的 `additional_tools` item 里。收编它就得给 Core 加一层只服务它一家的运输抽象 |
-| **Windsurf 的 `web_search` 执行器** | `src/egress/windsurf/web_search.ts` | 它不是「把 IR 编译成 wire」，而是**执行一个工具**：`GetChatMessage` 只把 `web_search` 当普通 function tool 发下去，真实客户端在模型返回该调用后另行调 `GetWebSearchResults`，再把结果当普通 `IRToolResult` 回灌。这是宿主工具循环的事，不是协议翻译 |
+| **ChatGPT Codex 私有 Responses** | `src/outbox/codex/` | 传输是 WebSocket `response.create` 帧，不是 POST；续轮靠 `previous_response_id`，工具定义放在 `input` 的 `additional_tools` item 里。收编它就得给 Core 加一层只服务它一家的运输抽象 |
+| **Windsurf 的 `web_search` 执行器** | `src/outbox/windsurf/web_search.ts` | 它不是「把 IR 编译成 wire」，而是**执行一个工具**：`GetChatMessage` 只把 `web_search` 当普通 function tool 发下去，真实客户端在模型返回该调用后另行调 `GetWebSearchResults`，再把结果当普通 `IRToolResult` 回灌。这是宿主工具循环的事，不是协议翻译 |
 
 两者都复用已有件而不是复制语义：codex 把 WebSocket 文本消息里的 JSON payload 直接喂给既有的
 Responses event lifter；web_search 的产物是普通 `IRToolResult`，不新增任何 IR 概念。
@@ -130,29 +128,39 @@ Responses event lifter；web_search 的产物是普通 `IRToolResult`，不新�
 注意 `webfetch`：真实客户端把它和 `web_search` 一样声明成普通 function tool，但抓包里
 **没有它的执行报文**，所以本仓库不实现它 —— 没有证据的东西不写。
 
-两条踩过的坑：
+两处必须留意：
 - **CloudCode 用 CRLF 分帧**。按 `indexOf("\n\n")` 找边界会把整条流攒成一个 block，症状不是报错是**内容凭空消失**。正确做法是逐行扫描 + 空行分帧（与官方 SDK 一致）。
-- **Windsurf 的应用错误在 Connect 尾帧里，没有 HTTP 状态码**。传输层是 200，`permission_denied` 落进资源重试会打遍账号池、伪装成 503。这条坑本身照旧成立（它说的是**错误往哪放**），但**别把它读成「为什么被拒」** —— 见下。
+- **Windsurf 的应用错误在 Connect 尾帧里，没有 HTTP 状态码**。传输层永远 200，所以错误必须从尾帧读；`permission_denied` 是「这条请求本身被拒」，`retryable:false`，换账号重试只会打遍账号池。它说的是**错误往哪放**；**为什么被拒**见 §3.2。
 
-### 3.1 一条被抓包证伪的说法
+### 3.2 Windsurf 的内容策略：三段会被拒
 
-此前有一个说法被当成事实四处引用：**「Windsurf 上游的内容分类器会因为 agent 脚手架的体量或
-关键词密度拒掉整条请求」**。2026-08-04 从真实 Devin CLI 抓到的 12 条 `GetChatMessage`
-**证伪了它**：21KB 的 agent system prompt + 23 个工具 + PNG 图片 + 21 轮历史，**全部 HTTP 200**。
-体量与关键词密度不是判据。逐条数据见 [EVIDENCE.md](EVIDENCE.md) 的「Windsurf 真实抓包」一节。
+Windsurf 上游在 wire 之外还有一层策略检查。请求可以编译得完全合法、字段一个不缺，仍然被
+整条打回（HTTP 200，错误在 Connect 尾帧）。判据是**具体段落**，不是体量也不是关键词密度。
 
-抓包唯一测到的差别是**客户端身份**：真实客户端的 system prompt 第一行是
-`You are Devin, an interactive command line agent from Cognition.`
+实测依据两处：`test/fixtures/windsurf_capture/` 的 12 条真实报文（21KB agent system prompt +
+23 个工具 + PNG 图片 + 21 轮历史，全部 200），以及 2026-08-05 拿真实凭据对
+`server.codeium.com` 做的逐段实验（模型 `claude-opus-4-6`，Claude Code 2.1.221 的 9929 字符
+system 切成 12 段逐个发）。结果是 **12 段里只有 3 段会被拒**：
 
-**但抓包只证到这里。** 没有人做过对照实验，因此下面这些都**还没有验证**，不许当结论用：
+| 段 | 字符 | 上游反应 |
+|---|---|---|
+| **`You are Claude Code, …`**（客户端身份行） | 57 | `an internal error occurred` |
+| **`IMPORTANT: Assist with authorized security testing…`** | 459 | `blocked by our content policy` |
+| **`# Environment`** | 973 | `blocked by our content policy` |
+| 其余 9 段（计费头 / `# Harness` / `# Delivering work` / `# Corrections` …） | 8507 | 放行 |
 
-- 「只替换身份行就够了」—— 无实证。抓包里身份行与其余 21KB 正文是同时出现的，
-  分不开哪一部分在起作用，也可能两者都不起作用。
-- 「上游根本不看 prompt 内容」—— 同样无实证。12 条全 200 只说明**这 12 条**没被拒，
-  证伪不了「存在某种会被拒的输入」。
+**错误信息区分两套机制**：身份行给泛化 `permission_denied`，正文段给明确的 content policy。
+两者独立，必须同时处理 —— 只动其中一边仍然被拒。摘掉这 3 段并把身份行换成
+`You are Devin, an interactive command line agent from Cognition.` 之后，带 12 个真实
+Claude Code 工具实测 200，客户端指令存活 **85.7%**（8507/9929）。
 
-对 Core 的结论只有一条，而且是消极的：这类猜测**不构成**往 `IROutboxProfile` 加字段的理由。
-供应商的内容策略既不是 wire 事实也不是能力声明，`profile` 里没有它的位置（AGENTS.md 接口边界）。
+处置全部落在 windsurf 自己的 `WindsurfSystemIdentityPolicy`（`src/outbox/windsurf/index.ts`），
+默认开启，每次改写记 `IRLoss`，调用方可传 `{ kind: "passthrough" }` 关掉。
+
+**注意**：段落判据用**段首前缀**而不是整段精确相等，因为这些段落会随客户端版本改字。
+前缀漂了的后果是那一段没被摘、整条请求被拒 —— 是个响亮的失败，不是静默的错。
+
+供应商的内容策略既不是 wire 事实也不是能力声明，因此 `IROutboxProfile` 里没有它的位置。
 
 ---
 
@@ -268,7 +276,7 @@ flowchart TB
 
 ## 7. 节点到源码
 
-目录名沿用 `ingress`/`egress`（见 §2.1 末尾），契约名一律是 `inbox`/`outbox`。下表左列是概念，
+目录名沿用 `inbox`/`outbox`（见 §2.1 末尾），契约名一律是 `inbox`/`outbox`。下表左列是概念，
 右列是磁盘上的真实路径，两者不必同名。
 
 | 图上的东西 | 源码 |
@@ -281,10 +289,10 @@ flowchart TB
 | 流守卫（提交点/保活/退避） | `src/ir/stream_guard.ts` |
 | SSE 分帧 | `src/ir/sse.ts` |
 | IRMessage 审计 interceptor chain | `src/ir/ir_message_interception_extensions.ts` |
-| 三个 Inbox codec | `src/ingress/**` |
-| 六个 Outbox（`OUTBOX_REGISTRY`） | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
-| Codex WebSocket 适配（**不是** `IROutbox`，见 §3.1） | `src/egress/codex/` |
-| Windsurf `web_search` 执行器（**不是** `IROutbox`，见 §3.1） | `src/egress/windsurf/web_search.ts` |
+| 三个 Inbox codec | `src/inbox/**` |
+| 六个 Outbox（`OUTBOX_REGISTRY`） | `src/outbox/**`（windsurf 在子目录，唯一带依赖） |
+| Codex WebSocket 适配（**不是** `IROutbox`，见 §3.1） | `src/outbox/codex/` |
+| Windsurf `web_search` 执行器（**不是** `IROutbox`，见 §3.1） | `src/outbox/windsurf/web_search.ts` |
 | Windsurf 真实报文夹具（12 条，全部 200） | `test/fixtures/windsurf_capture/` |
 | 出口选择（`OUTBOX_SELECTIONS`） | `src/gateway/outbox_selection.ts` |
 | 网关唯一装配点（`readGatewayRuntimeSettings`） | `src/gateway/config.ts` |
@@ -330,10 +338,10 @@ type OutboxRequestBuildResult<TBody> =
 
 ---
 
-## 9. 反模式
+## 9. 注意事项
 
-- **把 wire 格式当 IR**。位置不变量（`tool_result` 必须紧邻）是 wire 层的事，混进 IR 会让每个入口各维护一套排列规则。
-- **用索引签名夹带未知字段**。新增出口时它们会静默蒸发；未知必须显式装箱成 `opaque`，让类型系统逼每个出口表态。
-- **在 `readOutboxResponse` 的 switch 里留缺省黑洞**。没匹配上的事件必须产出 `unhandled` —— 实测代价是一天 126 次静默 `context_length_exceeded`，调用方只能盲重试。
-- **把保活挂在数据分支上**。上游彻底静默正是保活唯一要顶的场景，数据驱动会让它恰好在那时停摆。
-- **Core 里发明内容**。同一个 IR 换个出口出来的对话多了一句网关编的话，确定性就没了。
+- **IR 只表达语义，不表达排列。** 关联一律用 id；`tool_result` 必须紧邻这类位置不变量在写出 wire 时才处理。
+- **未知内容显式装箱成 `opaque`。** 类型系统据此逼每个 Outbox 表态，字段不会在新增 Outbox 时蒸发。
+- **`readOutboxResponse` 的 switch 必须有 default 产出 `unhandled`。** 上游协议漂移要能自己冒头，不靠故障反推。
+- **保活由计时器驱动。** 上游彻底静默正是保活要顶的场景，所以它不能挂在数据分支上。
+- **Core 不发明内容。** 表达不了就带精确 IR 路径拒绝；补值、改写、降级都归 repair 或 Outbox 自己的 owner option，且必须记 `IRLoss`。

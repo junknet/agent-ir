@@ -423,7 +423,7 @@ export function createAnthropicMessagesOutbox(dialect: AnthropicMessagesDialect)
       // a uuid, hash value, or other opaque identifier.」）。它就是 Claude Code 的原始形态 ——
       // 语料 365/611 条 anthropic_messages 请求带 `metadata.user_id`，且 365/365 是
       // `{"device_id","account_uuid","session_id"}` 的 JSON 串（accountType 全是 copilot，
-      // 也就是说这条 wire 上两家上游都真实受理过它）。ingress 的 `parseSessionIdentity` 解的
+      // 也就是说这条 wire 上两家上游都真实受理过它）。inbox 的 `parseSessionIdentity` 解的
       // 正是这个串，这里是它的逆 —— 有位置就发，不发才是不变量 3 的反面。
       const metadataUserId = writeSessionIdentity(intent.identity);
 

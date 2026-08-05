@@ -4,8 +4,8 @@ import {
   createWindsurfWebSearchToolResult,
   createWindsurfWebSearchWireRequest,
   readWindsurfWebSearchDocuments,
-} from "../src/egress/windsurf/web_search.ts";
-import { getSharedWindsurfSchema } from "../src/egress/windsurf/schema.ts";
+} from "../src/outbox/windsurf/web_search.ts";
+import { getSharedWindsurfSchema } from "../src/outbox/windsurf/schema.ts";
 
 describe("Windsurf 专属 web_search RPC", () => {
   it("按真实 application/proto 请求形状编译搜索，并复用 Windsurf 客户端身份", async () => {

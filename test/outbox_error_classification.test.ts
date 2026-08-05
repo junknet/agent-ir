@@ -19,13 +19,13 @@
  */
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeOutbox } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
-import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/egress/windsurf/connect_frame.ts";
-import { getSharedWindsurfSchema } from "../src/egress/windsurf/schema.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { createGeminiCloudCodeOutbox } from "../src/outbox/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
+import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/outbox/windsurf/connect_frame.ts";
+import { getSharedWindsurfSchema } from "../src/outbox/windsurf/schema.ts";
 import type { IROutbox, IREvent, IROutboxError, IRWireBody } from "../src/ir/types.ts";
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ const gemini = createGeminiCloudCodeOutbox({
 });
 const windsurf = createWindsurfOutbox({ model: "claude-opus-4-8-high", apiKey: "devin$h.e.s" });
 
-const EGRESSES: Readonly<Record<string, IROutbox<IRWireBody>>> = {
+const OUTBOXES: Readonly<Record<string, IROutbox<IRWireBody>>> = {
   anthropic, openai_chat: chat, openai_responses: responses, gemini_cloudcode: gemini, windsurf,
 };
 
@@ -144,7 +144,7 @@ describe("HTTP 4xx/5xx：带上游原文错误体", () => {
     },
   ];
 
-  for (const [name, outbox] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(OUTBOXES)) {
     for (const testCase of cases) {
       it(`${name} / HTTP ${testCase.status} → ${testCase.expect}`, async () => {
         const error = await errorOf(outbox.readOutboxResponse(
@@ -160,7 +160,7 @@ describe("HTTP 4xx/5xx：带上游原文错误体", () => {
 });
 
 describe("HTTP 层的重试判定与 kind 严格对齐", () => {
-  for (const [name, outbox] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(OUTBOXES)) {
     it(`${name}：429 与 5xx 可重试，4xx（除 429）一律不可`, async () => {
       const rateLimited = await errorOf(outbox.readOutboxResponse(httpResponse(429,
         JSON.stringify({ error: { type: "rate_limit_error", message: "slow down" } }))));
@@ -388,7 +388,7 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
 describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () => {
   const NGINX = "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>";
 
-  for (const [name, outbox] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(OUTBOXES)) {
     it(`${name}：仍要产出一条错误，且 raw 留住原文`, async () => {
       const error = await errorOf(outbox.readOutboxResponse(httpResponse(502, NGINX, "text/html")));
       expect(error.httpStatus).toBe(502);
@@ -397,7 +397,7 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
   }
 
   it("空错误体（连一个字节都没有）也不能崩", async () => {
-    for (const [, outbox] of Object.entries(EGRESSES)) {
+    for (const [, outbox] of Object.entries(OUTBOXES)) {
       const error = await errorOf(outbox.readOutboxResponse(httpResponse(503, "", "text/plain")));
       expect(error.httpStatus).toBe(503);
     }
@@ -405,12 +405,11 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 回归守卫 —— 以下三组曾是真实缺陷（DEFECT-7/8/9），已修复。用例原样保留：
-// 它们断言的是**应有行为**，改动分类链时谁破坏了它，谁就是让老故障复发。
+// 分类链必须守住的三条：状态码参与判定、contextLengthExceeded 可达、5xx 整段可重试
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * `src/egress/anthropic.ts` 的 `mapOutboxError(payload, httpStatus)` 收下了
+ * `src/outbox/anthropic.ts` 的 `mapOutboxError(payload, httpStatus)` 收下了
  * `httpStatus`，却**只把它写进返回值，不参与分类**：`kind` 完全由 body 里的
  * `error.type` 与 message 正则推出来。
  *
@@ -423,34 +422,34 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
  * `code === 500` 分支），只有这一家没有。**已修**：kind 的推导链末尾加了一段
  * 「type/message 都没命中时按 httpStatus 归档」（`kindFromHttpStatus`）。
  */
-describe("[守卫] anthropic 出口的错误分类必须把 HTTP 状态码算进去", () => {
+describe("anthropic 出口的错误分类必须把 HTTP 状态码算进去", () => {
   const CLOUDFLARE_524 = "error code: 524";
   const NGINX_502 = "<html><head><title>502 Bad Gateway</title></head></html>";
 
-  it("DEFECT-7a HTTP 503 + 非 JSON 体 → 应当是可重试的 outboxUnavailable", async () => {
+  it("HTTP 503 + 非 JSON 体 → 必须是可重试的 outboxUnavailable", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(httpResponse(503, NGINX_502, "text/html")));
     expect(error.kind).toBe("outboxUnavailable");
     expect(error.retryable).toBe(true);
   });
 
-  it("DEFECT-7b Cloudflare 524（纯文本）→ 应当可重试", async () => {
+  it("Cloudflare 524（纯文本）→ 必须可重试", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(httpResponse(524, CLOUDFLARE_524, "text/plain")));
     expect(error.retryable).toBe(true);
   });
 
-  it("DEFECT-7c HTTP 429 + 非 JSON 体 → 应当是 rateLimited", async () => {
+  it("HTTP 429 + 非 JSON 体 → rateLimited", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(httpResponse(429, "Too Many Requests", "text/plain")));
     expect(error.kind).toBe("rateLimited");
     expect(error.retryable).toBe(true);
   });
 
-  it("DEFECT-7d HTTP 401 + 非 JSON 体 → 应当是 permissionDenied", async () => {
+  it("HTTP 401 + 非 JSON 体 → permissionDenied", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(httpResponse(401, "Unauthorized", "text/plain")));
     expect(error.kind).toBe("permissionDenied");
   });
 
-  it("DEFECT-7e 对照：另外四个出口在同一条报文上都分对了", async () => {
-    for (const [name, outbox] of Object.entries(EGRESSES)) {
+  it("对照：另外四个出口在同一条报文上都分对了", async () => {
+    for (const [name, outbox] of Object.entries(OUTBOXES)) {
       if (name === "anthropic") continue;
       const error = await errorOf(outbox.readOutboxResponse(httpResponse(503, NGINX_502, "text/html")));
       expect({ name, kind: error.kind, retryable: error.retryable })
@@ -460,7 +459,7 @@ describe("[守卫] anthropic 出口的错误分类必须把 HTTP 状态码算进
 });
 
 /**
- * `src/egress/anthropic.ts` 的 `mapOutboxError` 是一条三元链，顺序是：
+ * `src/outbox/anthropic.ts` 的 `mapOutboxError` 是一条三元链，顺序是：
  *
  *   type === 'invalid_request_error'   → invalidRequest
  *   … 其它 type …
@@ -478,23 +477,23 @@ describe("[守卫] anthropic 出口的错误分类必须把 HTTP 状态码算进
  *
  * **已修**：message 正则前置到 type 判断之前，`contextLengthExceeded` 因此可达。
  */
-describe("[守卫] anthropic 出口的 contextLengthExceeded 必须可达", () => {
+describe("anthropic 出口的 contextLengthExceeded 必须可达", () => {
   const REAL_TOO_LONG = JSON.stringify({
     type: "error",
     error: { type: "invalid_request_error", message: "prompt is too long: 214253 tokens > 200000 maximum" },
   });
 
-  it("DEFECT-9a HTTP 400 + 真实报文 → 应当是 contextLengthExceeded，实际是 invalidRequest", async () => {
+  it("HTTP 400 + 真实报文 → contextLengthExceeded", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(httpResponse(400, REAL_TOO_LONG)));
     expect(error.kind).toBe("contextLengthExceeded");
   });
 
-  it("DEFECT-9b 流内 error 事件里的同一条报文，同样分错", async () => {
+  it("流内 error 事件里的同一条报文，同样分对", async () => {
     const error = await errorOf(anthropic.readOutboxResponse(sseResponse([`event: error\ndata: ${REAL_TOO_LONG}`])));
     expect(error.kind).toBe("contextLengthExceeded");
   });
 
-  it("DEFECT-9c 对照：另外三个 JSON 出口在等价报文上都分对了", async () => {
+  it("对照：另外三个 JSON 出口在等价报文上都分对了", async () => {
     const cases: readonly [string, IROutbox<IRWireBody>, string][] = [
       ["openai_chat", chat, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "maximum context length is 272000 tokens" } })],
       ["openai_responses", responses, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "input too long" } })],
@@ -510,17 +509,17 @@ describe("[守卫] anthropic 出口的 contextLengthExceeded 必须可达", () =
 /**
  * 5xx 是一整段，不是几个点。`gemini_cloudcode` 的分类器逐个枚举
  * `code === 500 || 502 || 503 || 504`，落在这四个之外的 5xx 一律 `unknown` +
- * `retryable:false`；`anthropic` 更彻底，压根不看状态码（见 DEFECT-7）。
+ * `retryable:false`；`anthropic` 更彻底，压根不看状态码（见 ）。
  *
  * 落在枚举外的 5xx 不是假想：Cloudflare 的 520/521/522/524 全在这一段，
  * 而本仓库 `stream_guard.ts` 的文件头就记着一次真实的 524。经过任何一层 CDN
  * 或隧道的部署都会撞上它，而撞上的后果是**不退避、不重试**，直接把一个瞬时故障
  * 报成永久失败。
  */
-describe("[守卫] 5xx 必须整段可重试，而不是只认几个特定码", () => {
+describe("5xx 必须整段可重试，而不是只认几个特定码", () => {
   for (const status of [520, 522, 524, 529]) {
-    it(`DEFECT-8 HTTP ${status}：五个出口都应当是可重试的 outboxUnavailable`, async () => {
-      for (const [name, outbox] of Object.entries(EGRESSES)) {
+    it(`HTTP ${status}：五个出口都必须是可重试的 outboxUnavailable`, async () => {
+      for (const [name, outbox] of Object.entries(OUTBOXES)) {
         const error = await errorOf(outbox.readOutboxResponse(
           httpResponse(status, "error code: 524", "text/plain"),
         ));

@@ -25,7 +25,7 @@
 import { OUTBOX_REGISTRY } from "../protocols.ts";
 import {
   createCloudCodeProjectSource, createGeminiOAuthTokenSource,
-} from "../egress/gemini_cloudcode.ts";
+} from "../outbox/gemini_cloudcode.ts";
 import type { IROutbox, IRWireBody } from "../ir/types.ts";
 import { readOptionalText, readRequiredText, type EnvLookup } from "./env.ts";
 

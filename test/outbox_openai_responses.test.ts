@@ -12,9 +12,9 @@
  *     `keepalive` / `response.failed` / 顶层 `error` 三例
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";

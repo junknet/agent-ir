@@ -247,7 +247,7 @@ function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: st
 }
 
 /**
- * 推理 item。ingress 把一条 `reasoning` 拆成若干 thinking part + 一个 redactedThinking part，
+ * 推理 item。inbox 把一条 `reasoning` 拆成若干 thinking part + 一个 redactedThinking part，
  * 这里把连续的一段合回一个 item，`encrypted_content` 原样回传 —— 这是 store=false 时
  * 让上游认得自己上一轮思考的唯一凭据。
  *
@@ -1101,7 +1101,7 @@ async function* liftResponsesStream(
     }
   }
 
-  // 上游把流掐断却没发终止事件：必须显式终止。此前那版在这里直接收尾，产出的是
+  // 上游把流掐断却没发终止事件：必须显式终止。直接收尾产出的会是
   // stop_reason 正常的空回合 —— 一个「看起来成功」的 200，调用方只能盲重试到 retry cap。
   if (!sawTerminal) {
     yield {

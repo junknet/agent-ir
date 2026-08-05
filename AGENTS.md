@@ -19,7 +19,7 @@
 - `IROutboxProfile` 只描述所有 Outbox 共同可解释的 wire 事实：`supports`、`lossy`、
   `mandatory`。不得向其中加入某一家供应商的内容策略、账户行为、模型怪癖或临时开关。
 - 某个供应商独有的编码、鉴权、工具映射、响应解码、重试判定或兼容逻辑，必须留在该供应商
-  自己的 `src/egress/` 模块，并通过它的 `writeOutboxRequest` / `readOutboxResponse`
+  自己的 `src/outbox/` 模块，并通过它的 `writeOutboxRequest` / `readOutboxResponse`
   与外部发生关系。
 - 不得为了一个 Outbox 的问题新增全局枚举、布尔 profile 字段、通用 callback 或 repair gate。
   只有当至少两个 Outbox 具有**同一语义、同一输入输出契约、同一调用方**时，才可以提出新的
@@ -42,7 +42,7 @@
   或精确 `IRBuildProblem`，不得静默修改。
 - 修改公共契约时，先更新 `src/ir/types.ts` 与 `docs/ARCHITECTURE.md`，再让 TypeScript
   枚举所有消费者；不得保留旧名称 alias 或兼容包装。
-- 每个 Outbox 特化都要在相应 `test/egress_<outbox>.test.ts` 覆盖 wire 形状、失败边界和
+- 每个 Outbox 特化都要在相应 `test/outbox_<outbox>.test.ts` 覆盖 wire 形状、失败边界和
   不影响其他 Outbox 的反例。
 - 交付前至少执行：`bun run typecheck`、`bun test`、`git diff --check`；并搜索已废弃名称，
   预期残留为零。

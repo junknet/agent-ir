@@ -1,8 +1,8 @@
 /** 内置 IRMessage 拦截链的时序、可变引用与三种边界。 */
 import { describe, expect, it } from "bun:test";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { writeAnthropicResponse } from "../src/ingress/anthropic_encode.ts";
-import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/ingress/openai_encode.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { writeAnthropicResponse } from "../src/inbox/anthropic_encode.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/inbox/openai_encode.ts";
 import {
   createIRMessageInterceptionExtensions, executeIRMessageInterceptorChain,
   observeCompleteIRResponseBeforeStreamTermination, type IRMessageInterceptor,

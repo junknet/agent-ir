@@ -1,10 +1,8 @@
 /**
  * 确定性 —— 入口解码、出口构造、响应折叠三处各一组。
  *
- * 为什么这件事要单独锁：这套架构把「同一个 IR 换个出口出来的对话多了一句网关编的话」
- * 列为反模式（`ARCHITECTURE.md` §8）。而不确定性是同一个病的另一种表现 ——
- * 同一个输入两次跑出不同结果时，「网关编的」那句话只是偶尔出现，
- * 于是它既复现不了，也没人相信它存在。
+ * 为什么这件事要单独锁：Core 的承诺是「同一个 IR 编译出同一份 wire」。一旦不确定，
+ * 「网关多编了一句话」这类问题就只是偶尔出现 —— 既复现不了，也没人相信它存在。
  *
  * 三处各自的不确定性来源不同，所以断言的对象也不同：
  *   入口 —— Map/Set 的迭代顺序（`requires` 是从 Map 里 collect 出来的）
@@ -16,12 +14,12 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
-import { readClientRequestForProtocol } from "../src/ingress/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/outbox/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
+import { readClientRequestForProtocol } from "../src/inbox/index.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { superviseUpstreamStream, DEFAULT_STREAM_POLICY } from "../src/ir/stream_guard.ts";
 import { IR_PROTOCOLS } from "../src/ir/types.ts";

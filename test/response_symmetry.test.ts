@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { assembleResponse, asResponsePart } from "../src/ir/response.ts";
-import { readAnthropicMessagesRequest } from "../src/ingress/index.ts";
+import { readAnthropicMessagesRequest } from "../src/inbox/index.ts";
 import type { IREvent, IRPart, IRTurn } from "../src/ir/types.ts";
 
 async function* streamOf(events: readonly IREvent[]): AsyncGenerator<IREvent> {

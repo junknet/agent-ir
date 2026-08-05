@@ -12,8 +12,8 @@
  *   - problem → repair 映射两侧分别用 `IR_BUILD_PROBLEM_KINDS` 与 `IR_REPAIR_KINDS` 枚举核对。
  */
 import { describe, expect, it } from "bun:test";
-import type { AnthropicOutboxOptions } from "../src/egress/anthropic.ts";
-import type { WindsurfOutboxOptions } from "../src/egress/windsurf/index.ts";
+import type { AnthropicOutboxOptions } from "../src/outbox/anthropic.ts";
+import type { WindsurfOutboxOptions } from "../src/outbox/windsurf/index.ts";
 import { OUTBOX_VARIABLE, readGatewayRuntimeSettings } from "../src/gateway/config.ts";
 import {
   OUTBOX_SELECTIONS, OUTBOX_NAMES,

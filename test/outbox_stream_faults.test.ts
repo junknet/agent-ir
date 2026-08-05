@@ -17,13 +17,13 @@
  */
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
-import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/egress/windsurf/connect_frame.ts";
-import { getSharedWindsurfSchema } from "../src/egress/windsurf/schema.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/outbox/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
+import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/outbox/windsurf/connect_frame.ts";
+import { getSharedWindsurfSchema } from "../src/outbox/windsurf/schema.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { superviseUpstreamStream } from "../src/ir/stream_guard.ts";
 import type { IROutbox, IREvent, IRWireBody } from "../src/ir/types.ts";
@@ -609,12 +609,12 @@ describe("红线：任何故障流都不许折出「没内容也没错误」的�
  * 就是这么写的）。异常穿过守卫意味着守卫维护的提交点状态在最需要它的那一刻失效，
  * 每个调用方都得自己重新实现一遍「我提交了没有」。
  *
- * 这两条曾经挂在「已知缺陷」下失败，但失败的是**夹具**不是实现：
- * `controller.error()` 会连同队列一起丢掉刚 enqueue 的前缀（见 `severed` 的注释），
- * 于是「提交后断连」这个场景根本没被构造出来 —— 读端在收到任何字节之前就拿到了异常。
+ * 构造这个场景要留意：`controller.error()` 会连同队列一起丢掉刚 enqueue 的前缀
+ * （见 `severed` 的注释），所以前缀与断连必须分两拍发，否则读端在收到任何字节之前
+ * 就拿到异常，测的就不是「提交后断连」了。
  */
 describe("传输层断连变成 error 事件，而不是异常", () => {
-  it("DEFECT-6 提交后断连：守卫补一条协议内的 error 事件收尾", async () => {
+  it("提交后断连：守卫补一条协议内的 error 事件收尾", async () => {
     const outbox = OUTBOX_FIXTURES[0]!;
     const prefix = sseLf(anthropicOk.slice(0, 4));
     const response = new Response(severed(prefix), {
@@ -625,7 +625,7 @@ describe("传输层断连变成 error 事件，而不是异常", () => {
     expect(events.at(-1)?.kind).toBe("error");
   });
 
-  it("DEFECT-6 提交前断连：同样应当是一条可重试的 error 事件", async () => {
+  it("提交前断连：同样应当是一条可重试的 error 事件", async () => {
     const outbox = OUTBOX_FIXTURES[0]!;
     const response = new Response(severed(null), {
       status: 200, headers: { "content-type": outbox.contentType },

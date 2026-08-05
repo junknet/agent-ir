@@ -65,4 +65,4 @@ const nonEmpty = (v: unknown): boolean =>
 **不能**：这里没有任何一条带 Claude Code 身份行的报文，也没有任何一条被拒的样本。
 因此「不改身份行会被拒」「改了就够」「上游是按身份行判的」三件事**全都是推断**。
 引用这份夹具时不许把它们写成实证 —— 相关取舍见
-`src/egress/windsurf/index.ts` 的 `WindsurfSystemIdentityPolicy`。
+`src/outbox/windsurf/index.ts` 的 `WindsurfSystemIdentityPolicy`。

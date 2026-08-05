@@ -9,7 +9,7 @@
  * 新增一种修复而不给用例，这个文件当场编译失败。
  */
 import { describe, expect, it } from "bun:test";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
@@ -209,7 +209,7 @@ const CASES: { readonly [K in IRRepairKind]: RepairCase } = {
       },
       // 目标根本不认识这个参数 → 填了只会凭空造出一条准入过不去的需求
       { request: irRequest({}), profile: NOTHING },
-      // DEFECT-10：目标**认识**它但**不要求**它 → 也不许填。认识 ≠ 要求。
+      // ：目标**认识**它但**不要求**它 → 也不许填。认识 ≠ 要求。
       { request: irRequest({}), profile: EVERYTHING },
     ],
   },
@@ -523,7 +523,7 @@ describe("defaultMaxOutputTokens", () => {
   });
 
   /**
-   * DEFECT-10 的单元级守卫：闸门问的是「目标**要求**这个字段吗」。
+   * 的单元级守卫：闸门问的是「目标**要求**这个字段吗」。
    * 只是**认识**它的目标（gemini 就是）一个 token 都不许被填。
    */
   it("does not fill a target that merely accepts the field", () => {

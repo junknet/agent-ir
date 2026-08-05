@@ -1,53 +1,53 @@
 /**
  * 两张注册表 —— 这套架构的全部对外面。
  *
- * `INGRESS_CODECS` 是**封闭**的：本网关支持的主流 Agent 对话协议固定为三种，补齐后
+ * `INBOX_CODECS` 是**封闭**的：本网关支持的主流 Agent 对话协议固定为三种，补齐后
  * 新增上游再也不需要碰它。
  *
  * `OUTBOX_REGISTRY` 是**开放**的：接 Gemini CloudCode、Windsurf Connect、Bedrock
  * 都只是往这里加一行（两个函数：writeOutboxRequest + readOutboxResponse），入口侧零改动，一次性多出三条路由。
  */
-import { createAnthropicOutbox, type AnthropicOutboxOptions } from "./egress/anthropic.ts";
-import { createCopilotOutbox, type CopilotOutboxOptions } from "./egress/copilot.ts";
-import { createGeminiCloudCodeOutbox, type GeminiCloudCodeOutboxOptions } from "./egress/gemini_cloudcode.ts";
-import { createOpenAIChatOutbox, type OpenAIChatOutboxOptions } from "./egress/openai_chat_completions.ts";
-import { createOpenAIResponsesOutbox, type OpenAIResponsesOutboxOptions } from "./egress/openai_responses.ts";
-import { createWindsurfOutbox, type WindsurfOutboxOptions } from "./egress/windsurf/index.ts";
-import { writeAnthropicResponse } from "./ingress/anthropic_encode.ts";
-import { readAnthropicMessagesRequest } from "./ingress/anthropic_messages.ts";
-import { readChatCompletionsRequest } from "./ingress/openai_chat_completions.ts";
-import { writeChatCompletionsResponse, writeResponsesResponse } from "./ingress/openai_encode.ts";
-import { readResponsesRequest } from "./ingress/openai_responses.ts";
+import { createAnthropicOutbox, type AnthropicOutboxOptions } from "./outbox/anthropic.ts";
+import { createCopilotOutbox, type CopilotOutboxOptions } from "./outbox/copilot.ts";
+import { createGeminiCloudCodeOutbox, type GeminiCloudCodeOutboxOptions } from "./outbox/gemini_cloudcode.ts";
+import { createOpenAIChatOutbox, type OpenAIChatOutboxOptions } from "./outbox/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox, type OpenAIResponsesOutboxOptions } from "./outbox/openai_responses.ts";
+import { createWindsurfOutbox, type WindsurfOutboxOptions } from "./outbox/windsurf/index.ts";
+import { writeAnthropicResponse } from "./inbox/anthropic_encode.ts";
+import { readAnthropicMessagesRequest } from "./inbox/anthropic_messages.ts";
+import { readChatCompletionsRequest } from "./inbox/openai_chat_completions.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "./inbox/openai_encode.ts";
+import { readResponsesRequest } from "./inbox/openai_responses.ts";
 import type {
-  IROutboxDescriptor, IROutboxRegistry, IRIngressCodec, IRIngressRegistry,
+  IROutboxDescriptor, IROutboxRegistry, IRInboxCodec, IRInboxRegistry,
 } from "./ir/codec.ts";
 import { IR_PROTOCOLS, type IRProtocol } from "./ir/types.ts";
 
 // ── 入口：封闭集，三个 ──────────────────────────────────────────────────────
 
-const anthropicMessages: IRIngressCodec = {
+const anthropicMessages: IRInboxCodec = {
   protocol: "anthropic_messages",
   readClientRequest: readAnthropicMessagesRequest,
   writeClientResponse: writeAnthropicResponse,
 };
 
-const openaiResponses: IRIngressCodec = {
+const openaiResponses: IRInboxCodec = {
   protocol: "openai_responses",
   readClientRequest: readResponsesRequest,
   writeClientResponse: writeResponsesResponse,
 };
 
-const openaiChatCompletions: IRIngressCodec = {
+const openaiChatCompletions: IRInboxCodec = {
   protocol: "openai_chat_completions",
   readClientRequest: readChatCompletionsRequest,
   writeClientResponse: writeChatCompletionsResponse,
 };
 
-export const INGRESS_CODECS = {
+export const INBOX_CODECS = {
   anthropic_messages: anthropicMessages,
   openai_responses: openaiResponses,
   openai_chat_completions: openaiChatCompletions,
-} as const satisfies IRIngressRegistry;
+} as const satisfies IRInboxRegistry;
 
 /**
  * 协议 → HTTP 入口路径。**唯一授权的那一份**，键由 `IRProtocol` 穷举：
@@ -55,7 +55,7 @@ export const INGRESS_CODECS = {
  *
  * 方向是「协议 → 路径」而不是反过来，正因为只有这个方向的键能被类型穷举。
  */
-export const INGRESS_PATH_BY_PROTOCOL = {
+export const INBOX_PATH_BY_PROTOCOL = {
   anthropic_messages: "/v1/messages",
   openai_responses: "/v1/responses",
   openai_chat_completions: "/v1/chat/completions",
@@ -67,8 +67,8 @@ export const INGRESS_PATH_BY_PROTOCOL = {
  * 反转唯一挡不住的漂移是「两个协议填了同一个路径」——那会让其中一个协议静默不可达。
  * 类型系统表达不了这个（值相等不可判），所以 codec_coverage 里有一条枚举两侧的往返测试兜它。
  */
-export const INGRESS_PATHS: Readonly<Record<string, IRProtocol>> = Object.fromEntries(
-  IR_PROTOCOLS.map((protocol) => [INGRESS_PATH_BY_PROTOCOL[protocol], protocol] as const),
+export const INBOX_PATHS: Readonly<Record<string, IRProtocol>> = Object.fromEntries(
+  IR_PROTOCOLS.map((protocol) => [INBOX_PATH_BY_PROTOCOL[protocol], protocol] as const),
 );
 
 // ── 出口：开放集，当前一家 ──────────────────────────────────────────────────

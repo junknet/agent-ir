@@ -20,9 +20,9 @@
  *    八个家族（FDS 里 `exa.codeium_common_pb.Model` 共 334 个枚举值），模型只是
  *    `chat_model_uid` 一个字符串字段。所以**只有一份实现，不按家族分支**。
  *
- * 5. **抓包证伪了一条流传很广的说法。** 「大体量 agent 脚手架会被 Windsurf 的内容分类器拒」
- *    不成立：20945 / 21599 / 21593 字符的 system prompt 加 23 个工具定义，12 条全部 200。
- *    真正被这些字节钉住的差异是**客户端身份行**（见 `WindsurfSystemIdentityPolicy`）。
+ * 5. **wire 之外还有一层内容策略。** 请求编译得完全合法也可能被整条拒（HTTP 200，错误在
+ *    Connect 尾帧）。判据是具体段落，与体量无关：21KB 的 system prompt 加 23 个工具定义
+ *    正常放行。处置见 `WindsurfSystemIdentityPolicy`。
  *
  * wire 知识全部来自真实收发过的字节，不凭印象：
  *   - `test/fixtures/windsurf_capture/` —— **12 条真实 GetChatMessage 请求字节**（mitmproxy 抓自
@@ -30,11 +30,11 @@
  *     135 个 `ChatMessagePrompt`、4 个 `chat_model_uid`（kimi-k3-high / swe-1-6-fast /
  *     gpt-5-6-terra-high / gemini-3-6-flash-high）、11/12 条带 23 个工具定义。
  *     **12 条全部得到上游 HTTP 200**（抓包侧记录，不是这些字节自身能证明的）。
- *     断言锁在 `test/egress_windsurf.test.ts` 的「抓包：…」几个 describe 里。
+ *     断言锁在 `test/outbox_windsurf.test.ts` 的「抓包：…」几个 describe 里。
  *   - `cc_proxy_unified/packages/windsurf_protocol/src/{messages,connect_frame,schema_registry}.ts`
  *   - `cc_proxy_unified/packages/relay/src/windsurf_messages_relay.ts`（踩坑记录）
  *   - `cc_proxy_unified/packages/relay_core/src/{messages_failure_policy,upstream_application_error}.ts`
- *   - `src/egress/windsurf/windsurf_exa.fds.pb` 的字段/枚举实测（本文件的字段存在性判断全部来自它）
+ *   - `src/outbox/windsurf/windsurf_exa.fds.pb` 的字段/枚举实测（本文件的字段存在性判断全部来自它）
  */
 import { createHash } from "node:crypto";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -107,7 +107,7 @@ const SUPPORTED = [
   // (A) `ChatMessagePrompt.thinking`。**这条是本次升级的主项**，双向都有实证：
   //     出站——抓包 39/135 个回合回传非空 thinking（最早见 getchatmessage_027），全部 200；
   //     回读——响应侧 `delta_thinking` 在抓包的 2107 帧里出现 850 次。
-  //     原注释「生产从不读写它，上游是否真把它当推理块消费未经实证」已被证伪。
+  //     上游确实把它当推理块消费：请求侧回传、响应侧流回，两个方向都有实证。
   //     ⚠ 仍然为真的两件事，各自另有 loss，不影响本条：
   //       1. 请求侧**没有**任何「开/关思考」的开关（mode/display 无对应字段）；
   //       2. `delta_thinking` 不是跨家族普遍事实 —— 抓包里 gemini-3-6-flash-high 上是 0 次，
@@ -319,51 +319,26 @@ export interface WindsurfSystemIdentityRule {
  * Windsurf 对**客户端身份**的策略限制。这是供应商私有事实，按 ARCHITECTURE §2.1 只住在
  * 这个出口里：不做通用 repair、不进 `IROutboxProfile`、不加全局枚举。
  *
- * ## 抓包证明了什么
+ * ## 判据：三段会被拒，其余放行
  *
- * 证伪了「关键词密度 / 体量触发内容分类器」这个流传的理由：20945–21599 字符的 agent 脚手架
- * 加 23 个工具定义，12 条全部 200。生产 cc_proxy 里「识别到 Claude Code 就把整个 system
- * 塌缩成中性提示」所依据的那条理由不成立。
+ * 依据两处实测 —— `test/fixtures/windsurf_capture/` 的 12 条真实报文（21KB agent system
+ * prompt + 23 个工具，全部 200），以及 2026-08-05 对 `server.codeium.com` 的逐段实验
+ * （模型 claude-opus-4-6，Claude Code 2.1.221 的 9929 字符 system 切成 12 段逐个发）。
  *
- * 被这 12 条字节钉住的唯一差异是**身份行**：真实客户端 12/12 条第一行都是
- * `WINDSURF_OBSERVED_IDENTITY_LINE`，而 Claude Code 送的是
- * `You are Claude Code, Anthropic's official CLI for Claude.`。
- *
- * ## 打真实上游二分出来的结果（2026-08-05，`server.codeium.com`，模型 claude-opus-4-6）
- *
- * 拿 Claude Code 2.1.221 的真实 system（4 块共 9929 字符）逐段发真实上游，
- * **9929 字符里只有 3 段会被拒，其余 8 段（8507 字符）全部放行**：
- *
- * | 段 | 字符 | 结果 |
+ * | 段 | 字符 | 上游反应 |
  * |---|---|---|
- * | 块0 `x-anthropic-billing-header:` | 81 | 放行 |
- * | **块1 `You are Claude Code, …`** | **57** | **拒：`an internal error occurred`** |
- * | 块2 首句 `You are an interactive agent…` | 79 | 放行 |
- * | **块2 `IMPORTANT: Assist with authorized security testing…`** | **459** | **拒：`blocked by our content policy`** |
- * | 块2 `# Harness` | 668 | 放行 |
- * | 块3 `Write code that reads like…` | 976 | 放行 |
- * | 块3 `# Session-specific guidance` | 922 | 放行 |
- * | **块3 `# Environment`** | **973** | **拒：`blocked by our content policy`** |
- * | 块3 `# Scratchpad Directory` | 762 | 放行 |
- * | 块3 `# Context management` | 560 | 放行 |
- * | 块3 `# Delivering work` | 2018 | 放行 |
- * | 块3 `# Corrections` | 2364 | 放行 |
+ * | **`You are Claude Code, …`** | **57** | `an internal error occurred` |
+ * | **`IMPORTANT: Assist with authorized security testing…`** | **459** | `blocked by our content policy` |
+ * | **`# Environment`** | **973** | `blocked by our content policy` |
+ * | 其余 9 段（计费头 / `# Harness` / `# Delivering work` / `# Corrections` …） | 8507 | 放行 |
  *
- * **两套机制，错误信息把它们分开了**：身份行触发的是泛化 `an internal error occurred`，
- * 正文段触发的是明确的 `blocked by our content policy`。因此两者都要处理，缺一不可 ——
- * 实测组合：
+ * **错误信息区分两套机制**：身份行给泛化 `permission_denied`，正文段给明确的 content policy。
+ * 两者独立，必须同时处理 —— 实测只动其中一边仍然被拒（只换身份行 → 错误变成 content policy；
+ * 只摘正文两段、保留身份行 → 仍是泛化拒绝）。摘 3 段 + 换身份行 → 200，
+ * 带 12 个真实 Claude Code 工具也是 200。
  *
- *   - 原样送            → 拒（泛化）
- *   - **只**换身份行     → 拒，且错误变成 content policy（身份修好了，正文接着命中）
- *   - prepend 身份行     → 拒（泛化，因为 CC 身份行还在）
- *   - 只摘正文两段、保留 CC 身份行 → 拒（泛化）
- *   - **摘 3 段 + 换身份行** → **200**，带 12 个真实 Claude Code 工具也是 **200**
- *
- * 所以「体量/关键词密度」这个旧说法方向对但描述错：不是累积密度，是**三个具体段落**。
- * 而生产那套「整体塌缩成中性提示」虽然能过，代价是客户端指令 **0% 存活**；
- * 这里只摘 3 段，**85.7% 存活**。这正是「尽量让用户能用、不硬 ban」该有的做法。
- *
- * 不接受任何改写的调用方显式传 `{ kind: "passthrough" }`，一步都不做。
+ * 客户端指令因此存活 **85.7%**（8507/9929）。不接受任何改写的调用方传
+ * `{ kind: "passthrough" }`，一步都不做。
  *
  * ## 为什么不是「只替换」：替换会静默失效
  *
@@ -1653,7 +1628,7 @@ async function* liftWindsurfStream(
   }
 
   if (terminal === null) {
-    // 一个结束帧都没等到 = 连接被掐断。此前照样 messageStop 的话，
+    // 一个结束帧都没等到 = 连接被掐断。这里必须显式终止，否则
     // 客户端看到的是一段截断内容加一个正常收尾，与「模型说完了」不可区分。
     yield {
       kind: "error",

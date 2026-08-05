@@ -10,11 +10,11 @@
  * 以及「没等到 finishReason」是否**必然**变成 error 而不是一个安静的空成功。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
 import {
   clearThoughtSignatureCache, createGeminiCloudCodeOutbox,
-} from "../src/egress/gemini_cloudcode.ts";
-import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+} from "../src/outbox/gemini_cloudcode.ts";
+import { createOpenAIChatOutbox } from "../src/outbox/openai_chat_completions.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
@@ -605,7 +605,7 @@ describe("lower：IR → v1internal wire", () => {
     expect(second.losses).toEqual(first.losses);
   });
 
-  it("effort 在这里换算成 thinkingBudget（IR 不在 ingress 互转），并留痕", async () => {
+  it("effort 在这里换算成 thinkingBudget（IR 不在 inbox 互转），并留痕", async () => {
     const result = await compiled(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       intent: intent({ reasoning: clientValue({ mode: "enabled", effort: "high", display: "summarized" }) }),

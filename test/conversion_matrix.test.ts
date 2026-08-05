@@ -6,11 +6,11 @@
  * Windsurf Connect 三个目标 independently lower。全程不发网络请求。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
-import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
+import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
-import { INGRESS_CODECS } from "../src/protocols.ts";
+import { INBOX_CODECS } from "../src/protocols.ts";
 import { IR_PROTOCOLS, type IRProtocol, type IROutbox } from "../src/ir/types.ts";
 
 const samples: Record<IRProtocol, unknown> = {
@@ -47,7 +47,7 @@ describe("三入口 × Anthropic / Responses / Windsurf 编译矩阵", () => {
   for (const protocol of IR_PROTOCOLS) {
     for (const [targetName, outbox] of Object.entries(targets)) {
       it(`${protocol} -> ${targetName}`, async () => {
-        const { request } = INGRESS_CODECS[protocol].readClientRequest(
+        const { request } = INBOX_CODECS[protocol].readClientRequest(
           samples[protocol], `matrix-${protocol}-${targetName}`,
         );
         const verdict = checkOutboxSupport(request, outbox.profile);

@@ -17,9 +17,9 @@
  * 不复制那些断言。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
-import { createGeminiCloudCodeOutbox } from "../src/egress/gemini_cloudcode.ts";
-import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createAnthropicOutbox } from "../src/outbox/anthropic.ts";
+import { createGeminiCloudCodeOutbox } from "../src/outbox/gemini_cloudcode.ts";
+import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { IR_BUILD_PROBLEM_KINDS, clientValue, defaultValue } from "../src/ir/types.ts";
 import type {

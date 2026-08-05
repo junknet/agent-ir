@@ -541,7 +541,7 @@ function lowerContents(request: IRRequest, ctx: LowerContext): GeminiContent[] {
 }
 
 /**
- * effort → thinkingBudget。IR 明确不在 ingress 互转，换算发生在这里并留痕。
+ * effort → thinkingBudget。IR 明确不在 inbox 互转，换算发生在这里并留痕。
  *
  * 键是 `IREffort` 而不是 `string`（另外两个出口的 EFFORT_WIRE 一直是这么写的）：
  * 开着 string 键时，新增一档 effort 会落进读取处的 `?? 4000` 默认值，还照样记一条
@@ -1318,7 +1318,7 @@ async function* liftGeminiStream(
   }
 
   // Gemini 流的终止信号就是 candidate.finishReason，没有 message_stop 这类终止帧。
-  // 一个都没等到 = 流被掐断。此前照样收尾的话，客户端看到的是「200 但空」，
+  // 一个都没等到 = 流被掐断。这里必须显式终止，否则客户端看到的是「200 但空」，
   // 与「模型没话说」不可区分，只能盲重试到 retry cap。
   if (state.finishReason === null) {
     yield {

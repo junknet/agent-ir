@@ -13,9 +13,9 @@
  * SDK 把 `content` 序列化成数字、代理把 `messages` 包了一层、重放工具历史时 id 撞车。
  */
 import { describe, expect, it } from "bun:test";
-import { readAnthropicMessagesRequest } from "../src/ingress/anthropic_messages.ts";
-import { readChatCompletionsRequest } from "../src/ingress/openai_chat_completions.ts";
-import { readResponsesRequest } from "../src/ingress/openai_responses.ts";
+import { readAnthropicMessagesRequest } from "../src/inbox/anthropic_messages.ts";
+import { readChatCompletionsRequest } from "../src/inbox/openai_chat_completions.ts";
+import { readResponsesRequest } from "../src/inbox/openai_responses.ts";
 import { IR_LOSS_KINDS, IR_PROTOCOLS } from "../src/ir/types.ts";
 import type { ClientRequestReadResult, IRPart, IRProtocol, IRRequest } from "../src/ir/types.ts";
 
@@ -545,7 +545,7 @@ describe("深层嵌套", () => {
         messages: [{ role: "user", content: [nestedToolResult(20_000)] }],
       }, "tr_deep");
     } catch (error) { thrown = error; }
-    // 现状：入口对递归深度不设限，畸形深度以 RangeError 逃逸。见报告 DEFECT-5。
+    // 现状：入口对递归深度不设限，畸形深度以 RangeError 逃逸。见报告 。
     expect(thrown).toBeInstanceOf(RangeError);
   });
 
@@ -676,7 +676,7 @@ describe("数值字段畸形", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 回归守卫 —— 以下曾是真实缺陷（DEFECT-1），已修复。用例原样保留：
+// 回归守卫 —— 以下曾是真实缺陷（），已修复。用例原样保留：
 // 它们断言的是**应有行为**，谁把 loss 记录去掉，谁就是让静默丢弃复发。
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -690,50 +690,50 @@ describe("数值字段畸形", () => {
  *
  * **已修**：每条 `?? 默认值` 分支上都补了 `losses.record({...})`。
  */
-describe("[守卫] 形状不对时换成空值，但必须留痕", () => {
-  it("DEFECT-1a anthropic：messages 不是数组 → 整段会话消失，应记一条 loss", () => {
+describe("形状不对时换成空值，但必须留痕", () => {
+  it("anthropic：messages 不是数组 → 整段会话消失，应记一条 loss", () => {
     const { losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: { role: "user", content: "ping" },
     }, "tr_d1");
     expect(losses.length).toBeGreaterThan(0);
   });
 
-  it("DEFECT-1b chat：messages 不是数组 → 同上", () => {
+  it("chat：messages 不是数组 → 同上", () => {
     const { losses } = readChatCompletionsRequest({
       model: "m", messages: { role: "user", content: "ping" },
     }, "tr_d1");
     expect(losses.length).toBeGreaterThan(0);
   });
 
-  it("DEFECT-1c responses：input 既不是数组也不是字符串 → 同上", () => {
+  it("responses：input 既不是数组也不是字符串 → 同上", () => {
     const { losses } = readResponsesRequest({
       model: "m", input: { type: "message", role: "user", content: "ping" },
     }, "tr_d1");
     expect(losses.length).toBeGreaterThan(0);
   });
 
-  it("DEFECT-1d 三个协议：tools 不是数组 → 整个工具集消失，应记一条 loss", () => {
+  it("三个协议：tools 不是数组 → 整个工具集消失，应记一条 loss", () => {
     for (const protocol of IR_PROTOCOLS) {
       const { losses } = READERS[protocol]({ ...MINIMAL[protocol], tools: { name: "read" } }, "tr_d1");
       expect(losses.length).toBeGreaterThan(0);
     }
   });
 
-  it("DEFECT-1e chat：tool_calls 不是数组 → 整段工具调用消失，应记一条 loss", () => {
+  it("chat：tool_calls 不是数组 → 整段工具调用消失，应记一条 loss", () => {
     const { losses } = readChatCompletionsRequest({
       model: "m", messages: [{ role: "assistant", content: "", tool_calls: { id: "call_1" } }],
     }, "tr_d1");
     expect(losses.length).toBeGreaterThan(0);
   });
 
-  it("DEFECT-2 anthropic：text 块的 text 不是字符串 → 内容被换成 \"\"，应记一条 loss", () => {
+  it("anthropic：text 块的 text 不是字符串 → 内容被换成 \"\"，应记一条 loss", () => {
     const { losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8, messages: [{ role: "user", content: [{ type: "text", text: 42 }] }],
     }, "tr_d2");
     expect(losses.length).toBeGreaterThan(0);
   });
 
-  it("DEFECT-3 chat：function.parameters 不是对象 → 降级成 freeform，应像另两个协议一样记 degraded", () => {
+  it("chat：function.parameters 不是对象 → 降级成 freeform，应像另两个协议一样记 degraded", () => {
     const { losses } = readChatCompletionsRequest({
       ...MINIMAL.openai_chat_completions,
       tools: [{ type: "function", function: { name: "read", parameters: "a string" } }],
@@ -741,7 +741,7 @@ describe("[守卫] 形状不对时换成空值，但必须留痕", () => {
     expect(losses.some((loss) => loss.kind === "degraded")).toBe(true);
   });
 
-  it("DEFECT-4 anthropic：tool_use.input 不是对象 → 参数被换成 {}，应记一条 loss", () => {
+  it("anthropic：tool_use.input 不是对象 → 参数被换成 {}，应记一条 loss", () => {
     const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{

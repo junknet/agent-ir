@@ -1,4 +1,4 @@
-/** 三个 ingress 共用的原语。任何解析歧义都在这里裁决一次，不许各入口各写一套。 */
+/** 三个 inbox 共用的原语。任何解析歧义都在这里裁决一次，不许各入口各写一套。 */
 import { IR_EFFORTS } from "../ir/types.ts";
 import type {
   IRBlob, IRCacheBreakpoint, IREffort, IRLoss, IRPart, IRProtocol, IRSessionIdentity,
