@@ -1331,10 +1331,8 @@ const CLAUDE_CODE_SYSTEM: readonly IRPart[] = [
   { kind: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
   { kind: "text", text: "\nYou are an interactive agent that helps users with software engineering tasks." },
 ];
-
-describe("客户端身份行：windsurf 私有策略，默认做最轻的那一档改动", () => {
+describe("客户端身份行：windsurf 私有策略，强制身份行为第一行", () => {
   it("抓包 12/12 条的 system 首行就是 WINDSURF_OBSERVED_IDENTITY_LINE", () => {
-    // 默认替换目标不是编的，是这 12 条字节里唯一一致的那一行。
     const devinRequests = CAPTURES.filter(({ message }) =>
       (message.prompt as string).startsWith("You are "));
     expect(devinRequests.filter(({ message }) =>
@@ -1343,33 +1341,34 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
     // 第 12 条是「生成会话标题」的短 system，没有身份行 —— 如实记下来，不假装 12/12。
     expect(CAPTURES.find(({ file }) => file === "getchatmessage_020.pb")?.message.prompt)
       .toStartWith("You are a session title generator.");
-    // 带 agent 脚手架的那 11 条：system 两万字符 + 23 个工具，全部 200。
     for (const { message } of devinRequests.filter(({ message }) => (message.tools as any[]).length > 0)) {
       expect((message.prompt as string).length).toBeGreaterThan(20000);
       expect((message.tools as any[]).length).toBe(23);
     }
   });
 
-  it("默认策略只换身份行那一行，其余 system 一字不动，并记一条 substituted", async () => {
+  /**
+   * 后置条件，**不依赖锚点命中**：非空 system 出站后第 0 行一定是身份行。
+   *
+   * 这是「删 + 强制前置」相对「就地替换」的全部价值：纯替换在锚点漂掉时会静默什么都不做，
+   * 出站带着外来身份行上去，症状是「忽然每条都被拒」而代码里一处报错都没有。
+   */
+  it("默认策略：身份行强制第一行，CC 身份行被删，其余 system 一字不动", async () => {
     const result = await outbox.writeOutboxRequest(request({
       system: CLAUDE_CODE_SYSTEM,
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
     }));
-    const decoded = decodeWire(result);
-    expect(decoded.prompt).toBe([
-      "x-anthropic-billing-header: cc_version=2.1.221.ebe; cc_entrypoint=cli;",
-      WINDSURF_OBSERVED_IDENTITY_LINE,
-      "\nYou are an interactive agent that helps users with software engineering tasks.",
-    ].join("\n\n"));
-    // 关键：**不是**把整个 system 塌缩成中性提示 —— 用户的指令全都还在。
-    expect(decoded.prompt).toContain("interactive agent that helps users with software engineering tasks");
-    expect(decoded.prompt).toContain("x-anthropic-billing-header");
-    expect(decoded.prompt).not.toContain("Claude Code");
+    const prompt = decodeWire(result).prompt as string;
+    // 位置是强制的：真实客户端身份行就在第 0 行，就地替换会把它落在计费头之后。
+    expect(prompt.split("\n")[0]).toBe(WINDSURF_OBSERVED_IDENTITY_LINE);
+    expect(prompt).not.toContain("You are Claude Code");
+    // **不是**把整个 system 塌缩成中性提示 —— 用户的指令全都还在。
+    expect(prompt).toContain("x-anthropic-billing-header");
+    expect(prompt).toContain("interactive agent that helps users with software engineering tasks");
 
     const loss = expectOk(result).losses.find((one) => one.path === "$.conversation.system");
     expect(loss?.kind).toBe("substituted");
-    // 这条改写现在有真实上游实测背书（见 WindsurfSystemIdentityPolicy 的二分表），
-    // loss 必须说清楚依据，并给出退出口。
+    expect(loss?.detail).toContain("第一行");
     expect(loss?.detail).toContain("实测");
     expect(loss?.detail).toContain("passthrough");
   });
@@ -1388,32 +1387,22 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
     expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
   });
 
-  /**
-   * 这一组锁的是**后置条件**，不是「尝试替换」：
-   * 非空 system 过完这条策略，文本里一定含有 `identityLine`。
-   *
-   * 纯替换的失败模式是静默的 —— 锚点漂一个字就什么都不做，出站带着外来身份行上去，
-   * 代码里没有一处报错。prepend 兜底把「没命中」从静默失效变成一条**看得见的降级**。
-   */
-  it("锚点没命中 → prepend 到最前面，绝不静默什么都不做", async () => {
-    const notMatching = await outbox.writeOutboxRequest(request({
+  it("锚点一条都没命中 → 身份行照样是第一行，客户端原文一字不动地跟在后面", async () => {
+    const result = await outbox.writeOutboxRequest(request({
       // 提到了 Claude Code，但不是那一行身份行 —— 判据是整行精确相等，不是子串。
       system: [{ kind: "text", text: "The user is running Claude Code, Anthropic's official CLI for Claude, in a terminal." }],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
     }));
-    const prompt = decodeWire(notMatching).prompt as string;
-    // 后置条件：身份行在，而且在最前面。
-    expect(prompt.split("\n")[0]).toBe(WINDSURF_OBSERVED_IDENTITY_LINE);
-    // 客户端原文一字未动地跟在后面。
-    expect(prompt).toContain("The user is running Claude Code, Anthropic's official CLI for Claude, in a terminal.");
-
-    const loss = expectOk(notMatching).losses.find((one) => one.path === "$.conversation.system");
-    expect(loss?.kind).toBe("substituted");
-    // 走的是哪条路必须写在 detail 里，否则排障时分不清「换了」和「补了」。
-    expect(loss?.detail).toContain("prepend");
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt).toBe(
+      `${WINDSURF_OBSERVED_IDENTITY_LINE}\n\n`
+      + "The user is running Claude Code, Anthropic's official CLI for Claude, in a terminal.",
+    );
+    const loss = expectOk(result).losses.find((one) => one.path === "$.conversation.system");
+    expect(loss?.detail).toContain("一行都没删");
   });
 
-  it("身份行已经在了 → 一个字节都不动（幂等，多轮不会越堆越长）", async () => {
+  it("本来就合规 → 一个字节都不动（幂等，多轮不会越堆越长）", async () => {
     const devin = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: `${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.` }],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
@@ -1421,16 +1410,30 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
     expect(decodeWire(devin).prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.`);
     expect(expectOk(devin).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
 
-    // 身份行不在首行时同样算「已经在了」—— 判据是存在，不是位置。
-    const buried = await outbox.writeOutboxRequest(request({
+    // 两次过同一条策略，结果逐字节相同 —— 身份行不会越堆越多。
+    const once = decodeWire(await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: "plain instructions" }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }))).prompt as string;
+    const twice = decodeWire(await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: once }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }))).prompt as string;
+    expect(twice).toBe(once);
+  });
+
+  it("身份行埋在中间 → 提到第一行，不留下第二条", async () => {
+    const result = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: `preamble\n${WINDSURF_OBSERVED_IDENTITY_LINE}\ntail` }],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
     }));
-    expect(decodeWire(buried).prompt).toBe(`preamble\n${WINDSURF_OBSERVED_IDENTITY_LINE}\ntail`);
-    expect(expectOk(buried).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\npreamble\ntail`);
+    // 全文只有一条身份行。
+    expect(prompt.split("\n").filter((line) => line === WINDSURF_OBSERVED_IDENTITY_LINE)).toHaveLength(1);
   });
 
-  it("空 system 是故意的例外：不 prepend，因为那是凭空发明客户端没写过的指令", async () => {
+  it("空 system 是故意的例外：不补身份行，因为那是凭空发明客户端没写过的指令", async () => {
     const empty = await outbox.writeOutboxRequest(request({
       system: [],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
@@ -1439,7 +1442,25 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
     expect(expectOk(empty).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
   });
 
-  it("调用方可以自定身份行与被取代清单；替换一次请求最多动一行", async () => {
+  it("多条外来身份行一次删干净", async () => {
+    const result = await outbox.writeOutboxRequest(request({
+      system: [
+        { kind: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { kind: "text", text: "keep me" },
+        { kind: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+      ],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt.split("\n")[0]).toBe(WINDSURF_OBSERVED_IDENTITY_LINE);
+    expect(prompt).toContain("keep me");
+    expect(prompt).not.toContain("You are Claude Code");
+    expect(prompt).not.toContain("Claude Agent SDK");
+    expect(expectOk(result).losses.find((one) => one.path === "$.conversation.system")?.detail)
+      .toContain("删掉 2 条外来身份行");
+  });
+
+  it("调用方可以自定身份行与被取代清单", async () => {
     const custom = createWindsurfOutbox({
       model: "claude-opus-4-8-high",
       apiKey: "devin-session-token$h.e.sig",
@@ -1454,12 +1475,10 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
       system: [{ kind: "text", text: "I am robot.\nkeep\nI am robot." }],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
     }));
-    // 只换第一处：第二处原样留着，改动有确定上界。
-    expect(decodeWire(result).prompt).toBe("I am human.\nkeep\nI am robot.");
-    expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system")).toHaveLength(1);
+    // 两条都删掉，身份行统一在第一行 —— 没有「只换第一处」这种半吊子状态。
+    expect(decodeWire(result).prompt).toBe("I am human.\n\nkeep");
 
-    // 换了自定清单之后，Claude Code 那一行不再是「被取代」的对象 —— 于是走 prepend，
-    // 而不是像纯替换实现那样什么都不做。
+    // 换了自定清单之后，Claude Code 那一行不再是「被取代」的对象，但身份行照样在第一行。
     const other = await custom.writeOutboxRequest(request({
       system: CLAUDE_CODE_SYSTEM,
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
@@ -1469,15 +1488,16 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
     expect(otherPrompt).toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 
-  it("Claude Agent SDK 的身份行也在默认被取代清单里", async () => {
-    const sdk = await outbox.writeOutboxRequest(request({
-      system: [{ kind: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nDo the thing." }],
+
+  it("空 system 是故意的例外：不 prepend，因为那是凭空发明客户端没写过的指令", async () => {
+    const empty = await outbox.writeOutboxRequest(request({
+      system: [],
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
     }));
-    expect(decodeWire(sdk).prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.`);
-    expect(expectOk(sdk).losses.find((one) => one.path === "$.conversation.system")?.detail)
-      .toContain("整行换成");
+    expect(decodeWire(empty).prompt).toBe("");
+    expect(expectOk(empty).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
   });
+
 
   it("反例：这条特化**只**属于 windsurf，同一条 IR 走 anthropic 出口一个字都不变", async () => {
     const irRequest = request({

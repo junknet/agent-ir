@@ -371,23 +371,26 @@ export interface WindsurfSystemIdentityRule {
  * 出站于是带着**原样的外来身份行**上去 —— 症状是「忽然每条请求都被拒」，而代码里
  * 没有任何一处报错，因为「没命中」和「不需要改」在纯替换的实现里是同一个返回值。
  *
- * 所以这条策略的契约不是「尝试替换」，而是一条**后置条件**：
+ * 所以这条策略的契约不是「尝试替换」，而是一条**不依赖锚点命中**的后置条件：
  *
- *   > 只要客户端给了非空 system，改写之后这段文本里**一定**含有 `identityLine`。
+ *   > 只要客户端给了非空 system，出站文本的**第 0 行一定是** `identityLine`。
  *
- * 两条路达成它，命中与否都不会「什么都没做」：
+ * 实现是「删 + 强制前置」而不是「就地替换」：
  *
- *   1. **命中**已知外来身份行 → 整行换掉。首选这条，因为它顺带**移走**了那行外来身份，
- *      不会留下两个互相矛盾的自我描述。
- *   2. **没命中** → 把 `identityLine` 直接 prepend 到最前面，原文一字不动地跟在后面。
- *      锚点漂了也照样有身份行，代价是客户端原来那句自我描述还留在下面。
+ *   - `supersededLines` 里的行**删掉**（不留下互相矛盾的第二个自我描述）；
+ *   - 然后无条件把 `identityLine` 放到第 0 行。
+ *
+ * 于是「有没有命中锚点」只决定要不要多删几行，**不决定身份行在不在**。锚点漂了最多是
+ * 客户端自己那句自我描述留在原文里，身份行照样是第一行 —— 这正是纯替换做不到的。
+ * 位置也是强制的：Claude Code 的第一块是 `x-anthropic-billing-header: …`，就地替换会让
+ * 身份行落在计费头之后，而真实客户端的身份行是第 0 行，没必要留着这个可观察差异。
  *
  * 空 system 是**故意的例外**：没有外来身份行要纠正，也没有客户端指令要保护，
- * 这时 prepend 等于凭空发明一段客户端从没写过的系统提示词。按 AGENTS.md「Core 不发明内容」，
+ * 这时补一行等于凭空发明一段客户端从没写过的系统提示词。按 AGENTS.md「Core 不发明内容」，
  * 这一档保持不动。（真实客户端 12/12 条都带 system，这条路在实践中不会走到。）
  *
- * 无论走哪一档，只要真的改了字节就必然产出一条 `substituted` 的 `IRLoss`，
- * 且 detail 里写明走的是替换还是 prepend：Core 不静默改写。
+ * 只要真的改了字节就必然产出一条 `substituted` 的 `IRLoss`，detail 里写明删了哪几行：
+ * Core 不静默改写。
  */
 export type WindsurfSystemIdentityPolicy =
   | { readonly kind: "passthrough" }
@@ -428,10 +431,11 @@ export const WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY: WindsurfSystemIdentityPoli
   ],
 };
 
-/** 身份行这一步实际走了哪条路。`null` = 身份行没动。 */
-export type WindsurfIdentityOutcome =
-  | { readonly kind: "replaced"; readonly supersededLine: string }
-  | { readonly kind: "prepended" };
+/** 身份行这一步做了什么。`null` = 一个字节都没动（本来就合规）。 */
+export interface WindsurfIdentityOutcome {
+  /** 被删掉的外来身份行。可能不止一条（客户端把身份重复写在多个 system 块里）。 */
+  readonly supersededRemoved: readonly string[];
+}
 
 /** 被摘掉的一段。`prefix` 是命中的那条前缀，用来在 loss 里指认「为什么摘」。 */
 export interface WindsurfDroppedSegment {
@@ -461,34 +465,51 @@ function dropWindsurfBlockedSegments(
 }
 
 /**
- * 保证 `identityLine` 出现在合并后的 system 文本里。
+ * 强制让 `identityLine` 成为 system 的**第一行**，并删掉文中所有已知的外来身份行。
  *
- * 按行扫而不是只看第 0 行：Claude Code 的 system 是分块的，身份行是**第二块**
- * （第一块是 `x-anthropic-billing-header: …`），合并成一个字符串后它不在首行。
- * 只处理第一处命中，让「改了多少」有确定上界 —— 一次请求最多动一行。
+ * 后置条件只有一条，且不依赖任何锚点命中：
  *
- * 已经含有 `identityLine` 的文本原样返回（`null`）：重复 prepend 会在多轮里越堆越多。
+ *   > 只要客户端给了非空 system，出站文本的第 0 行**一定**是 `identityLine`。
+ *
+ * 位置是强制的而不是「就地替换」，因为就地替换会把身份行留在它碰巧所在的地方 ——
+ * Claude Code 的第一块是 `x-anthropic-billing-header: …`，替换完身份行就落在计费头**之后**，
+ * 而真实客户端的身份行是第 0 行。位置本身是可观察差异，没必要留着不一致。
+ *
+ * `supersededLines` 里的行**删掉**而不是替换：删掉之后统一在最前面补一行，
+ * 于是「有没有命中」不再影响结果形状 —— 命中只决定要不要多删几行，不决定身份行在不在。
+ * 锚点漂了最多是原文里多留一句客户端自己的自我描述，身份行照样在第一行。
+ *
+ * 幂等：已经是第一行、且文中没有别的外来身份行时原样返回，多轮不会越堆越长。
+ *
+ * 空 system 是故意的例外：没有外来身份要纠正，也没有客户端指令要保护，
+ * 这时补一行等于凭空发明客户端从没写过的系统提示词。
  */
-function ensureWindsurfIdentityLine(
+function ensureWindsurfLeadingIdentityLine(
   systemText: string,
   policy: WindsurfSystemIdentityPolicy,
 ): { readonly text: string; readonly outcome: WindsurfIdentityOutcome | null } {
-  // 空 system 不 prepend —— 那会凭空发明客户端没写过的指令，见上面的文档注释。
   if (policy.kind === "passthrough" || systemText.length === 0) {
     return { text: systemText, outcome: null };
   }
   const lines = systemText.split("\n");
-  // 幂等：身份行已经在了就什么都不做，否则同一段 system 反复过这条策略会越堆越长。
-  if (lines.includes(policy.identityLine)) return { text: systemText, outcome: null };
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line === undefined || !policy.supersededLines.includes(line)) continue;
-    lines[index] = policy.identityLine;
-    return { text: lines.join("\n"), outcome: { kind: "replaced", supersededLine: line } };
+  const supersededRemoved: string[] = [];
+  const body: string[] = [];
+  for (const line of lines) {
+    if (policy.supersededLines.includes(line)) { supersededRemoved.push(line); continue; }
+    // 文中别处的同一行身份行也摘出来，稍后统一放回第 0 行，避免出现两条。
+    if (line === policy.identityLine) continue;
+    body.push(line);
   }
-  // 没命中任何已知身份行 —— 补一行而不是放弃，见「替换会静默失效」那一段。
-  return { text: `${policy.identityLine}\n\n${systemText}`, outcome: { kind: "prepended" } };
+  // 本来就合规：第 0 行是身份行、全文没有第二条、也没有外来身份行要删。
+  if (lines[0] === policy.identityLine
+    && supersededRemoved.length === 0
+    && lines.indexOf(policy.identityLine, 1) === -1) {
+    return { text: systemText, outcome: null };
+  }
+  // 删完之后前导空行没有意义，去掉；身份行与正文之间留一个空行，与真实客户端形状一致。
+  while (body.length > 0 && body[0]?.trim() === "") body.shift();
+  const text = body.length === 0 ? policy.identityLine : `${policy.identityLine}\n\n${body.join("\n")}`;
+  return { text, outcome: { supersededRemoved } };
 }
 
 export interface WindsurfOutboxOptions {
@@ -887,7 +908,7 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
         joinedSystem,
         systemIdentity.kind === "ensureIdentityLine" ? systemIdentity.blockedSegmentPrefixes : [],
       );
-      const identity = ensureWindsurfIdentityLine(blocked.text, systemIdentity);
+      const identity = ensureWindsurfLeadingIdentityLine(blocked.text, systemIdentity);
       const systemText = identity.text;
       for (const segment of blocked.dropped) {
         losses.record({
@@ -900,15 +921,15 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
         });
       }
       if (identity.outcome !== null) {
-        const what = identity.outcome.kind === "replaced"
-          ? `客户端身份行 '${identity.outcome.supersededLine}' 被整行换成 `
-            + `'${systemIdentity.kind === "ensureIdentityLine" ? systemIdentity.identityLine : ""}'；`
-            + "system 的其余内容一字未动。"
-          : "没有命中任何已知的外来身份行，改为把身份行 prepend 到 system 最前面；"
-            + "客户端原文一字未动地跟在后面（因此它原来的自我描述仍然在下文里）。";
+        const removed = identity.outcome.supersededRemoved;
         losses.record({
           path: "$.conversation.system", kind: "substituted",
-          detail: what
+          detail: `身份行 '${systemIdentity.kind === "ensureIdentityLine" ? systemIdentity.identityLine : ""}' `
+            + "被强制放到 system 的第一行"
+            + (removed.length === 0
+              ? "（客户端原文没有已知的外来身份行，一行都没删）。"
+              : `，并删掉 ${removed.length} 条外来身份行：${removed.map((one) => `'${one}'`).join("、")}。`)
+            + "system 的其余内容一字未动。"
             + "实测：Claude Code 的 57 字符身份行**单独**发过去就会被拒"
             + "（`an internal error occurred`，与正文段的 content policy 是两套机制）；"
             + "摘掉正文触发段但保留这一行，照样被拒。所以身份与正文必须同时处理。"
