@@ -13,7 +13,7 @@
 import { deriveCapabilityNeeds } from "../ir/capabilities.ts";
 import { defaultValue } from "../ir/types.ts";
 import type {
-  IRCapability, IRConversation, IREgressProfile, IRPart, IRRequest, IRToolRef, IRTurn,
+  IRCapability, IRConversation, IROutboxProfile, IRPart, IRRequest, IRToolRef, IRTurn,
 } from "../ir/types.ts";
 import type { IRRepairOptionsByKind, IRRepairRecord, IRRepairResult, IRRepairTrigger } from "./contract.ts";
 
@@ -45,7 +45,7 @@ function renderPlaceholder(template: string, values: Readonly<Record<string, str
  * 目标是否「缺」这个能力。`trigger` 决定 lossy 算不算缺 —— 这是策略，
  * 所以由调用方的选项说了算，不在这里写死。
  */
-function lacksCapability(profile: IREgressProfile, capability: IRCapability, trigger: IRRepairTrigger): boolean {
+function lacksCapability(profile: IROutboxProfile, capability: IRCapability, trigger: IRRepairTrigger): boolean {
   if (profile.supports.has(capability)) return false;
   return trigger === "capabilityAbsentOrLossy" || !profile.lossy.has(capability);
 }
@@ -133,8 +133,8 @@ export function dropOrphanToolResults(request: IRRequest): IRRepairResult {
 
 /**
  * 给没有结果的 tool_use 补一条占位结果，插在**紧随其后的 user 回合最前面**
- * （没有就新建一条 user 回合）。IR 内部靠 id 关联，但位置约束是下游 egress 的现实，
- * 补在正确的位置能让任何 egress 都不必二次搬运。
+ * （没有就新建一条 user 回合）。IR 内部靠 id 关联，但位置约束是下游 outbox 的现实，
+ * 补在正确的位置能让任何 outbox 都不必二次搬运。
  *
  * 措辞是这条修复的**全部风险所在**：假装工具返回了空内容，agent 会当成「命令执行成功、
  * 无输出」继续往下走。默认文案必须把「结果未知、不要假定成功」说死。
@@ -240,7 +240,7 @@ export function fillEmptyToolResults(
  * 「该换一家上游，不该假装送到了」。所以它默认关闭，只有调用方明确认为「有总比 422 好」时才开。
  */
 export function textualizeUnsupportedImages(
-  request: IRRequest, profile: IREgressProfile, options: OptionsOf<"textualizeUnsupportedImage">,
+  request: IRRequest, profile: IROutboxProfile, options: OptionsOf<"textualizeUnsupportedImage">,
 ): IRRepairResult {
   const records: IRRepairRecord[] = [];
   const conversation = mapConversationParts(request.conversation, (part, site) => {
@@ -252,7 +252,7 @@ export function textualizeUnsupportedImages(
       kind: "textualizeUnsupportedImage",
       path: site.path,
       detail:
-        `gateway decided ${profile.provider} should see a text description instead of this ${part.media.mediaType} ` +
+        `gateway decided the selected outbox should see a text description instead of this ${part.media.mediaType} ` +
         `image; the pixels never reach the model`,
     });
     return {
@@ -270,7 +270,7 @@ export function textualizeUnsupportedImages(
 
 /** 与图片同构，判据只看 `document` —— 文档在 tool result 里也不另需一个能力。 */
 export function textualizeUnsupportedDocuments(
-  request: IRRequest, profile: IREgressProfile, options: OptionsOf<"textualizeUnsupportedDocument">,
+  request: IRRequest, profile: IROutboxProfile, options: OptionsOf<"textualizeUnsupportedDocument">,
 ): IRRepairResult {
   const records: IRRepairRecord[] = [];
   const conversation = mapConversationParts(request.conversation, (part, site) => {
@@ -280,7 +280,7 @@ export function textualizeUnsupportedDocuments(
       kind: "textualizeUnsupportedDocument",
       path: site.path,
       detail:
-        `gateway decided ${profile.provider} should see a text description instead of this ${part.media.mediaType} ` +
+        `gateway decided the selected outbox should see a text description instead of this ${part.media.mediaType} ` +
         `document; its body never reaches the model`,
     });
     return {

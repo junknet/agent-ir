@@ -1,7 +1,7 @@
 /**
  * Repair 层。
  *
- * 这一层的价值判据只有一个：**原本被 `checkUpstreamSupport` 拒掉的请求，在调用方明确
+ * 这一层的价值判据只有一个：**原本被 `checkOutboxSupport` 拒掉的请求，在调用方明确
  * 同意某种降级之后能过**。所以除了逐种修复的正/反用例，必须有一条端到端断言把
  * 「拒 → 修 → 过」串起来（`makes a rejected request admissible`）。
  *
@@ -9,12 +9,12 @@
  * 新增一种修复而不给用例，这个文件当场编译失败。
  */
 import { describe, expect, it } from "bun:test";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
-import { checkUpstreamSupport } from "../src/ir/admission.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
   IR_CAPABILITIES, clientValue, defaultValue,
-  type IRCapability, type IRConversation, type IREgressProfile, type IRIntent,
+  type IRCapability, type IRConversation, type IROutboxProfile, type IRIntent,
   type IRMandatoryFieldTable, type IROutputFormat,
   type IRPart, type IRReasoning, type IRRequest, type IRToolChoice, type IRTurn,
 } from "../src/ir/types.ts";
@@ -81,7 +81,7 @@ const profileOf = (
   supports: readonly IRCapability[],
   lossy: readonly IRCapability[] = [],
   mandatory: IRMandatoryFieldTable = { maxOutputTokens: false },
-): IREgressProfile => ({ provider: "test", supports: new Set(supports), lossy: new Set(lossy), mandatory });
+): IROutboxProfile => ({ supports: new Set(supports), lossy: new Set(lossy), mandatory });
 
 /** 认识全部能力，但**什么都不强制要求** —— 「认识」与「要求」是两个维度。 */
 const EVERYTHING = profileOf(IR_CAPABILITIES);
@@ -101,7 +101,7 @@ const snapshot = (request: IRRequest): string => JSON.stringify(request);
 
 interface RepairScenario {
   readonly request: IRRequest;
-  readonly profile: IREgressProfile;
+  readonly profile: IROutboxProfile;
 }
 
 interface RepairCase {
@@ -626,14 +626,14 @@ describe("compose", () => {
     });
     const losses = describeRepairsAsLosses(applied, "test");
     expect(losses.map((loss) => loss.kind)).toEqual(["dropped", "degraded"]);
-    expect(losses.every((loss) => loss.stage === "egress" && loss.provider === "test")).toBe(true);
+    expect(losses.every((loss) => loss.stage === "outbox" && loss.outbox === "test")).toBe(true);
   });
 });
 
 // ── 端到端：这一层存在的意义 ────────────────────────────────────────────────
 
 describe("admission", () => {
-  const chat = createChatCompletionsUpstream({
+  const chat = createOpenAIChatOutbox({
     baseUrl: "https://api.openai.com/v1/", apiKey: "sk-test", model: "gpt-5-mini",
   }).profile;
 
@@ -646,7 +646,7 @@ describe("admission", () => {
   });
 
   it("is rejected by the real chat profile before any repair", () => {
-    const check = checkUpstreamSupport(withUnsupportedModalities, chat);
+    const check = checkOutboxSupport(withUnsupportedModalities, chat);
     expect(check.admitted).toBe(false);
     expect(check.unsupported.map((need) => need.capability).sort()).toEqual(["document", "toolResultImage"]);
   });
@@ -661,7 +661,7 @@ describe("admission", () => {
       .toEqual(["textualizeUnsupportedDocument", "textualizeUnsupportedImage"]);
     // 顶层图片这家上游本来就支持，不该被牵连
     expect(request.conversation.turns[0]?.parts[0]?.kind).toBe("text");
-    expect(checkUpstreamSupport(request, chat).admitted).toBe(true);
+    expect(checkOutboxSupport(request, chat).admitted).toBe(true);
   });
 
   it("still rejects when the caller opts into nothing", () => {

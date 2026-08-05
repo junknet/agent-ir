@@ -52,15 +52,27 @@ describe("响应文档形态", () => {
     ]);
   });
 
-  it("分片 JSON 拼不回对象时降级成 freeform 原文，不猜也不丢", async () => {
+  it.each([
+    {
+      input: '{"broken',
+      detail: "tool input JSON could not be parsed; preserved raw fragments as freeform text",
+    },
+    {
+      input: "[]",
+      detail: "tool input JSON parsed to a non-object; preserved raw fragments as freeform text",
+    },
+  ])("分片 JSON 无法成为对象时降级成 freeform 原文并记录 loss", async ({ input, detail }) => {
     const assembled = await assembleResponse(streamOf([
       { kind: "partStart", index: 0, part: { kind: "toolCall", call: { id: "t", toolRef: { group: null, name: "X" }, input: { kind: "json", value: {} } } } },
-      { kind: "partDelta", index: 0, delta: { kind: "toolInputJson", json: '{"broken' } },
+      { kind: "partDelta", index: 0, delta: { kind: "toolInputJson", json: input } },
       { kind: "partEnd", index: 0 },
       { kind: "messageStop", reason: "toolUse" },
     ]), "m");
     const part = assembled.turn.parts[0];
-    expect(part?.kind === "toolCall" && part.call.input).toEqual({ kind: "text", text: '{"broken' });
+    expect(part?.kind === "toolCall" && part.call.input).toEqual({ kind: "text", text: input });
+    expect(assembled.losses).toContainEqual({
+      stage: "outbox", outbox: null, path: "$.response.parts[0].call.input", kind: "degraded", detail,
+    });
   });
 
   it("上游没发终止事件时 stopReason 为 null —— 用来区分「说完了」与「断了」", async () => {
@@ -96,7 +108,7 @@ describe("响应文档形态", () => {
       { kind: "messageStop", reason: "endTurn" },
     ]), "m");
     expect(assembled.turn.parts).toEqual([]);
-    expect(assembled.losses[0]).toMatchObject({ stage: "lift", kind: "dropped", path: "$.response.parts[0]" });
+    expect(assembled.losses[0]).toMatchObject({ stage: "outbox", kind: "dropped", path: "$.response.parts[0]" });
   });
 });
 

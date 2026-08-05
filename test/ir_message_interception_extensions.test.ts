@@ -1,6 +1,6 @@
 /** 内置 IRMessage 拦截链的时序、可变引用与三种边界。 */
 import { describe, expect, it } from "bun:test";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
 import { writeAnthropicResponse } from "../src/ingress/anthropic_encode.ts";
 import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/ingress/openai_encode.ts";
 import {
@@ -105,7 +105,7 @@ describe("outbox SSE frame interceptor chain", () => {
   });
 
   it("出口 lift 确实把完整 frame interceptor 接到解码前", async () => {
-    const egress = createChatCompletionsUpstream({ baseUrl: "https://example.invalid/v1", apiKey: "test", model: "test" });
+    const outbox = createOpenAIChatOutbox({ baseUrl: "https://example.invalid/v1", apiKey: "test", model: "test" });
     const source = new Response([
       'data: {"model":"test","choices":[{"delta":{"content":"original"},"finish_reason":null}]}',
       'data: {"model":"test","choices":[{"delta":{},"finish_reason":"stop"}]}',
@@ -113,8 +113,8 @@ describe("outbox SSE frame interceptor chain", () => {
       "",
     ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
     const events: IREvent[] = [];
-    for await (const event of egress.readUpstreamResponse(source, {
-      processCompleteSseFrame: (frame) => { frame.data = frame.data.replace("original", "audited"); },
+    for await (const event of outbox.readOutboxResponse(source, {
+      inspectCompleteSseFrame: (frame) => { frame.data = frame.data.replace("original", "audited"); },
     })) events.push(event);
     expect(events).toContainEqual({ kind: "partDelta", index: 0, delta: { kind: "text", text: "audited" } });
   });
@@ -146,7 +146,7 @@ describe("统一 inbox completed response interceptor chain", () => {
   it("非流式使用同一 IRResponse interceptor，修改后的内容进入 JSON 响应", async () => {
     const response = await writeResponsesResponse(eventsOf(completed), baseRequest, {
       messageId: "response_callback_test",
-      processCompleteIRResponse: (document) => {
+      runCompleteIRResponseInterception: (document) => {
         const first = document.turn.parts[0];
         if (first?.kind === "text") first.text = "audited";
       },
@@ -168,7 +168,7 @@ describe("统一 inbox completed response interceptor chain", () => {
       };
       const response = write(eventsOf(completed), request, {
         messageId: `stream_done_${protocol}`,
-        processCompleteIRResponse: (document) => {
+        runCompleteIRResponseInterception: (document) => {
           calls += 1;
           expect(document.turn.parts).toHaveLength(1);
         },

@@ -1,7 +1,7 @@
 /**
  * 上游错误分类 —— 五个出口 × HTTP 层 / 协议内两条路径。
  *
- * 为什么这件事值得单独一组：`IRUpstreamError` 的两个字段决定了调用方的**全部**动作。
+ * 为什么这件事值得单独一组：`IROutboxError` 的两个字段决定了调用方的**全部**动作。
  *   `kind`      → 换不换账号、要不要降级、给客户端回几号状态码
  *   `retryable` → 退避重试还是当场失败
  * 分错一档的代价在生产里是可量化的：`permission_denied` 被当成资源错误重试，
@@ -19,24 +19,24 @@
  */
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeUpstream } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createGeminiCloudCodeOutbox } from "../src/egress/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
 import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/egress/windsurf/connect_frame.ts";
 import { getSharedWindsurfSchema } from "../src/egress/windsurf/schema.ts";
-import type { IREgress, IREvent, IRUpstreamError, IRWireBody } from "../src/ir/types.ts";
+import type { IROutbox, IREvent, IROutboxError, IRWireBody } from "../src/ir/types.ts";
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 
-const ALL_KINDS: readonly IRUpstreamError["kind"][] = [
+const ALL_KINDS: readonly IROutboxError["kind"][] = [
   "invalidRequest", "permissionDenied", "rateLimited", "quotaExhausted",
-  "contextLengthExceeded", "contentPolicy", "upstreamUnavailable", "transport", "unknown",
+  "contextLengthExceeded", "contentPolicy", "outboxUnavailable", "transport", "unknown",
 ];
 
 /** 重发同一条请求必然重演的那几档 —— 它们**永远**不可重试。 */
-const NEVER_RETRYABLE: ReadonlySet<IRUpstreamError["kind"]> = new Set<IRUpstreamError["kind"]>([
+const NEVER_RETRYABLE: ReadonlySet<IROutboxError["kind"]> = new Set<IROutboxError["kind"]>([
   "invalidRequest", "permissionDenied", "contentPolicy", "contextLengthExceeded", "quotaExhausted",
 ]);
 
@@ -47,7 +47,7 @@ async function collect(events: AsyncIterable<IREvent>): Promise<IREvent[]> {
 }
 
 /** 取出流里唯一的那条错误。没有错误就是测试要抓的失败本身，所以直接报出来。 */
-async function errorOf(events: AsyncIterable<IREvent>): Promise<IRUpstreamError> {
+async function errorOf(events: AsyncIterable<IREvent>): Promise<IROutboxError> {
   const collected = await collect(events);
   const found = collected.find((event) => event.kind === "error");
   if (found === undefined || found.kind !== "error") {
@@ -70,15 +70,15 @@ function sseResponse(frames: readonly string[]): Response {
   });
 }
 
-const anthropic = createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
-const chat = createChatCompletionsUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
-const responses = createResponsesUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
-const gemini = createGeminiCloudCodeUpstream({
+const anthropic = createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+const chat = createOpenAIChatOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+const responses = createOpenAIResponsesOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+const gemini = createGeminiCloudCodeOutbox({
   model: "gemini-3.6-flash", accessToken: "t", project: "p", requestIdFactory: () => "r",
 });
-const windsurf = createWindsurfUpstream({ model: "claude-opus-4-8-high", apiKey: "devin$h.e.s" });
+const windsurf = createWindsurfOutbox({ model: "claude-opus-4-8-high", apiKey: "devin$h.e.s" });
 
-const EGRESSES: Readonly<Record<string, IREgress<IRWireBody>>> = {
+const EGRESSES: Readonly<Record<string, IROutbox<IRWireBody>>> = {
   anthropic, openai_chat: chat, openai_responses: responses, gemini_cloudcode: gemini, windsurf,
 };
 
@@ -115,8 +115,8 @@ function windsurfStream(parts: readonly Uint8Array[]): Response {
 describe("HTTP 4xx/5xx：带上游原文错误体", () => {
   const cases: readonly {
     readonly status: number;
-    readonly body: (provider: string) => string;
-    readonly expect: IRUpstreamError["kind"];
+    readonly body: (outbox: string) => string;
+    readonly expect: IROutboxError["kind"];
   }[] = [
     {
       status: 400, expect: "invalidRequest",
@@ -135,19 +135,19 @@ describe("HTTP 4xx/5xx：带上游原文错误体", () => {
       body: () => JSON.stringify({ error: { type: "rate_limit_error", code: "rate_limit_exceeded", message: "slow down" } }),
     },
     {
-      status: 500, expect: "upstreamUnavailable",
+      status: 500, expect: "outboxUnavailable",
       body: () => JSON.stringify({ error: { type: "api_error", code: "server_error", message: "internal" } }),
     },
     {
-      status: 503, expect: "upstreamUnavailable",
+      status: 503, expect: "outboxUnavailable",
       body: () => JSON.stringify({ error: { type: "overloaded_error", code: "overloaded", status: "UNAVAILABLE", message: "overloaded" } }),
     },
   ];
 
-  for (const [name, egress] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(EGRESSES)) {
     for (const testCase of cases) {
       it(`${name} / HTTP ${testCase.status} → ${testCase.expect}`, async () => {
-        const error = await errorOf(egress.readUpstreamResponse(
+        const error = await errorOf(outbox.readOutboxResponse(
           httpResponse(testCase.status, testCase.body(name)),
         ));
         expect(error.kind).toBe(testCase.expect);
@@ -160,17 +160,17 @@ describe("HTTP 4xx/5xx：带上游原文错误体", () => {
 });
 
 describe("HTTP 层的重试判定与 kind 严格对齐", () => {
-  for (const [name, egress] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(EGRESSES)) {
     it(`${name}：429 与 5xx 可重试，4xx（除 429）一律不可`, async () => {
-      const rateLimited = await errorOf(egress.readUpstreamResponse(httpResponse(429,
+      const rateLimited = await errorOf(outbox.readOutboxResponse(httpResponse(429,
         JSON.stringify({ error: { type: "rate_limit_error", message: "slow down" } }))));
       expect(rateLimited.retryable).toBe(true);
 
-      const unavailable = await errorOf(egress.readUpstreamResponse(httpResponse(503,
+      const unavailable = await errorOf(outbox.readOutboxResponse(httpResponse(503,
         JSON.stringify({ error: { type: "overloaded_error", message: "overloaded" } }))));
       expect(unavailable.retryable).toBe(true);
 
-      const invalid = await errorOf(egress.readUpstreamResponse(httpResponse(400,
+      const invalid = await errorOf(outbox.readOutboxResponse(httpResponse(400,
         JSON.stringify({ error: { type: "invalid_request_error", message: "bad" } }))));
       expect(invalid.retryable).toBe(false);
     });
@@ -183,22 +183,22 @@ describe("上下文超长必须自己成一档 —— 它不是普通的 400", (
    * 调用方只能盲重试。它与 `invalidRequest` 的处置完全不同（前者要压缩上下文，
    * 后者要改请求），所以必须是独立的一档。
    */
-  const cases: readonly [string, IREgress<IRWireBody>, number, string][] = [
+  const cases: readonly [string, IROutbox<IRWireBody>, number, string][] = [
     ["openai_chat", chat, 400, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "This model's maximum context length is 272000 tokens" } })],
     ["openai_responses", responses, 400, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "input too long" } })],
     ["gemini_cloudcode", gemini, 400, JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "The input token count exceeds the maximum" } })],
   ];
 
-  for (const [name, egress, status, body] of cases) {
+  for (const [name, outbox, status, body] of cases) {
     it(name, async () => {
-      const error = await errorOf(egress.readUpstreamResponse(httpResponse(status, body)));
+      const error = await errorOf(outbox.readOutboxResponse(httpResponse(status, body)));
       expect(error.kind).toBe("contextLengthExceeded");
       expect(error.retryable).toBe(false);
     });
   }
 
   it("windsurf：上下文超长藏在 Connect 尾帧的 invalid_argument 里", async () => {
-    const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfData({ deltaText: "" }),
       windsurfEnd({ error: { code: "invalid_argument", message: "prompt is too long for the context window" } }),
     ])));
@@ -208,35 +208,35 @@ describe("上下文超长必须自己成一档 —— 它不是普通的 400", (
 });
 
 describe("配额耗尽与限流分得开", () => {
-  const cases: readonly [string, IREgress<IRWireBody>, Response][] = [
+  const cases: readonly [string, IROutbox<IRWireBody>, Response][] = [
     ["openai_chat", chat, httpResponse(429, JSON.stringify({ error: { type: "insufficient_quota", code: "insufficient_quota", message: "You exceeded your current quota" } }))],
     ["openai_responses", responses, httpResponse(429, JSON.stringify({ error: { code: "insufficient_quota", message: "quota exceeded" } }))],
     ["gemini_cloudcode", gemini, httpResponse(429, JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded for quota metric" } }))],
   ];
 
-  for (const [name, egress, response] of cases) {
+  for (const [name, outbox, response] of cases) {
     it(`${name}：命中配额词 → quotaExhausted 且不可重试`, async () => {
-      const error = await errorOf(egress.readUpstreamResponse(response));
+      const error = await errorOf(outbox.readOutboxResponse(response));
       expect(error.kind).toBe("quotaExhausted");
       expect(error.retryable).toBe(false);
     });
   }
 
   it("gemini：同样是 RESOURCE_EXHAUSTED，不带配额词就是限流（可重试）", async () => {
-    const error = await errorOf(gemini.readUpstreamResponse(httpResponse(429,
+    const error = await errorOf(gemini.readOutboxResponse(httpResponse(429,
       JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Too many requests" } }))));
     expect(error.kind).toBe("rateLimited");
     expect(error.retryable).toBe(true);
   });
 
   it("windsurf：resource_exhausted 靠文案二分，配额档不可重试", async () => {
-    const quota = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const quota = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfEnd({ error: { code: "resource_exhausted", message: "out of credits" } }),
     ])));
     expect(quota.kind).toBe("quotaExhausted");
     expect(quota.retryable).toBe(false);
 
-    const throttled = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const throttled = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfEnd({ error: { code: "resource_exhausted", message: "too many concurrent requests" } }),
     ])));
     expect(throttled.kind).toBe("rateLimited");
@@ -250,27 +250,27 @@ describe("配额耗尽与限流分得开", () => {
 
 describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
   it("anthropic：SSE 里的 error 事件终止本轮，不再补 transport 错误", async () => {
-    const events = await collect(anthropic.readUpstreamResponse(sseResponse([
+    const events = await collect(anthropic.readOutboxResponse(sseResponse([
       'event: message_start\ndata: {"type":"message_start","message":{"model":"m"}}',
       'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
     ])));
     const errors = events.filter((event) => event.kind === "error");
     // 恰好一条：既不吞掉，也不因为「没等到终止事件」再追加一条 transport。
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ kind: "error", error: { kind: "upstreamUnavailable", retryable: true, httpStatus: null } });
+    expect(errors[0]).toMatchObject({ kind: "error", error: { kind: "outboxUnavailable", retryable: true, httpStatus: null } });
   });
 
   it("openai_chat：chunk 里的 error 字段同样是终止", async () => {
-    const error = await errorOf(chat.readUpstreamResponse(sseResponse([
+    const error = await errorOf(chat.readOutboxResponse(sseResponse([
       'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"partial"}}]}',
       'data: {"error":{"type":"server_error","code":"server_error","message":"upstream hiccup"}}',
     ])));
-    expect(error.kind).toBe("upstreamUnavailable");
+    expect(error.kind).toBe("outboxUnavailable");
     expect(error.httpStatus).toBeNull();
   });
 
   it("openai_responses：response.failed 里的 context_length_exceeded 必须显形", async () => {
-    const error = await errorOf(responses.readUpstreamResponse(sseResponse([
+    const error = await errorOf(responses.readOutboxResponse(sseResponse([
       'data: {"type":"response.created","response":{"model":"m"}}',
       'data: {"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"too long"}}}',
     ])));
@@ -279,7 +279,7 @@ describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
   });
 
   it("openai_responses：顶层 error 事件是另一条失败路径，分类相同", async () => {
-    const error = await errorOf(responses.readUpstreamResponse(sseResponse([
+    const error = await errorOf(responses.readOutboxResponse(sseResponse([
       'data: {"type":"error","code":"rate_limit_exceeded","message":"slow down"}',
     ])));
     expect(error.kind).toBe("rateLimited");
@@ -287,7 +287,7 @@ describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
   });
 
   it("gemini：200 的 SSE 里直接塞 {error} —— 内容策略与鉴权都走这条", async () => {
-    const denied = await errorOf(gemini.readUpstreamResponse(new Response(
+    const denied = await errorOf(gemini.readOutboxResponse(new Response(
       `data: ${JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "caller lacks permission" } })}\r\n\r\n`,
       { status: 200, headers: { "content-type": "text/event-stream" } },
     )));
@@ -296,7 +296,7 @@ describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
   });
 
   it("gemini：promptFeedback.blockReason → contentPolicy 且不可重试", async () => {
-    const error = await errorOf(gemini.readUpstreamResponse(new Response(
+    const error = await errorOf(gemini.readOutboxResponse(new Response(
       `data: ${JSON.stringify({ response: { promptFeedback: { blockReason: "SAFETY" } } })}\r\n\r\n`,
       { status: 200, headers: { "content-type": "text/event-stream" } },
     )));
@@ -305,7 +305,7 @@ describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
   });
 
   it("gemini：数组包一层的错误体也要认，否则 message 退化成 'upstream error'", async () => {
-    const error = await errorOf(gemini.readUpstreamResponse(httpResponse(429,
+    const error = await errorOf(gemini.readOutboxResponse(httpResponse(429,
       JSON.stringify([{ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded for X" } }]))));
     expect(error.kind).toBe("quotaExhausted");
     expect(error.message).toContain("Quota exceeded");
@@ -314,7 +314,7 @@ describe("协议内错误：HTTP 200，但这一轮已经失败了", () => {
 
 describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
   it("permission_denied 不可重试 —— 重试会打遍账号池并伪装成 503", async () => {
-    const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfData({ deltaText: "thinking" }),
       windsurfEnd({ error: { code: "permission_denied", message: "an internal error occurred" } }),
     ])));
@@ -325,12 +325,12 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
   });
 
   it("瞬时码可重试，请求码不可重试 —— 逐个 Connect code 表态", async () => {
-    const expectations: readonly [string, IRUpstreamError["kind"], boolean][] = [
-      ["unavailable", "upstreamUnavailable", true],
-      ["internal", "upstreamUnavailable", true],
-      ["deadline_exceeded", "upstreamUnavailable", true],
-      ["aborted", "upstreamUnavailable", true],
-      ["unknown", "upstreamUnavailable", true],
+    const expectations: readonly [string, IROutboxError["kind"], boolean][] = [
+      ["unavailable", "outboxUnavailable", true],
+      ["internal", "outboxUnavailable", true],
+      ["deadline_exceeded", "outboxUnavailable", true],
+      ["aborted", "outboxUnavailable", true],
+      ["unknown", "outboxUnavailable", true],
       ["canceled", "transport", true],
       ["invalid_argument", "invalidRequest", false],
       ["failed_precondition", "invalidRequest", false],
@@ -340,7 +340,7 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
       ["permission_denied", "permissionDenied", false],
     ];
     for (const [code, kind, retryable] of expectations) {
-      const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+      const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
         windsurfEnd({ error: { code, message: `stream error: ${code}` } }),
       ])));
       expect({ code, kind: error.kind, retryable: error.retryable }).toEqual({ code, kind, retryable });
@@ -349,7 +349,7 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
 
   it("数字 gRPC 码与 SCREAMING_SNAKE 归一到同一档", async () => {
     for (const code of [7, "7", "PERMISSION_DENIED", "permission_denied"]) {
-      const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+      const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
         windsurfEnd({ error: { code, message: "denied" } }),
       ])));
       expect(error.kind).toBe("permissionDenied");
@@ -357,7 +357,7 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
   });
 
   it("尾帧里的字符串错误也是错误，不能当干净收尾", async () => {
-    const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfData({ deltaText: "x" }),
       windsurfEnd({ error: "something went wrong" }),
     ])));
@@ -366,14 +366,14 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
   });
 
   it("认不出的 Connect code 落到 unknown 而不是某个默认档", async () => {
-    const error = await errorOf(windsurf.readUpstreamResponse(windsurfStream([
+    const error = await errorOf(windsurf.readOutboxResponse(windsurfStream([
       windsurfEnd({ error: { code: "quantum_flux_2099", message: "?" } }),
     ])));
     expect(error.kind).toBe("unknown");
   });
 
   it("HTTP 层错误与尾帧错误是两条路径：前者带真状态码", async () => {
-    const error = await errorOf(windsurf.readUpstreamResponse(
+    const error = await errorOf(windsurf.readOutboxResponse(
       httpResponse(403, JSON.stringify({ code: "permission_denied", message: "bad session" })),
     ));
     expect(error.kind).toBe("permissionDenied");
@@ -388,17 +388,17 @@ describe("windsurf：错误在 Connect 尾帧里，HTTP 永远是 200", () => {
 describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () => {
   const NGINX = "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>";
 
-  for (const [name, egress] of Object.entries(EGRESSES)) {
+  for (const [name, outbox] of Object.entries(EGRESSES)) {
     it(`${name}：仍要产出一条错误，且 raw 留住原文`, async () => {
-      const error = await errorOf(egress.readUpstreamResponse(httpResponse(502, NGINX, "text/html")));
+      const error = await errorOf(outbox.readOutboxResponse(httpResponse(502, NGINX, "text/html")));
       expect(error.httpStatus).toBe(502);
       expect(JSON.stringify(error.raw)).toContain("502 Bad Gateway");
     });
   }
 
   it("空错误体（连一个字节都没有）也不能崩", async () => {
-    for (const [, egress] of Object.entries(EGRESSES)) {
-      const error = await errorOf(egress.readUpstreamResponse(httpResponse(503, "", "text/plain")));
+    for (const [, outbox] of Object.entries(EGRESSES)) {
+      const error = await errorOf(outbox.readOutboxResponse(httpResponse(503, "", "text/plain")));
       expect(error.httpStatus).toBe(503);
     }
   });
@@ -410,7 +410,7 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * `src/egress/anthropic.ts` 的 `mapUpstreamError(payload, httpStatus)` 收下了
+ * `src/egress/anthropic.ts` 的 `mapOutboxError(payload, httpStatus)` 收下了
  * `httpStatus`，却**只把它写进返回值，不参与分类**：`kind` 完全由 body 里的
  * `error.type` 与 message 正则推出来。
  *
@@ -427,40 +427,40 @@ describe("[守卫] anthropic 出口的错误分类必须把 HTTP 状态码算进
   const CLOUDFLARE_524 = "error code: 524";
   const NGINX_502 = "<html><head><title>502 Bad Gateway</title></head></html>";
 
-  it("DEFECT-7a HTTP 503 + 非 JSON 体 → 应当是可重试的 upstreamUnavailable", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(httpResponse(503, NGINX_502, "text/html")));
-    expect(error.kind).toBe("upstreamUnavailable");
+  it("DEFECT-7a HTTP 503 + 非 JSON 体 → 应当是可重试的 outboxUnavailable", async () => {
+    const error = await errorOf(anthropic.readOutboxResponse(httpResponse(503, NGINX_502, "text/html")));
+    expect(error.kind).toBe("outboxUnavailable");
     expect(error.retryable).toBe(true);
   });
 
   it("DEFECT-7b Cloudflare 524（纯文本）→ 应当可重试", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(httpResponse(524, CLOUDFLARE_524, "text/plain")));
+    const error = await errorOf(anthropic.readOutboxResponse(httpResponse(524, CLOUDFLARE_524, "text/plain")));
     expect(error.retryable).toBe(true);
   });
 
   it("DEFECT-7c HTTP 429 + 非 JSON 体 → 应当是 rateLimited", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(httpResponse(429, "Too Many Requests", "text/plain")));
+    const error = await errorOf(anthropic.readOutboxResponse(httpResponse(429, "Too Many Requests", "text/plain")));
     expect(error.kind).toBe("rateLimited");
     expect(error.retryable).toBe(true);
   });
 
   it("DEFECT-7d HTTP 401 + 非 JSON 体 → 应当是 permissionDenied", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(httpResponse(401, "Unauthorized", "text/plain")));
+    const error = await errorOf(anthropic.readOutboxResponse(httpResponse(401, "Unauthorized", "text/plain")));
     expect(error.kind).toBe("permissionDenied");
   });
 
   it("DEFECT-7e 对照：另外四个出口在同一条报文上都分对了", async () => {
-    for (const [name, egress] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(EGRESSES)) {
       if (name === "anthropic") continue;
-      const error = await errorOf(egress.readUpstreamResponse(httpResponse(503, NGINX_502, "text/html")));
+      const error = await errorOf(outbox.readOutboxResponse(httpResponse(503, NGINX_502, "text/html")));
       expect({ name, kind: error.kind, retryable: error.retryable })
-        .toEqual({ name, kind: "upstreamUnavailable", retryable: true });
+        .toEqual({ name, kind: "outboxUnavailable", retryable: true });
     }
   });
 });
 
 /**
- * `src/egress/anthropic.ts` 的 `mapUpstreamError` 是一条三元链，顺序是：
+ * `src/egress/anthropic.ts` 的 `mapOutboxError` 是一条三元链，顺序是：
  *
  *   type === 'invalid_request_error'   → invalidRequest
  *   … 其它 type …
@@ -485,23 +485,23 @@ describe("[守卫] anthropic 出口的 contextLengthExceeded 必须可达", () =
   });
 
   it("DEFECT-9a HTTP 400 + 真实报文 → 应当是 contextLengthExceeded，实际是 invalidRequest", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(httpResponse(400, REAL_TOO_LONG)));
+    const error = await errorOf(anthropic.readOutboxResponse(httpResponse(400, REAL_TOO_LONG)));
     expect(error.kind).toBe("contextLengthExceeded");
   });
 
   it("DEFECT-9b 流内 error 事件里的同一条报文，同样分错", async () => {
-    const error = await errorOf(anthropic.readUpstreamResponse(sseResponse([`event: error\ndata: ${REAL_TOO_LONG}`])));
+    const error = await errorOf(anthropic.readOutboxResponse(sseResponse([`event: error\ndata: ${REAL_TOO_LONG}`])));
     expect(error.kind).toBe("contextLengthExceeded");
   });
 
   it("DEFECT-9c 对照：另外三个 JSON 出口在等价报文上都分对了", async () => {
-    const cases: readonly [string, IREgress<IRWireBody>, string][] = [
+    const cases: readonly [string, IROutbox<IRWireBody>, string][] = [
       ["openai_chat", chat, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "maximum context length is 272000 tokens" } })],
       ["openai_responses", responses, JSON.stringify({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "input too long" } })],
       ["gemini_cloudcode", gemini, JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "The input token count exceeds the maximum" } })],
     ];
-    for (const [name, egress, body] of cases) {
-      const error = await errorOf(egress.readUpstreamResponse(httpResponse(400, body)));
+    for (const [name, outbox, body] of cases) {
+      const error = await errorOf(outbox.readOutboxResponse(httpResponse(400, body)));
       expect({ name, kind: error.kind }).toEqual({ name, kind: "contextLengthExceeded" });
     }
   });
@@ -519,13 +519,13 @@ describe("[守卫] anthropic 出口的 contextLengthExceeded 必须可达", () =
  */
 describe("[守卫] 5xx 必须整段可重试，而不是只认几个特定码", () => {
   for (const status of [520, 522, 524, 529]) {
-    it(`DEFECT-8 HTTP ${status}：五个出口都应当是可重试的 upstreamUnavailable`, async () => {
-      for (const [name, egress] of Object.entries(EGRESSES)) {
-        const error = await errorOf(egress.readUpstreamResponse(
+    it(`DEFECT-8 HTTP ${status}：五个出口都应当是可重试的 outboxUnavailable`, async () => {
+      for (const [name, outbox] of Object.entries(EGRESSES)) {
+        const error = await errorOf(outbox.readOutboxResponse(
           httpResponse(status, "error code: 524", "text/plain"),
         ));
         expect({ name, status, kind: error.kind, retryable: error.retryable })
-          .toEqual({ name, status, kind: "upstreamUnavailable", retryable: true });
+          .toEqual({ name, status, kind: "outboxUnavailable", retryable: true });
       }
     });
   }

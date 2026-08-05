@@ -13,26 +13,30 @@
  *     —— 尾帧 `{"code":"permission_denied","message":"an internal error occurred"}` 是那两处
  *     用例里的原文。
  */
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "bun:test";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
+import {
+  CHISEL_PROFILE, createWindsurfOutbox, WINDSURF_OBSERVED_IDENTITY_LINE,
+} from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
 import {
   CONNECT_FRAME_HEADER_BYTES, createDeframeState, deframe, enframe, parseConnectTrailer,
 } from "../src/egress/windsurf/connect_frame.ts";
 import { getSharedWindsurfSchema, WINDSURF_TYPES } from "../src/egress/windsurf/schema.ts";
 import { normalizeConnectCode } from "../src/egress/windsurf/errors.ts";
-import { checkUpstreamSupport } from "../src/ir/admission.ts";
+import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { clientValue, defaultValue } from "../src/ir/types.ts";
 import type {
-  IREvent, IRIntent, IRPart, IRRequest, IRToolset, IRTurn, UpstreamRequestBuildResult,
+  IREvent, IRIntent, IRPart, IRRequest, IRToolset, IRTurn, OutboxRequestBuildResult,
 } from "../src/ir/types.ts";
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
 const schema = getSharedWindsurfSchema();
 
-const egress = createWindsurfUpstream({
+const outbox = createWindsurfOutbox({
   model: "claude-opus-4-8-high",
   apiKey: "devin-session-token$h.eyJzZXNzaW9uX2lkIjoicyJ9.sig",
 });
@@ -88,7 +92,7 @@ function simpleRequest(overrides: Partial<Parameters<typeof request>[0]> = {}): 
   });
 }
 
-function expectOk(result: UpstreamRequestBuildResult<Uint8Array>): Extract<UpstreamRequestBuildResult<Uint8Array>, { ok: true }> {
+function expectOk(result: OutboxRequestBuildResult<Uint8Array>): Extract<OutboxRequestBuildResult<Uint8Array>, { ok: true }> {
   if (!result.ok) {
     throw new Error(`expected ok build, got problems: ${JSON.stringify(result.problems)}`);
   }
@@ -96,7 +100,7 @@ function expectOk(result: UpstreamRequestBuildResult<Uint8Array>): Extract<Upstr
 }
 
 /** 解回出站的 GetChatMessageRequest —— 断言的是真字节，不是构造它的那个对象。 */
-function decodeWire(result: UpstreamRequestBuildResult<Uint8Array>): Record<string, any> {
+function decodeWire(result: OutboxRequestBuildResult<Uint8Array>): Record<string, any> {
   const wire = expectOk(result).wire;
   expect(wire.body).toBeInstanceOf(Uint8Array);
   const framed = wire.body as Uint8Array;
@@ -167,6 +171,50 @@ async function collect(events: AsyncIterable<IREvent>): Promise<IREvent[]> {
 
 function kinds(events: readonly IREvent[]): string[] {
   return events.map((event) => event.kind);
+}
+
+/**
+ * protobuf 的「没设」在解出来的对象上是**类型相关的零值**，不是 `undefined`：
+ * 标量是 `""` / `0` / `0n` / `false`，list 是 `[]`，bytes 是**空 `Uint8Array`**，
+ * 只有 message 字段才真的是 `undefined`。
+ *
+ * 拿 `?? ` 或 `!== ""` 判空会在 bytes 和 list 上给出假阳性 —— 这正是
+ * 「geminiThoughtSignature 每条都非空」那个错误结论的成因。判空只走这一个函数。
+ */
+function isEmptyWireValue(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (value instanceof Uint8Array) return value.length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "string") return value.length === 0;
+  if (typeof value === "number") return value === 0;
+  if (typeof value === "bigint") return value === 0n;
+  if (typeof value === "boolean") return !value;
+  return false;
+}
+
+function pickConfiguration(configuration: Record<string, any>): Record<string, unknown> {
+  return {
+    numCompletions: configuration.numCompletions,
+    maxNewlines: configuration.maxNewlines,
+    temperature: configuration.temperature,
+    topK: configuration.topK,
+    topP: configuration.topP,
+    seed: configuration.seed,
+    stopPatterns: configuration.stopPatterns,
+    serviceTier: configuration.serviceTier,
+  };
+}
+
+function pickMetadata(metadata: Record<string, any>): Record<string, unknown> {
+  return {
+    ideName: metadata.ideName,
+    extensionName: metadata.extensionName,
+    extensionVersion: metadata.extensionVersion,
+    ideVersion: metadata.ideVersion,
+    locale: metadata.locale,
+    os: metadata.os,
+    apiKey: metadata.apiKey,
+  };
 }
 
 // ── Connect 帧切分 ──────────────────────────────────────────────────────────
@@ -246,7 +294,7 @@ describe("FileDescriptorSet 运行时反射", () => {
 
 describe("能力声明", () => {
   it("supports 与 lossy 不重叠，且合起来不含四项已知不可承载的能力", () => {
-    const { supports, lossy } = egress.profile;
+    const { supports, lossy } = outbox.profile;
     for (const capability of supports) expect(lossy.has(capability)).toBe(false);
     for (const capability of ["document", "toolBuiltin", "toolChoiceSpecific", "structuredOutput"] as const) {
       expect(supports.has(capability)).toBe(false);
@@ -254,11 +302,23 @@ describe("能力声明", () => {
     }
   });
 
-  it("thinking 只进 lossy —— 字段存在但上游是否消费未经实证", () => {
-    expect(egress.profile.supports.has("thinking")).toBe(false);
-    expect(egress.profile.lossy.has("thinking")).toBe(true);
-    expect(egress.profile.lossy.has("thinkingSignature")).toBe(true);
-    expect(egress.profile.lossy.has("cacheBreakpoint")).toBe(true);
+  it("thinking 进 supports —— 抓包双向实证（39/135 回合出站、850/2107 帧回读）", () => {
+    expect(outbox.profile.supports.has("thinking")).toBe(true);
+    expect(outbox.profile.lossy.has("thinking")).toBe(false);
+  });
+
+  it("证据仍不够的四条留在 lossy，不为了好看升级", () => {
+    // thinkingSignature：双向都有实证但 IR 装不下 signature_type（抓包 2/135、2/2107）。
+    expect(outbox.profile.lossy.has("thinkingSignature")).toBe(true);
+    // toolGroup：抓包 253 个工具定义 server_name 全空，分组语义零实证，只能拍进名字。
+    expect(outbox.profile.lossy.has("toolGroup")).toBe(true);
+    // toolResultImage：抓包 23 个 source=4 回合全部 0 张图，关联性零实证。
+    expect(outbox.profile.lossy.has("toolResultImage")).toBe(true);
+    // cacheBreakpoint：抓包 12/12 条两个 cache_options 字段都没设。
+    expect(outbox.profile.lossy.has("cacheBreakpoint")).toBe(true);
+    for (const capability of ["thinkingSignature", "toolGroup", "toolResultImage", "cacheBreakpoint"] as const) {
+      expect(outbox.profile.supports.has(capability)).toBe(false);
+    }
   });
 
   it("准入把结构化输出指到精确路径而不是笼统报错", () => {
@@ -267,7 +327,7 @@ describe("能力声明", () => {
         outputFormat: clientValue({ kind: "jsonSchema", schema: { type: "object" } }),
       }),
     });
-    const check = checkUpstreamSupport(irRequest, egress.profile);
+    const check = checkOutboxSupport(irRequest, outbox.profile);
     expect(check.admitted).toBe(false);
     expect(check.unsupported.map((need) => need.capability)).toContain("structuredOutput");
     expect(check.unsupported[0]?.paths).toContain("$.intent.outputFormat");
@@ -276,10 +336,12 @@ describe("能力声明", () => {
 
 // ── 出站请求构造 ────────────────────────────────────────────────────────────
 
-describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
+describe("writeOutboxRequest 构造真实 GetChatMessage", () => {
   it("system 进顶层 prompt，回合进 chat_message_prompts，模型进 chat_model_uid", async () => {
-    const decoded = decodeWire(await egress.writeUpstreamRequest(simpleRequest()));
-    expect(decoded.prompt).toBe("You are a coding assistant.");
+    const decoded = decodeWire(await outbox.writeOutboxRequest(simpleRequest()));
+    // 默认身份策略的后置条件在这里也成立：客户端的 system 原样在，身份行被补在最前面。
+    // 想要逐字节透传的调用方传 systemIdentity={kind:'passthrough'}（见下面那组用例）。
+    expect(decoded.prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nYou are a coding assistant.`);
     expect(decoded.chatModelUid).toBe("claude-opus-4-8-high");
     expect(decoded.requestType).toBe(5);
     expect(decoded.plannerMode).toBe(1);
@@ -290,7 +352,7 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
   });
 
   it("body 保留原始 Connect 字节，头里给 Connect 的两个必需头", async () => {
-    const wire = expectOk(await egress.writeUpstreamRequest(simpleRequest())).wire;
+    const wire = expectOk(await outbox.writeOutboxRequest(simpleRequest())).wire;
     expect(wire.headers["content-type"]).toBe("application/connect+proto");
     expect(wire.headers["connect-protocol-version"]).toBe("1");
     expect(wire.headers.authorization).toStartWith("Basic devin-session-token$");
@@ -308,18 +370,18 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
 
   it("同一条 IR 构造两次得到逐字节相同的 body", async () => {
     const irRequest = simpleRequest();
-    const first = expectOk(await egress.writeUpstreamRequest(irRequest)).wire.body as Uint8Array;
-    const second = expectOk(await egress.writeUpstreamRequest(irRequest)).wire.body as Uint8Array;
+    const first = expectOk(await outbox.writeOutboxRequest(irRequest)).wire.body as Uint8Array;
+    const second = expectOk(await outbox.writeOutboxRequest(irRequest)).wire.body as Uint8Array;
     expect(second).toEqual(first);
     // traceId 变了才该变：id 是从 traceId 派生的，不是随机的。
-    const other = expectOk(await egress.writeUpstreamRequest(
+    const other = expectOk(await outbox.writeOutboxRequest(
       simpleRequest({ traceId: "tr_other" }),
     )).wire.body as Uint8Array;
     expect(other).not.toEqual(first);
   });
 
   it("工具往返：assistant 的 toolCall 进 toolCalls，结果各自成一条 source=4 的 prompt", async () => {
-    const decoded = decodeWire(await egress.writeUpstreamRequest(request({
+    const decoded = decodeWire(await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [
         { role: "user", parts: [{ kind: "text", text: "create hello.txt" }] },
@@ -365,7 +427,7 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
   });
 
   it("错误的工具结果打上 tool_result_is_error", async () => {
-    const decoded = decodeWire(await egress.writeUpstreamRequest(request({
+    const decoded = decodeWire(await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [
         {
@@ -389,7 +451,7 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
   });
 
   it("图片进 ImageData，且不往 prompt 里注入任何占位文案", async () => {
-    const decoded = decodeWire(await egress.writeUpstreamRequest(request({
+    const decoded = decodeWire(await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [{
         role: "user",
@@ -408,7 +470,7 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
   });
 
   it("缓存断点落到 prompt_cache_options / system_prompt_cache_options 的 EPHEMERAL", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys", cacheBreakpoint: { scope: "ephemeral" } }],
       turns: [{
         role: "user",
@@ -423,8 +485,8 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
       .toBe(true);
   });
 
-  it("思考与签名写进 thinking/signature，并记一条「未经实证」的 loss", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+  it("思考写进 thinking 且不再记 loss；只有签名因为丢了 signature_type 才留痕", async () => {
+    const withSignature = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [{
         role: "assistant",
@@ -434,19 +496,32 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
         ],
       }],
     }));
-    const decoded = decodeWire(result);
-    expect(decoded.chatMessagePrompts[0]).toMatchObject({
+    expect(decodeWire(withSignature).chatMessagePrompts[0]).toMatchObject({
       thinking: "let me think", signature: "sig-abc", prompt: "done",
     });
-    const thinkingLoss = expectOk(result).losses.find(
-      (loss) => loss.path === "$.conversation.turns[0]" && loss.detail.includes("thinking/signature"),
+    const signatureLoss = expectOk(withSignature).losses.find(
+      (loss) => loss.path === "$.conversation.turns[0]" && loss.detail.includes("signature_type"),
     );
-    expect(thinkingLoss?.kind).toBe("degraded");
-    expect(thinkingLoss?.detail).toContain("没有任何一次真实调用证明");
+    expect(signatureLoss?.kind).toBe("degraded");
+    // 损的是家族标签，不是「上游会不会消费思考」——后者已被抓包证伪。
+    expect(signatureLoss?.detail).toContain("openai");
+
+    // 没有签名的纯思考回合：wire 照常带 thinking，一条回合级 loss 都不记。
+    const bare = await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: "sys" }],
+      turns: [{
+        role: "assistant",
+        parts: [{ kind: "thinking", text: "just thinking" }, { kind: "text", text: "done" }],
+      }],
+    }));
+    expect(decodeWire(bare).chatMessagePrompts[0]).toMatchObject({
+      thinking: "just thinking", signature: "", prompt: "done",
+    });
+    expect(expectOk(bare).losses.filter((loss) => loss.path === "$.conversation.turns[0]")).toEqual([]);
   });
 
   it("客户端给了采样参数就用客户端的，没给才由出口命名并留痕", async () => {
-    const bare = await egress.writeUpstreamRequest(simpleRequest());
+    const bare = await outbox.writeOutboxRequest(simpleRequest());
     const bareDecoded = decodeWire(bare);
     expect(bareDecoded.configuration).toMatchObject({ temperature: 1, topK: 40n, topP: 0.95 });
     const substitution = expectOk(bare).losses.find((loss) => loss.path === "$.intent");
@@ -454,7 +529,7 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
     expect(substitution?.detail).toContain("temperature");
     expect(substitution?.detail).toContain("max_newlines");
 
-    const explicit = await egress.writeUpstreamRequest(simpleRequest({
+    const explicit = await outbox.writeOutboxRequest(simpleRequest({
       intent: intent({
         sampling: { temperature: clientValue(0.3), topP: clientValue(0.5), topK: clientValue(7) },
         stopping: { maxOutputTokens: clientValue(4096), stopSequences: clientValue(["</done>"]) },
@@ -472,14 +547,14 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
   });
 
   it("关闭并行工具调用走 disable_parallel_tool_calls", async () => {
-    const decoded = decodeWire(await egress.writeUpstreamRequest(simpleRequest({
+    const decoded = decodeWire(await outbox.writeOutboxRequest(simpleRequest({
       toolset: { ...EMPTY_TOOLSET, parallel: clientValue(false) },
     })));
     expect(decoded.disableParallelToolCalls).toBe(true);
   });
 
   it("effort 记成 substituted 并说明它是靠模型 id 表达的", async () => {
-    const result = await egress.writeUpstreamRequest(simpleRequest({
+    const result = await outbox.writeOutboxRequest(simpleRequest({
       intent: intent({ reasoning: clientValue({ mode: "enabled", display: "summarized", effort: "high" }) }),
     }));
     const loss = expectOk(result).losses.find((one) => one.path === "$.intent.reasoning.effort");
@@ -490,9 +565,9 @@ describe("writeUpstreamRequest 构造真实 GetChatMessage", () => {
 
 // ── 拒绝 ────────────────────────────────────────────────────────────────────
 
-describe("writeUpstreamRequest 的拒绝条件", () => {
+describe("writeOutboxRequest 的拒绝条件", () => {
   it("悬空的工具调用带精确路径拒绝", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [{
         role: "assistant",
@@ -511,7 +586,7 @@ describe("writeUpstreamRequest 的拒绝条件", () => {
   });
 
   it("孤儿工具结果带精确路径拒绝", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await outbox.writeOutboxRequest(request({
       system: [{ kind: "text", text: "sys" }],
       turns: [{
         role: "user",
@@ -530,7 +605,7 @@ describe("writeUpstreamRequest 的拒绝条件", () => {
   });
 
   it("带工具却没有 system 时按生产实证拒绝", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await outbox.writeOutboxRequest(request({
       turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
       toolset: {
         ...EMPTY_TOOLSET,
@@ -546,7 +621,7 @@ describe("writeUpstreamRequest 的拒绝条件", () => {
   });
 
   it("一次收齐全部构造问题，而不是遇到第一个就返回", async () => {
-    const result = await egress.writeUpstreamRequest(request({
+    const result = await outbox.writeOutboxRequest(request({
       system: [
         { kind: "text", text: "sys" },
         { kind: "image", media: { source: { kind: "base64", data: "AA==" }, mediaType: "image/png" } },
@@ -595,7 +670,7 @@ describe("writeUpstreamRequest 的拒绝条件", () => {
   });
 
   it("一个可承载的回合都没有时拒绝，而不是发一条空请求", async () => {
-    const result = await egress.writeUpstreamRequest(request({ turns: [] }));
+    const result = await outbox.writeOutboxRequest(request({ turns: [] }));
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.problems).toEqual([expect.objectContaining({
@@ -607,9 +682,9 @@ describe("writeUpstreamRequest 的拒绝条件", () => {
 
 // ── 响应：正常流 ────────────────────────────────────────────────────────────
 
-describe("readUpstreamResponse 正常流", () => {
+describe("readOutboxResponse 正常流", () => {
   it("文本增量 + 跨帧累积的 usage + 干净尾帧", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "PO", usage: { outputTokens: 1n } }),
       dataFrame({
         deltaText: "NG",
@@ -635,7 +710,7 @@ describe("readUpstreamResponse 正常流", () => {
   });
 
   it("分片的 deltaToolCalls 被拼成完整参数，stopReason=10 归 toolUse", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "I'll write it.", usage: { inputTokens: 8n, outputTokens: 2n } }),
       dataFrame({ deltaToolCalls: [{ id: "toolu_1", name: "Write", argumentsJson: "" }] }),
       dataFrame({ deltaToolCalls: [{ id: "", name: "", argumentsJson: '{"path":"hello.txt"' }] }),
@@ -665,7 +740,7 @@ describe("readUpstreamResponse 正常流", () => {
   });
 
   it("并行工具由各自 id 的首帧切分，分片归属最近开始的那个", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaToolCalls: [{ id: "t1", name: "Read", argumentsJson: "" }] }),
       dataFrame({ deltaToolCalls: [{ id: "", name: "", argumentsJson: '{"path":"a"}' }] }),
       dataFrame({ deltaToolCalls: [{ id: "t2", name: "Read", argumentsJson: "" }] }),
@@ -684,7 +759,7 @@ describe("readUpstreamResponse 正常流", () => {
   });
 
   it("delta_thinking / delta_signature 走思考块，与文本块自动切边界", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaThinking: "weighing options" }),
       dataFrame({ deltaSignature: "sig-xyz" }),
       dataFrame({ deltaText: "here you go" }),
@@ -710,9 +785,9 @@ describe("readUpstreamResponse 正常流", () => {
       dataFrame({ deltaText: "NG", stopReason: 3 }),
       endFrame({}),
     ]);
-    const whole = await collect(egress.readUpstreamResponse(connectResponse(bytes)));
+    const whole = await collect(outbox.readOutboxResponse(connectResponse(bytes)));
     // 3 字节一刀：帧头被劈开、payload 被劈开、尾帧也被劈开。
-    const sliced = await collect(egress.readUpstreamResponse(
+    const sliced = await collect(outbox.readOutboxResponse(
       connectResponse(bytes, new Array(Math.ceil(bytes.length / 3)).fill(3)),
     ));
     expect(sliced).toEqual(whole);
@@ -720,7 +795,7 @@ describe("readUpstreamResponse 正常流", () => {
   });
 
   it("thinking_redacted 只是个 bool，不造 redactedThinking 块，只留痕", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ thinkingRedacted: true, deltaText: "ok" }),
       endFrame({}),
     ]))));
@@ -733,9 +808,9 @@ describe("readUpstreamResponse 正常流", () => {
 
 // ── 响应：unhandled 兜底 ────────────────────────────────────────────────────
 
-describe("readUpstreamResponse 的 unhandled 兜底", () => {
+describe("readOutboxResponse 的 unhandled 兜底", () => {
   it("一个语义字段都没有的帧走 unhandled 而不是被静默吞掉", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "a" }),
       // latency / creditCost 是纯计费与遥测字段：没有任何语义产出。
       dataFrame({ latency: 12.5, creditCost: 3 }),
@@ -750,7 +825,7 @@ describe("readUpstreamResponse 的 unhandled 兜底", () => {
   it("解不开的 protobuf payload 走 unhandled，并把原字节 base64 带出来", async () => {
     // 0xFF 不是合法的 protobuf tag：这一帧解码必抛。
     const broken = enframe(new Uint8Array([0xff, 0xff, 0xff, 0xff]));
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       broken, dataFrame({ deltaText: "still here" }), endFrame({}),
     ]))));
     const unhandled = events.find((event) => event.kind === "unhandled");
@@ -767,14 +842,14 @@ describe("readUpstreamResponse 的 unhandled 兜底", () => {
     view.setUint8(0, 0b01);
     view.setUint32(1, payload.length, false);
     compressed.set(payload, CONNECT_FRAME_HEADER_BYTES);
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       compressed, dataFrame({ deltaText: "x" }), endFrame({}),
     ]))));
     expect(events[0]).toMatchObject({ kind: "unhandled", rawType: "<windsurf-frame:compressed:flag=1>" });
   });
 
   it("表里没有的 stop reason 走 unhandled 而不是落进一个默认值", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "x", stopReason: 99 }),
       endFrame({}),
     ]))));
@@ -790,7 +865,7 @@ describe("readUpstreamResponse 的 unhandled 兜底", () => {
     view.setUint8(0, 0b10);
     view.setUint32(1, payload.length, false);
     badEnd.set(payload, CONNECT_FRAME_HEADER_BYTES);
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "x" }), badEnd,
     ]))));
     expect(events.some((event) => event.kind === "unhandled"
@@ -799,7 +874,7 @@ describe("readUpstreamResponse 的 unhandled 兜底", () => {
   });
 
   it("content-type 不是 connect+proto 时不当成空成功", async () => {
-    const events = await collect(egress.readUpstreamResponse(new Response("<html>oops</html>", {
+    const events = await collect(outbox.readOutboxResponse(new Response("<html>oops</html>", {
       status: 200,
       headers: { "content-type": "text/html" },
     })));
@@ -810,9 +885,9 @@ describe("readUpstreamResponse 的 unhandled 兜底", () => {
 
 // ── 响应：截断与错误 ────────────────────────────────────────────────────────
 
-describe("readUpstreamResponse 的终止判定", () => {
+describe("readOutboxResponse 的终止判定", () => {
   it("流结束却没有结束帧 → error，绝不产出 200 但空的假成功", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "half a sen" }),
     ]))));
     expect(kinds(events)).toEqual(["messageStart", "partStart", "partDelta", "partEnd", "usage", "error"]);
@@ -826,7 +901,7 @@ describe("readUpstreamResponse 的终止判定", () => {
 
   it("在一帧中间被掐断时错误文案区分「半帧」与「少个尾帧」", async () => {
     const bytes = dataFrame({ deltaText: "hello" });
-    const events = await collect(egress.readUpstreamResponse(
+    const events = await collect(outbox.readOutboxResponse(
       connectResponse(bytes.slice(0, bytes.length - 3)),
     ));
     const last = events.at(-1);
@@ -835,7 +910,7 @@ describe("readUpstreamResponse 的终止判定", () => {
   });
 
   it("干净尾帧但一条数据帧都没有 → error", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(endFrame({}))));
+    const events = await collect(outbox.readOutboxResponse(connectResponse(endFrame({}))));
     expect(kinds(events)).toEqual(["error"]);
     expect(events[0]).toMatchObject({
       kind: "error",
@@ -844,7 +919,7 @@ describe("readUpstreamResponse 的终止判定", () => {
   });
 
   it("上游自报 STOP_REASON_ERROR 时不报成 messageStop", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaText: "x", stopReason: 13 }),
       endFrame({}),
     ]))));
@@ -857,7 +932,7 @@ describe("readUpstreamResponse 的终止判定", () => {
 
 describe("Connect 尾帧里的应用错误", () => {
   it("permission_denied 归 permissionDenied 且不可重试 —— 重试会打遍账号池", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       // 生产实测：上游先回一个无内容的首帧，拒绝随后才从尾帧到达。
       dataFrame({ messageId: "m1" }),
       endFrame({ error: { code: "permission_denied", message: "an internal error occurred" } }),
@@ -879,7 +954,7 @@ describe("Connect 尾帧里的应用错误", () => {
   });
 
   it("出错时不铺半截的工具块 —— 那是把垃圾当内容提交", async () => {
-    const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
       dataFrame({ deltaToolCalls: [{ id: "t1", name: "Write", argumentsJson: '{"path":' }] }),
       endFrame({ error: { code: "permission_denied", message: "blocked" } }),
     ]))));
@@ -890,9 +965,9 @@ describe("Connect 尾帧里的应用错误", () => {
 
   it("瞬时码可重试、请求码不可重试、配额与限流分得开", async () => {
     const cases: readonly [Record<string, unknown>, string, boolean][] = [
-      [{ code: "unavailable", message: "try again" }, "upstreamUnavailable", true],
-      [{ code: "internal", message: "boom" }, "upstreamUnavailable", true],
-      [{ code: "deadline_exceeded", message: "slow" }, "upstreamUnavailable", true],
+      [{ code: "unavailable", message: "try again" }, "outboxUnavailable", true],
+      [{ code: "internal", message: "boom" }, "outboxUnavailable", true],
+      [{ code: "deadline_exceeded", message: "slow" }, "outboxUnavailable", true],
       [{ code: "resource_exhausted", message: "rate limit exceeded" }, "rateLimited", true],
       [{ code: "resource_exhausted", message: "monthly quota exhausted" }, "quotaExhausted", false],
       [{ code: "invalid_argument", message: "an internal error occurred" }, "invalidRequest", false],
@@ -902,7 +977,7 @@ describe("Connect 尾帧里的应用错误", () => {
       [{ code: "canceled", message: "client went away" }, "transport", true],
     ];
     for (const [payload, kind, retryable] of cases) {
-      const events = await collect(egress.readUpstreamResponse(connectResponse(concat([
+      const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
         dataFrame({ messageId: "m" }),
         endFrame({ error: payload }),
       ]))));
@@ -920,7 +995,7 @@ describe("Connect 尾帧里的应用错误", () => {
   });
 
   it("HTTP 层错误走真正的状态码，与尾帧错误是两条路径", async () => {
-    const events = await collect(egress.readUpstreamResponse(new Response(
+    const events = await collect(outbox.readOutboxResponse(new Response(
       JSON.stringify({ code: "unauthenticated", message: "invalid session" }),
       { status: 401, headers: { "content-type": "application/json" } },
     )));
@@ -935,12 +1010,542 @@ describe("Connect 尾帧里的应用错误", () => {
       },
     }]);
 
-    const overloaded = await collect(egress.readUpstreamResponse(
+    const overloaded = await collect(outbox.readOutboxResponse(
       new Response("upstream is on fire", { status: 503 }),
     ));
     expect(overloaded[0]).toMatchObject({
       kind: "error",
-      error: { kind: "upstreamUnavailable", httpStatus: 503, retryable: true },
+      error: { kind: "outboxUnavailable", httpStatus: 503, retryable: true },
     });
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 真实抓包：12 条 GetChatMessage 请求字节
+//
+// 前面所有用例的报文都是本仓库自己编出来的 —— 它们能证明「我们编得自洽」，
+// 证明不了「我们对上游的形状认知是对的」。这一段拿的是 mitmproxy 从真实 Devin CLI
+// 抓下来的字节（`test/fixtures/windsurf_capture/`，`metadata.apiKey` 已抹），
+// 12 条**全部得到上游 HTTP 200**。`src/egress/windsurf/index.ts` 里每一条标「抓包」的
+// 能力声明，判据都锁在下面这些断言上：夹具被换掉、或者本地 FDS 与真实 wire 对不上，
+// 这里就会红，而不是等到线上收到一个语义模糊的 4xx。
+// ════════════════════════════════════════════════════════════════════════════
+
+const CAPTURE_DIR = new URL("./fixtures/windsurf_capture/", import.meta.url);
+
+const CAPTURE_FILES = [
+  "getchatmessage_017.pb", "getchatmessage_020.pb", "getchatmessage_027.pb",
+  "getchatmessage_035.pb", "getchatmessage_065.pb", "getchatmessage_074.pb",
+  "getchatmessage_093.pb", "getchatmessage_111.pb", "getchatmessage_117.pb",
+  "getchatmessage_130.pb", "getchatmessage_148.pb", "getchatmessage_159.pb",
+] as const;
+
+function captureBytes(file: string): Uint8Array {
+  return new Uint8Array(readFileSync(new URL(file, CAPTURE_DIR)));
+}
+
+function captureRequest(file: string): Record<string, any> {
+  return fromBinary(schema.requestDesc, captureBytes(file)) as unknown as Record<string, any>;
+}
+
+const CAPTURES = CAPTURE_FILES.map((file) => ({ file, message: captureRequest(file) }));
+const CAPTURED_PROMPTS = CAPTURES.flatMap(({ file, message }) =>
+  (message.chatMessagePrompts as any[]).map((prompt, index) => ({ file, index, prompt })));
+
+describe("抓包：本地 FDS 与真实 wire 对得上", () => {
+  it("12 条全部解得开，且没有一个字段落进 $unknown", () => {
+    expect(CAPTURES).toHaveLength(12);
+    for (const { file, message } of CAPTURES) {
+      // $unknown 非空 = 真实客户端发了本地 FDS 不认识的字段，即协议漂移。
+      expect({ file, unknown: (message.$unknown as unknown[] | undefined)?.length ?? 0 })
+        .toEqual({ file, unknown: 0 });
+      for (const prompt of message.chatMessagePrompts as any[]) {
+        expect((prompt.$unknown as unknown[] | undefined)?.length ?? 0).toBe(0);
+      }
+    }
+  });
+
+  it("解出来再编回去逐字节相同 —— 出站方向用的是同一套 descriptor", () => {
+    for (const { file, message } of CAPTURES) {
+      const reencoded = toBinary(schema.requestDesc, message as never);
+      expect({ file, same: Buffer.from(reencoded).equals(Buffer.from(captureBytes(file))) })
+        .toEqual({ file, same: true });
+    }
+  });
+});
+
+describe("抓包：请求信封的实证形状", () => {
+  it("真实客户端只设 11 个顶层字段，其余一个都不发", () => {
+    // 反过来说：本出口发的任何一个不在这张表里的顶层字段，都没有抓包背书。
+    const alwaysSet = ["prompt", "chatMessagePrompts", "chatModelUid", "requestType",
+      "cascadeId", "plannerMode", "metadata", "configuration", "trajectoryReference"] as const;
+    const neverSet = ["useInternalChatModel", "internalChatModel", "disableParallelToolCalls",
+      "chatModelName", "promptId", "providerSource", "language",
+      "toolChoice", "systemPromptCacheOptions", "experimentConfig"] as const;
+    for (const { file, message } of CAPTURES) {
+      for (const field of alwaysSet) {
+        expect({ file, field, empty: isEmptyWireValue(message[field]) })
+          .toEqual({ file, field, empty: false });
+      }
+      for (const field of neverSet) {
+        expect({ file, field, empty: isEmptyWireValue(message[field]) })
+          .toEqual({ file, field, empty: true });
+      }
+    }
+    // tools / executionId 只有那条「生成会话标题」的短请求没有。
+    expect(CAPTURES.filter(({ message }) => (message.tools as any[]).length > 0)).toHaveLength(11);
+    expect(CAPTURES.filter(({ message }) => (message.executionId as string).length > 0)).toHaveLength(11);
+  });
+
+  it("configuration 的六个标量是 WIRE_NEUTRAL 的证据来源", () => {
+    for (const { file, message } of CAPTURES) {
+      const configuration = message.configuration;
+      expect({ file, ...pickConfiguration(configuration) } as Record<string, unknown>).toEqual({
+        file,
+        numCompletions: 1n,
+        maxNewlines: 400n,
+        temperature: 1,
+        topK: 40n,
+        // 0.95 过 float32 就是这个值 —— 断言写成 0.95 会红，这正是要锁的。
+        topP: 0.949999988079071,
+        seed: 0n,
+        stopPatterns: [],
+        serviceTier: "",
+      });
+    }
+    // max_tokens 是唯一不一致的那个：两个量级都被上游受理。
+    const byMaxTokens = new Map<string, string[]>();
+    for (const { file, message } of CAPTURES) {
+      const key = String(message.configuration.maxTokens);
+      byMaxTokens.set(key, [...(byMaxTokens.get(key) ?? []), file]);
+    }
+    expect(byMaxTokens.get("128000")).toHaveLength(10);
+    expect(byMaxTokens.get("65535")).toHaveLength(2);
+    // 65535 的那两条正是 gemini 家族 —— 所以 WIRE_NEUTRAL 取 128000 只是「被观测最多」。
+    expect(CAPTURES.filter(({ message }) => message.configuration.maxTokens === 65535n)
+      .map(({ message }) => message.chatModelUid))
+      .toEqual(["gemini-3-6-flash-high", "gemini-3-6-flash-high"]);
+  });
+
+  it("四个模型家族共用同一个信封，家族只是 chat_model_uid 一个字符串", () => {
+    expect([...new Set(CAPTURES.map(({ message }) => message.chatModelUid as string))].sort())
+      .toEqual(["gemini-3-6-flash-high", "gpt-5-6-terra-high", "kimi-k3-high", "swe-1-6-fast"]);
+    // 家族不同，但 requestType / plannerMode / trajectory_type 完全一致。
+    for (const { file, message } of CAPTURES) {
+      expect({ file, requestType: message.requestType, plannerMode: message.plannerMode })
+        .toEqual({ file, requestType: 5, plannerMode: 1 });
+      expect(message.trajectoryReference.trajectoryType).toBe(4);
+      expect(message.trajectoryReference.forceBillable).toBe(false);
+    }
+  });
+
+  it("trajectory 是**跨请求的会话轨迹**，本出口每条请求各起一条 —— 已知的偏离", async () => {
+    // 12 条共用同一个 trajectory_id，step_index 从 0 单调数到 11。
+    const ids = new Set(CAPTURES.map(({ message }) => message.trajectoryReference.trajectoryId as string));
+    expect(ids.size).toBe(1);
+    expect(CAPTURES.map(({ message }) => Number(message.trajectoryReference.stepIndex)))
+      .toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    // step_type 不是常量：14 与 0 两种都被受理过。
+    expect([...new Set(CAPTURES.map(({ message }) => message.trajectoryReference.stepType))].sort())
+      .toEqual([0, 14]);
+
+    // 本出口每条请求都新起一条 trajectory（id 从 traceId 派生、stepIndex 恒 0、stepType 恒 14）。
+    // 这与真实客户端不同，但 12 条里 stepIndex=0/stepType=14 的那条同样是 200，
+    // 而「跨请求维持轨迹」需要出口持有会话状态 —— 那是调用方的事，不是编译事实。
+    const decoded = decodeWire(await outbox.writeOutboxRequest(simpleRequest()));
+    expect(decoded.trajectoryReference).toMatchObject({ trajectoryType: 4, stepIndex: 0, stepType: 14 });
+  });
+
+  it("metadata 只有 8 个字段，且真实客户端填的是 f 而不是 device_fingerprint", () => {
+    for (const { file, message } of CAPTURES) {
+      const metadata = message.metadata;
+      expect({ file, ...pickMetadata(metadata) } as Record<string, unknown>).toEqual({
+        file,
+        ideName: "chisel",
+        extensionName: "chisel",
+        extensionVersion: "3000.2.17",
+        ideVersion: "3000.2.17",
+        locale: "en",
+        os: "linux",
+        apiKey: "devin-session-token$REDACTED-BY-FIXTURE-EXTRACTION",
+      });
+      expect((metadata.f as string).length).toBe(732);
+      // 本出口的 WindsurfClientProfile.deviceFingerprint 走的是另一个字段，抓包从不填它。
+      expect(metadata.deviceFingerprint).toBe("");
+      // request_id 真实客户端送 0；本出口改送 traceId 派生值，这条差异是知情的。
+      expect(metadata.requestId).toBe(0n);
+      expect(metadata.sessionId).toBe("");
+    }
+    // CHISEL_PROFILE 就是抓包里那一份，逐字段一致。
+    expect(CHISEL_PROFILE).toEqual({
+      ideName: "chisel", extensionName: "chisel", extensionVersion: "3000.2.17",
+      ideVersion: "3000.2.17", locale: "en", os: "linux",
+    });
+  });
+});
+
+describe("抓包：回合与工具的实证形状", () => {
+  it("135 个回合按 source 分成 user(1)/assistant(2)/tool(4) 三档", () => {
+    expect(CAPTURED_PROMPTS).toHaveLength(135);
+    const bySource = new Map<number, number>();
+    for (const { prompt } of CAPTURED_PROMPTS) {
+      bySource.set(prompt.source, (bySource.get(prompt.source) ?? 0) + 1);
+    }
+    expect([...bySource].sort((a, b) => a[0] - b[0])).toEqual([[1, 72], [2, 40], [4, 23]]);
+  });
+
+  it("工具结果是一条 source=4 的 prompt：prompt 文本 + tool_call_id，没有 toolResult 子消息", () => {
+    const toolResults = CAPTURED_PROMPTS.filter(({ prompt }) => prompt.source === 4);
+    expect(toolResults).toHaveLength(23);
+    for (const { file, index, prompt } of toolResults) {
+      const shape = {
+        hasPrompt: (prompt.prompt as string).length > 0,
+        hasToolCallId: (prompt.toolCallId as string).length > 0,
+        toolCalls: (prompt.toolCalls as unknown[]).length,
+        images: (prompt.images as unknown[]).length,
+      };
+      expect({ file, index, ...shape }).toEqual({
+        file, index, hasPrompt: true, hasToolCallId: true, toolCalls: 0, images: 0,
+      });
+    }
+    // 本出口的 lowerToolResult 编出来的正是这个形状 —— 与抓包对齐，不是自创。
+    expect(toolResults.map(({ prompt }) => prompt.toolCallId as string))
+      .toContain("web_search_1");
+
+    // ⚠ 抓包**没有**覆盖 tool_result_is_error：23 条全是 false。
+    // supports 里的 toolResultError 靠的是生产那份证据，不是这 12 条报文。
+    expect(toolResults.every(({ prompt }) => prompt.toolResultIsError === false)).toBe(true);
+    // 同理 toolResultImage 留在 lossy：没有一条工具结果带过图。
+    expect(toolResults.every(({ prompt }) => (prompt.images as unknown[]).length === 0)).toBe(true);
+  });
+
+  it("并行工具调用：一个 assistant 回合里 2 个 tool_calls，6 条报文都是 200", () => {
+    const parallelTurns = CAPTURED_PROMPTS.filter(
+      ({ prompt }) => (prompt.toolCalls as unknown[]).length > 1);
+    expect(parallelTurns.map(({ file }) => file)).toEqual([
+      "getchatmessage_093.pb", "getchatmessage_111.pb", "getchatmessage_117.pb",
+      "getchatmessage_130.pb", "getchatmessage_148.pb", "getchatmessage_159.pb",
+    ]);
+    for (const { prompt } of parallelTurns) {
+      expect(prompt.source).toBe(2);
+      expect((prompt.toolCalls as any[]).map((call) => call.name)).toEqual(["web_search", "web_search"]);
+      // 两个调用各有自己的 id —— 关联靠 id，不靠位置。
+      const ids = (prompt.toolCalls as any[]).map((call) => call.id as string);
+      expect(new Set(ids).size).toBe(2);
+    }
+  });
+
+  it("图片是 ImageData{base64Data,mimeType,caption}，挂在 user 回合上", () => {
+    const withImages = CAPTURED_PROMPTS.filter(({ prompt }) => (prompt.images as unknown[]).length > 0);
+    expect(withImages.reduce((sum, { prompt }) => sum + (prompt.images as unknown[]).length, 0)).toBe(11);
+    for (const { prompt } of withImages) {
+      expect(prompt.source).toBe(1);
+      for (const image of prompt.images as any[]) {
+        expect(image.mimeType).toBe("image/png");
+        // caption 是空串 —— 生产实现会往 prompt 里插 `[Image 1: …]` 占位文案，抓包证明真实客户端不插。
+        expect(image.caption).toBe("");
+        expect((image.base64Data as string).length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("ChatToolDefinition 只用 name/description/json_schema_string，MCP 靠元工具而不是 server_name", () => {
+    const tools = CAPTURES.flatMap(({ message }) => message.tools as any[]);
+    expect(tools).toHaveLength(253);
+    for (const tool of tools) {
+      expect((tool.name as string).length).toBeGreaterThan(0);
+      expect((tool.description as string).length).toBeGreaterThan(0);
+      expect((tool.jsonSchemaString as string).length).toBeGreaterThan(0);
+      // 这六个全空 —— toolGroup / toolFreeform / toolBuiltin 三条判断的直接依据。
+      for (const field of ["serverName", "strict", "isCustomTool", "customToolGrammar",
+        "attributionFieldNames", "computerUseConfig"] as const) {
+        expect({ name: tool.name, field, empty: isEmptyWireValue(tool[field]) })
+          .toEqual({ name: tool.name, field, empty: true });
+      }
+    }
+    const names = (CAPTURES[0]?.message.tools as any[]).map((tool) => tool.name as string);
+    // MCP 分组是四个普通 function 元工具，不是 server_name。
+    expect(names).toContain("mcp_call_tool");
+    expect(names).toContain("mcp_list_servers");
+    // web_search 也是普通 function 工具，不是上游内建能力 —— toolBuiltin 因此仍然不可承载。
+    expect(names).toContain("web_search");
+    expect(names).toHaveLength(23);
+  });
+});
+
+describe("抓包：thinking / signature / geminiThoughtSignature", () => {
+  it("thinking 在 39/135 个回合上真实回传 —— supports 的直接依据", () => {
+    const withThinking = CAPTURED_PROMPTS.filter(
+      ({ prompt }) => (prompt.thinking as string).length > 0);
+    expect(withThinking).toHaveLength(39);
+    // 全部挂在 assistant 回合上。
+    expect(withThinking.every(({ prompt }) => prompt.source === 2)).toBe(true);
+  });
+
+  it("signature 稀疏(2/135)且**带家族标签**，IR 装不下标签 —— 这才是 lossy 的理由", () => {
+    const withSignature = CAPTURED_PROMPTS.filter(
+      ({ prompt }) => (prompt.signature as string).length > 0);
+    expect(withSignature).toHaveLength(2);
+    for (const { prompt } of withSignature) {
+      expect((prompt.signature as string).length).toBe(1984);
+      expect(prompt.signatureType).toBe("openai");
+      expect((prompt.thinking as string).length).toBeGreaterThan(0);
+    }
+    // signature_type="openai" 却出现在 gemini 请求里：签名是上一轮由别家签发后原样带回的。
+    expect(withSignature.map(({ file }) => file))
+      .toEqual(["getchatmessage_148.pb", "getchatmessage_159.pb"]);
+    expect(withSignature.every(({ file }) =>
+      CAPTURES.find((one) => one.file === file)?.message.chatModelUid === "gemini-3-6-flash-high"))
+      .toBe(true);
+  });
+
+  it("geminiThoughtSignature 在 135 个回合上**全为空** —— 零行为实证，不做任何处理", () => {
+    // 这条用例是防复发的：曾经有一份简报把它读成「每个回合都带、非空」，
+    // 原因是拿 `!== ""` 判一个 bytes 字段（空 Uint8Array 恒不等于空串）。
+    // 正确的判空是看 length。
+    for (const { prompt } of CAPTURED_PROMPTS) {
+      const signature = prompt.geminiThoughtSignature as Uint8Array;
+      expect(signature).toBeInstanceOf(Uint8Array);
+      expect(signature.length).toBe(0);
+    }
+    // 而且它是 implicit presence 的 bytes：空值根本不上 wire。
+    // field #17 的 tag 是 (17<<3)|2 = 138 = 0x8A，varint 编码 0x8A 0x01。
+    for (const file of CAPTURE_FILES) {
+      const bytes = captureBytes(file);
+      let hits = 0;
+      for (let i = 0; i + 1 < bytes.length; i += 1) {
+        if (bytes[i] === 0x8a && bytes[i + 1] === 0x01) hits += 1;
+      }
+      expect({ file, hits }).toEqual({ file, hits: 0 });
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 客户端身份：windsurf 自己的 owner option
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Claude Code 的 system 真实排布：计费头一块、身份行**单独一块**、正文一块。 */
+const CLAUDE_CODE_SYSTEM: readonly IRPart[] = [
+  { kind: "text", text: "x-anthropic-billing-header: cc_version=2.1.221.ebe; cc_entrypoint=cli;" },
+  { kind: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+  { kind: "text", text: "\nYou are an interactive agent that helps users with software engineering tasks." },
+];
+
+describe("客户端身份行：windsurf 私有策略，默认做最轻的那一档改动", () => {
+  it("抓包 12/12 条的 system 首行就是 WINDSURF_OBSERVED_IDENTITY_LINE", () => {
+    // 默认替换目标不是编的，是这 12 条字节里唯一一致的那一行。
+    const devinRequests = CAPTURES.filter(({ message }) =>
+      (message.prompt as string).startsWith("You are "));
+    expect(devinRequests.filter(({ message }) =>
+      (message.prompt as string).split("\n")[0] === WINDSURF_OBSERVED_IDENTITY_LINE))
+      .toHaveLength(11);
+    // 第 12 条是「生成会话标题」的短 system，没有身份行 —— 如实记下来，不假装 12/12。
+    expect(CAPTURES.find(({ file }) => file === "getchatmessage_020.pb")?.message.prompt)
+      .toStartWith("You are a session title generator.");
+    // 带 agent 脚手架的那 11 条：system 两万字符 + 23 个工具，全部 200。
+    for (const { message } of devinRequests.filter(({ message }) => (message.tools as any[]).length > 0)) {
+      expect((message.prompt as string).length).toBeGreaterThan(20000);
+      expect((message.tools as any[]).length).toBe(23);
+    }
+  });
+
+  it("默认策略只换身份行那一行，其余 system 一字不动，并记一条 substituted", async () => {
+    const result = await outbox.writeOutboxRequest(request({
+      system: CLAUDE_CODE_SYSTEM,
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const decoded = decodeWire(result);
+    expect(decoded.prompt).toBe([
+      "x-anthropic-billing-header: cc_version=2.1.221.ebe; cc_entrypoint=cli;",
+      WINDSURF_OBSERVED_IDENTITY_LINE,
+      "\nYou are an interactive agent that helps users with software engineering tasks.",
+    ].join("\n\n"));
+    // 关键：**不是**把整个 system 塌缩成中性提示 —— 用户的指令全都还在。
+    expect(decoded.prompt).toContain("interactive agent that helps users with software engineering tasks");
+    expect(decoded.prompt).toContain("x-anthropic-billing-header");
+    expect(decoded.prompt).not.toContain("Claude Code");
+
+    const loss = expectOk(result).losses.find((one) => one.path === "$.conversation.system");
+    expect(loss?.kind).toBe("substituted");
+    // 注释与 loss 都必须把「抓包证明了什么」和「还是推断」分开写。
+    expect(loss?.detail).toContain("抓包实证");
+    expect(loss?.detail).toContain("未验证");
+    expect(loss?.detail).toContain("passthrough");
+  });
+
+  it("passthrough 一步都不改，也不记 loss", async () => {
+    const passthrough = createWindsurfOutbox({
+      model: "claude-opus-4-8-high",
+      apiKey: "devin-session-token$h.e.sig",
+      systemIdentity: { kind: "passthrough" },
+    });
+    const result = await passthrough.writeOutboxRequest(request({
+      system: CLAUDE_CODE_SYSTEM,
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(result).prompt).toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+  });
+
+  /**
+   * 这一组锁的是**后置条件**，不是「尝试替换」：
+   * 非空 system 过完这条策略，文本里一定含有 `identityLine`。
+   *
+   * 纯替换的失败模式是静默的 —— 锚点漂一个字就什么都不做，出站带着外来身份行上去，
+   * 代码里没有一处报错。prepend 兜底把「没命中」从静默失效变成一条**看得见的降级**。
+   */
+  it("锚点没命中 → prepend 到最前面，绝不静默什么都不做", async () => {
+    const notMatching = await outbox.writeOutboxRequest(request({
+      // 提到了 Claude Code，但不是那一行身份行 —— 判据是整行精确相等，不是子串。
+      system: [{ kind: "text", text: "The user is running Claude Code, Anthropic's official CLI for Claude, in a terminal." }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(notMatching).prompt as string;
+    // 后置条件：身份行在，而且在最前面。
+    expect(prompt.split("\n")[0]).toBe(WINDSURF_OBSERVED_IDENTITY_LINE);
+    // 客户端原文一字未动地跟在后面。
+    expect(prompt).toContain("The user is running Claude Code, Anthropic's official CLI for Claude, in a terminal.");
+
+    const loss = expectOk(notMatching).losses.find((one) => one.path === "$.conversation.system");
+    expect(loss?.kind).toBe("substituted");
+    // 走的是哪条路必须写在 detail 里，否则排障时分不清「换了」和「补了」。
+    expect(loss?.detail).toContain("prepend");
+  });
+
+  it("身份行已经在了 → 一个字节都不动（幂等，多轮不会越堆越长）", async () => {
+    const devin = await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: `${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.` }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(devin).prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.`);
+    expect(expectOk(devin).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+
+    // 身份行不在首行时同样算「已经在了」—— 判据是存在，不是位置。
+    const buried = await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: `preamble\n${WINDSURF_OBSERVED_IDENTITY_LINE}\ntail` }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(buried).prompt).toBe(`preamble\n${WINDSURF_OBSERVED_IDENTITY_LINE}\ntail`);
+    expect(expectOk(buried).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+  });
+
+  it("空 system 是故意的例外：不 prepend，因为那是凭空发明客户端没写过的指令", async () => {
+    const empty = await outbox.writeOutboxRequest(request({
+      system: [],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(empty).prompt).toBe("");
+    expect(expectOk(empty).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+  });
+
+  it("调用方可以自定身份行与被取代清单；替换一次请求最多动一行", async () => {
+    const custom = createWindsurfOutbox({
+      model: "claude-opus-4-8-high",
+      apiKey: "devin-session-token$h.e.sig",
+      systemIdentity: {
+        kind: "ensureIdentityLine",
+        identityLine: "I am human.",
+        supersededLines: ["I am robot."],
+      },
+    });
+    const result = await custom.writeOutboxRequest(request({
+      system: [{ kind: "text", text: "I am robot.\nkeep\nI am robot." }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    // 只换第一处：第二处原样留着，改动有确定上界。
+    expect(decodeWire(result).prompt).toBe("I am human.\nkeep\nI am robot.");
+    expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system")).toHaveLength(1);
+
+    // 换了自定清单之后，Claude Code 那一行不再是「被取代」的对象 —— 于是走 prepend，
+    // 而不是像纯替换实现那样什么都不做。
+    const other = await custom.writeOutboxRequest(request({
+      system: CLAUDE_CODE_SYSTEM,
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const otherPrompt = decodeWire(other).prompt as string;
+    expect(otherPrompt.split("\n")[0]).toBe("I am human.");
+    expect(otherPrompt).toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+  });
+
+  it("Claude Agent SDK 的身份行也在默认被取代清单里", async () => {
+    const sdk = await outbox.writeOutboxRequest(request({
+      system: [{ kind: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n\nDo the thing." }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(sdk).prompt).toBe(`${WINDSURF_OBSERVED_IDENTITY_LINE}\n\nDo the thing.`);
+    expect(expectOk(sdk).losses.find((one) => one.path === "$.conversation.system")?.detail)
+      .toContain("整行换成");
+  });
+
+  it("反例：这条特化**只**属于 windsurf，同一条 IR 走 anthropic 出口一个字都不变", async () => {
+    const irRequest = request({
+      system: CLAUDE_CODE_SYSTEM,
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: intent({ stopping: { maxOutputTokens: clientValue(1024) } }),
+    });
+    const anthropic = createAnthropicOutbox({
+      baseUrl: "https://api.anthropic.com",
+      apiKey: "sk-test",
+      model: "claude-opus-4-6",
+    });
+    const result = await anthropic.writeOutboxRequest(irRequest);
+    if (!result.ok) throw new Error(`anthropic build failed: ${JSON.stringify(result.problems)}`);
+    const body = JSON.parse(result.wire.body as string) as { system: { text: string }[] };
+    // 身份行原样进 anthropic 的 system —— windsurf 的替换没有泄漏成通用 repair。
+    expect(body.system.map((block) => block.text))
+      .toEqual(CLAUDE_CODE_SYSTEM.map((part) => (part.kind === "text" ? part.text : "")));
+    expect(JSON.stringify(body)).not.toContain("Devin");
+    // 也没有任何一条 windsurf 的 loss 混进别家出口。
+    expect(result.losses.every((loss) => loss.outbox !== "windsurf")).toBe(true);
+    expect(result.losses.filter((loss) => loss.path === "$.conversation.system")).toEqual([]);
+
+    // 而 IROutboxProfile 里不该长出任何身份/策略字段 —— 它只描述三条 wire 事实加一个出口名。
+    const profileKeys = Object.keys(outbox.profile);
+    expect(profileKeys).toContain("supports");
+    expect(profileKeys).toContain("lossy");
+    expect(profileKeys).toContain("mandatory");
+    expect(profileKeys.some((key) => /identity|policy|content|rewrite/iu.test(key))).toBe(false);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 回读侧：抓包在响应帧上钉住的两件事
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("readOutboxResponse：抓包钉住的响应形状", () => {
+  it("delta_signature_type 送不进 IR，如实记一条 loss，签名照常下发", async () => {
+    // 抓包实证：2107 帧里 delta_signature 与 delta_signature_type 各 2 次、成对出现。
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
+      dataFrame({ deltaThinking: "weighing" }),
+      dataFrame({ deltaSignature: "sig-1984", deltaSignatureType: "openai" }),
+      endFrame({}),
+    ]))));
+    expect(events.some((event) => event.kind === "partDelta"
+      && event.delta.kind === "thinkingSignature"
+      && event.delta.signature === "sig-1984")).toBe(true);
+    const loss = events.find((event) => event.kind === "loss");
+    expect(loss).toMatchObject({
+      kind: "loss",
+      loss: { path: "$.response.deltaSignatureType", kind: "dropped", outbox: "windsurf" },
+    });
+    expect((loss as { loss: { detail: string } }).loss.detail).toContain("openai");
+    expect(events.at(-1)).toMatchObject({ kind: "messageStop" });
+  });
+
+  it("response_dimension_groups 没有映射：只带它的一帧走 unhandled，不被静默吞掉", async () => {
+    const events = await collect(outbox.readOutboxResponse(connectResponse(concat([
+      dataFrame({ deltaText: "a" }),
+      // ⚠ 真实流里每帧都带 messageId，所以这条兜底在抓包上从未被触发；
+      //   它防的是「上游哪天单发一帧维度信息」。这里构造的正是那种帧。
+      dataFrame({ responseDimensionGroups: [{ dimensions: [] }] }),
+      endFrame({}),
+    ]))));
+    const unhandled = events.find((event) => event.kind === "unhandled");
+    expect(unhandled).toBeDefined();
+    expect((unhandled as { rawType: string }).rawType).toStartWith("<windsurf-response:");
+    // 兜底不是终止：前面的文本照常产出，收尾照常。
+    expect(events.some((event) => event.kind === "partDelta")).toBe(true);
+    expect(events.at(-1)).toMatchObject({ kind: "messageStop" });
   });
 });

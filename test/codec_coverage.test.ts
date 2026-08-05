@@ -8,8 +8,8 @@
  * 逼你把新增能力写进来，而不是悄悄多出几条没人知道的路。
  */
 import { describe, expect, it } from "bun:test";
-import { availableRoutes, routesPerNewEgress, type IREgressRegistry } from "../src/ir/codec.ts";
-import { EGRESS_PROVIDERS, INGRESS_CODECS, INGRESS_PATHS, INGRESS_PATH_BY_PROTOCOL } from "../src/protocols.ts";
+import { availableRoutes, routesPerNewOutbox, type IROutboxRegistry } from "../src/ir/codec.ts";
+import { OUTBOX_REGISTRY, INGRESS_CODECS, INGRESS_PATHS, INGRESS_PATH_BY_PROTOCOL } from "../src/protocols.ts";
 import { IR_PROTOCOLS } from "../src/ir/types.ts";
 
 // 协议清单从唯一授权定义取，不在测试里手抄第二份 —— 手抄的那份改了源不会失败，
@@ -52,51 +52,51 @@ describe("出口是开放集", () => {
     // 早先这条断言写成了「没有任何出口能与客户端协议同名」，那是过强且错的：
     // Anthropic Messages 与 OpenAI Responses 本来就既是客户端协议又是上游 API。
     // 两条轴要锁的是**独立**：出口键空间开放，不必是、也不必不是客户端协议。
-    const providerNames = Object.keys(EGRESS_PROVIDERS);
+    const providerNames = Object.keys(OUTBOX_REGISTRY);
 
     // 存在既是客户端协议、又是上游 API 的出口（重叠是允许的）
     expect(providerNames.some((name) => (PROTOCOLS as readonly string[]).includes(name))).toBe(true);
     // 也存在**根本不是**任何客户端协议的出口 —— 这才是两条轴必须分开的实证
     expect(providerNames.some((name) => !(PROTOCOLS as readonly string[]).includes(name))).toBe(true);
 
-    expect(EGRESS_PROVIDERS.anthropic.wire).toBe("anthropic_messages_sse");
+    expect(OUTBOX_REGISTRY.anthropic.wire).toBe("anthropic_messages_sse");
   });
 });
 
 describe("路由数只随出口线性增长", () => {
   it("路由数 = 入口数 × 出口数，且每个组合恰好出现一次", () => {
-    const routes = availableRoutes(INGRESS_CODECS, EGRESS_PROVIDERS);
+    const routes = availableRoutes(INGRESS_CODECS, OUTBOX_REGISTRY);
     const ingressCount = Object.keys(INGRESS_CODECS).length;
-    const egressCount = Object.keys(EGRESS_PROVIDERS).length;
+    const egressCount = Object.keys(OUTBOX_REGISTRY).length;
     expect(routes).toHaveLength(ingressCount * egressCount);
     // 去重后仍是全量，说明没有重复也没有遗漏的组合
     expect(new Set(routes.map((route) => `${route.from}->${route.to}`)).size).toBe(routes.length);
     for (const from of PROTOCOLS) {
-      for (const to of Object.keys(EGRESS_PROVIDERS)) {
+      for (const to of Object.keys(OUTBOX_REGISTRY)) {
         expect(routes.some((route) => route.from === from && route.to === to)).toBe(true);
       }
     }
   });
 
   it("Gemini CloudCode 已在册 —— 它只能当出口，是两条轴分开的实证", () => {
-    expect(Object.keys(EGRESS_PROVIDERS)).toContain("gemini_cloudcode");
-    expect(EGRESS_PROVIDERS.gemini_cloudcode.wire).toBe("google_cloudcode_stream_generate_content_sse");
+    expect(Object.keys(OUTBOX_REGISTRY)).toContain("gemini_cloudcode");
+    expect(OUTBOX_REGISTRY.gemini_cloudcode.wire).toBe("google_cloudcode_stream_generate_content_sse");
     // 出口名不是任何客户端协议
     expect(PROTOCOLS).not.toContain("gemini_cloudcode" as never);
   });
 
   it("Windsurf Connect 已在册 —— 它服务不同模型家族，但不是一组按模型拆开的出口", () => {
-    expect(EGRESS_PROVIDERS.windsurf.wire).toBe("connectrpc_protobuf_stream");
+    expect(OUTBOX_REGISTRY.windsurf.wire).toBe("connectrpc_protobuf_stream");
     expect(PROTOCOLS).not.toContain("windsurf" as never);
   });
 
   it("接一家新上游的边际收益恒为 3 —— 两个函数换三条路由", () => {
-    expect(routesPerNewEgress(INGRESS_CODECS)).toBe(PROTOCOLS.length);
+    expect(routesPerNewOutbox(INGRESS_CODECS)).toBe(PROTOCOLS.length);
 
     const stub = { name: "x", wire: "x", create: (() => { throw new Error("not called"); }) as never };
-    const baseline = availableRoutes(INGRESS_CODECS, EGRESS_PROVIDERS).length;
-    const withOneMore: IREgressRegistry = { ...EGRESS_PROVIDERS, windsurf_connect: { ...stub, name: "windsurf_connect" } };
-    const withTwoMore: IREgressRegistry = { ...withOneMore, bedrock: { ...stub, name: "bedrock" } };
+    const baseline = availableRoutes(INGRESS_CODECS, OUTBOX_REGISTRY).length;
+    const withOneMore: IROutboxRegistry = { ...OUTBOX_REGISTRY, windsurf_connect: { ...stub, name: "windsurf_connect" } };
+    const withTwoMore: IROutboxRegistry = { ...withOneMore, bedrock: { ...stub, name: "bedrock" } };
 
     // 每接一家，路由数恰好 +3（= 入口数），不是 +1
     expect(availableRoutes(INGRESS_CODECS, withOneMore)).toHaveLength(baseline + PROTOCOLS.length);

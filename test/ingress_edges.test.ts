@@ -225,7 +225,7 @@ describe("anthropic messages ingress", () => {
   it("孤立的空回合**原样保留**，Core 不丢也不留痕 —— 丢空是策略", () => {
     // 这条原本断言「丢掉并留痕」，锁的正是被剥离出去的 dropEmptyTurns。
     // 丢空回合是「我替你删」，已归 repair 层的 dropEmptyTurn；Core 只做确定性编译，
-    // 把空回合原样交给 egress，由各 wire 按自己的编译事实处置。
+    // 把空回合原样交给 outbox，由各 wire 按自己的编译事实处置。
     const { request, losses } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
@@ -512,7 +512,7 @@ describe("cross-protocol invariants", () => {
       ],
     }, TRACE);
     const result = partsOfTurn(request, 3)[0];
-    // 位置隔了两个回合，关联仍然成立 —— Anthropic wire 的「必须紧邻」是 egress 的事。
+    // 位置隔了两个回合，关联仍然成立 —— Anthropic wire 的「必须紧邻」是 outbox 的事。
     expect(result?.kind === "toolResult" && result.result.callId).toBe("c1");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { writeResponsesResponse } from "../src/ingress/openai_encode.ts";
+import { writeChatCompletionsResponse, writeResponsesResponse } from "../src/ingress/openai_encode.ts";
 import { defaultValue, type IREvent, type IRRequest } from "../src/ir/types.ts";
 
 async function* streamOf(events: readonly IREvent[]): AsyncGenerator<IREvent> {
@@ -37,5 +37,31 @@ describe("Responses 流式 encoder", () => {
     expect(body.indexOf("event: response.output_item.done")).toBeLessThan(body.indexOf("event: response.completed"));
     expect(body).toContain('"namespace":"weather"');
     expect(body).toContain('"arguments":"{\\"city\\":\\"Shanghai\\"}"');
+  });
+});
+
+describe("Chat Completions encoder", () => {
+  it("流式工具调用用与聚合响应一致的 group__name", async () => {
+    const events: readonly IREvent[] = [
+      { kind: "messageStart", model: "gpt-test" },
+      { kind: "partStart", index: 0, part: { kind: "toolCall", call: { id: "call_weather", toolRef: { group: "weather", name: "get" }, input: { kind: "json", value: {} } } } },
+      { kind: "partEnd", index: 0 },
+      { kind: "messageStop", reason: "toolUse" },
+    ];
+    const chatRequest: IRRequest = { ...request, protocol: "openai_chat_completions" };
+
+    const streamed = writeChatCompletionsResponse(streamOf(events), chatRequest, { messageId: "chat_stream_test" });
+    const streamedBody = await (streamed as Response).text();
+    expect(streamedBody).toContain('"name":"weather__get"');
+
+    const aggregateRequest: IRRequest = {
+      ...chatRequest,
+      intent: { ...chatRequest.intent, stream: defaultValue(false) },
+    };
+    const aggregate = await writeChatCompletionsResponse(streamOf(events), aggregateRequest, { messageId: "chat_aggregate_test" });
+    const aggregateBody = await (aggregate as Response).json() as {
+      choices: Array<{ message: { tool_calls: Array<{ function: { name: string } }> } }>;
+    };
+    expect(aggregateBody.choices[0]?.message.tool_calls[0]?.function.name).toBe("weather__get");
   });
 });

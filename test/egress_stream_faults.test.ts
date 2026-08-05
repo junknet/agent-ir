@@ -12,21 +12,21 @@
  *
  * 为什么把五个出口塞进一张表而不是各写一遍：故障形态是**协议无关**的（帧被切开、
  * 帧解不开、终止事件没来），只有它们的字节表示是协议相关的。表驱动之后，
- * 新增一个出口只需要在 PROVIDERS 里加一行，十条故障自动全覆盖 —— 漏测一种
+ * 新增一个出口只需要在 OUTBOX_FIXTURES 里加一行，十条故障自动全覆盖 —— 漏测一种
  * 不再取决于谁记得。
  */
 import { describe, expect, it } from "bun:test";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeUpstream, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
 import { CONNECT_FRAME_HEADER_BYTES, enframe } from "../src/egress/windsurf/connect_frame.ts";
 import { getSharedWindsurfSchema } from "../src/egress/windsurf/schema.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { superviseUpstreamStream } from "../src/ir/stream_guard.ts";
-import type { IREgress, IREvent, IRWireBody } from "../src/ir/types.ts";
+import type { IROutbox, IREvent, IRWireBody } from "../src/ir/types.ts";
 
 // ── 字节工具 ────────────────────────────────────────────────────────────────
 
@@ -139,9 +139,9 @@ function windsurfEnd(trailer: Record<string, unknown>): Uint8Array {
 
 const HUGE_TEXT = "喵".repeat(400_000); // ~1.2 MB UTF-8，跨越任何合理的 chunk 边界
 
-interface Provider {
+interface OutboxFixture {
   readonly name: string;
-  readonly egress: IREgress<IRWireBody>;
+  readonly outbox: IROutbox<IRWireBody>;
   readonly contentType: string;
   /** 一条完整成功的流。 */
   readonly complete: Uint8Array;
@@ -208,10 +208,10 @@ const geminiOk: readonly string[] = [
   dataFrameText(geminiChunk([{ text: "" }], "STOP")),
 ];
 
-const PROVIDERS: readonly Provider[] = [
+const OUTBOX_FIXTURES: readonly OutboxFixture[] = [
   {
     name: "anthropic",
-    egress: createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
+    outbox: createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
     contentType: "text/event-stream",
     complete: sseLf(anthropicOk),
     truncated: sseLf(anthropicOk.slice(0, 4)),
@@ -229,7 +229,7 @@ const PROVIDERS: readonly Provider[] = [
   },
   {
     name: "openai_chat",
-    egress: createChatCompletionsUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    outbox: createOpenAIChatOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
     contentType: "text/event-stream",
     complete: sseLf(chatOk),
     truncated: sseLf(chatOk.slice(0, 3)),
@@ -243,7 +243,7 @@ const PROVIDERS: readonly Provider[] = [
   },
   {
     name: "openai_responses",
-    egress: createResponsesUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    outbox: createOpenAIResponsesOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
     contentType: "text/event-stream",
     complete: sseLf(responsesOk),
     truncated: sseLf(responsesOk.slice(0, 4)),
@@ -261,7 +261,7 @@ const PROVIDERS: readonly Provider[] = [
   },
   {
     name: "gemini_cloudcode",
-    egress: createGeminiCloudCodeUpstream({
+    outbox: createGeminiCloudCodeOutbox({
       model: "gemini-3.6-flash-high", accessToken: "ya29.t", project: "p",
       requestIdFactory: () => "agent/1/1/deadbeef/2",
     }),
@@ -279,7 +279,7 @@ const PROVIDERS: readonly Provider[] = [
   },
   {
     name: "windsurf",
-    egress: createWindsurfUpstream({ model: "claude-opus-4-8-high", apiKey: "devin-session-token$h.e.s" }),
+    outbox: createWindsurfOutbox({ model: "claude-opus-4-8-high", apiKey: "devin-session-token$h.e.s" }),
     contentType: "application/connect+proto",
     complete: concat([windsurfData({ deltaText: "PO" }), windsurfData({ deltaText: "NG" }), windsurfEnd({})]),
     truncated: concat([windsurfData({ deltaText: "PO" }), windsurfData({ deltaText: "NG" })]),
@@ -303,10 +303,10 @@ const PROVIDERS: readonly Provider[] = [
   },
 ];
 
-function respond(provider: Provider, payload: Uint8Array, chunkSize = payload.length || 1): Response {
+function respond(outbox: OutboxFixture, payload: Uint8Array, chunkSize = payload.length || 1): Response {
   return new Response(streamed(payload, chunkSize), {
     status: 200,
-    headers: { "content-type": provider.contentType },
+    headers: { "content-type": outbox.contentType },
   });
 }
 
@@ -332,11 +332,11 @@ async function expectNoSilentSuccess(events: readonly IREvent[]): Promise<void> 
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("对照组：完整流", () => {
-  for (const provider of PROVIDERS) {
-    it(`${provider.name}：内容完整、以 messageStop 收尾、没有 error`, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(`${outbox.name}：内容完整、以 messageStop 收尾、没有 error`, async () => {
       clearThoughtSignatureCache();
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.complete)));
-      expect(textOf(events)).toBe(provider.expectedText);
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.complete)));
+      expect(textOf(events)).toBe(outbox.expectedText);
       expect(kinds(events)).toContain("messageStop");
       expect(events.some((event) => event.kind === "error")).toBe(false);
     });
@@ -348,10 +348,10 @@ describe("对照组：完整流", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("空流：200 + 零字节，绝不是成功", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
-      const events = await collect(provider.egress.readUpstreamResponse(
-        new Response(streamed(new Uint8Array(0), 1), { status: 200, headers: { "content-type": provider.contentType } }),
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
+      const events = await collect(outbox.outbox.readOutboxResponse(
+        new Response(streamed(new Uint8Array(0), 1), { status: 200, headers: { "content-type": outbox.contentType } }),
       ));
       expect(events.some((event) => event.kind === "error")).toBe(true);
       expect(kinds(events)).not.toContain("messageStop");
@@ -361,10 +361,10 @@ describe("空流：200 + 零字节，绝不是成功", () => {
 });
 
 describe("body 为 null（HEAD 式响应 / 代理吞掉了 body）", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
-      const events = await collect(provider.egress.readUpstreamResponse(
-        new Response(null, { status: 200, headers: { "content-type": provider.contentType } }),
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
+      const events = await collect(outbox.outbox.readOutboxResponse(
+        new Response(null, { status: 200, headers: { "content-type": outbox.contentType } }),
       ));
       expect(events.some((event) => event.kind === "error")).toBe(true);
       expect(kinds(events)).not.toContain("messageStop");
@@ -374,9 +374,9 @@ describe("body 为 null（HEAD 式响应 / 代理吞掉了 body）", () => {
 });
 
 describe("只有心跳/遥测的流：连接是活的，但一个字都没产出", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.heartbeatOnly)));
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.heartbeatOnly)));
       expect(events.some((event) => event.kind === "error")).toBe(true);
       expect(kinds(events)).not.toContain("messageStop");
       await expectNoSilentSuccess(events);
@@ -385,9 +385,9 @@ describe("只有心跳/遥测的流：连接是活的，但一个字都没产出
 });
 
 describe("终止事件缺失：内容发了一半，连接没了", () => {
-  for (const provider of PROVIDERS) {
-    it(`${provider.name}：已到达的内容保留，但必须以 error 收尾`, async () => {
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.truncated)));
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(`${outbox.name}：已到达的内容保留，但必须以 error 收尾`, async () => {
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.truncated)));
       const last = events.at(-1);
       expect(last?.kind).toBe("error");
       if (last?.kind === "error") {
@@ -406,13 +406,13 @@ describe("终止事件缺失：内容发了一半，连接没了", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("TCP 分片：切在任意字节上都必须解出同一串事件", () => {
-  for (const provider of PROVIDERS) {
+  for (const outbox of OUTBOX_FIXTURES) {
     for (const chunkSize of [1, 2, 3, 7, 64]) {
-      it(`${provider.name} / 每 ${chunkSize} 字节一刀`, async () => {
+      it(`${outbox.name} / 每 ${chunkSize} 字节一刀`, async () => {
         clearThoughtSignatureCache();
-        const whole = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.complete)));
+        const whole = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.complete)));
         clearThoughtSignatureCache();
-        const sliced = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.complete, chunkSize)));
+        const sliced = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.complete, chunkSize)));
         expect(sliced).toEqual(whole);
       });
     }
@@ -422,23 +422,23 @@ describe("TCP 分片：切在任意字节上都必须解出同一串事件", () 
    * 一字节一刀必然把 `\r\n` 切在 `\r` 与 `\n` 之间。孤立的 `\r` 落在缓冲末尾时
    * **不能**当成行结束符 —— 当成了就会在事件中间劈一刀，症状是内容凭空少一段。
    */
-  for (const provider of PROVIDERS) {
-    if (provider.completeCrlf === null) continue;
-    it(`${provider.name}：换一种行终止符分帧，逐字节切开仍解出同样的内容`, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    if (outbox.completeCrlf === null) continue;
+    it(`${outbox.name}：换一种行终止符分帧，逐字节切开仍解出同样的内容`, async () => {
       clearThoughtSignatureCache();
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.completeCrlf!, 1)));
-      expect(textOf(events)).toBe(provider.expectedText);
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.completeCrlf!, 1)));
+      expect(textOf(events)).toBe(outbox.expectedText);
       expect(kinds(events)).toContain("messageStop");
     });
   }
 });
 
 describe("超大单帧：1MB 文本不许被分片逻辑截断", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
       clearThoughtSignatureCache();
       // 8KB 一刀 —— 一帧要跨 150 个 chunk 才拼得回来。
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.hugeFrame, 8192)));
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.hugeFrame, 8192)));
       expect(textOf(events)).toBe(HUGE_TEXT);
       expect(kinds(events)).toContain("messageStop");
     });
@@ -450,10 +450,10 @@ describe("超大单帧：1MB 文本不许被分片逻辑截断", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("解析不出来的帧：进 unhandled，不静默丢，也不终止整条流", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
       clearThoughtSignatureCache();
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.withBadFrame)));
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.withBadFrame)));
       expect(kinds(events)).toContain("unhandled");
       // 坏帧之后的正常帧照常产出 —— 一个坏帧不该让后面的内容全部蒸发。
       expect(textOf(events)).toContain("NG");
@@ -463,27 +463,27 @@ describe("解析不出来的帧：进 unhandled，不静默丢，也不终止整
 });
 
 describe("没见过的事件类型：进 unhandled（不变量 4：不许有 switch 黑洞）", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
       clearThoughtSignatureCache();
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.withUnknownEvent)));
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.withUnknownEvent)));
       expect(kinds(events)).toContain("unhandled");
-      expect(textOf(events)).toBe(provider.expectedText);
+      expect(textOf(events)).toBe(outbox.expectedText);
       expect(kinds(events)).toContain("messageStop");
     });
   }
 });
 
 describe("终止事件出现两次：结局唯一且确定，不许把内容重放一遍", () => {
-  for (const provider of PROVIDERS) {
-    it(provider.name, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(outbox.name, async () => {
       clearThoughtSignatureCache();
-      const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider.doubleTerminal)));
+      const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox.doubleTerminal)));
       const source = (async function* () { yield* events; })();
       const assembled = await assembleResponse(source, "fallback");
       // 内容不因为多了一个终止事件而重复。
       expect(assembled.turn.parts.filter((part) => part.kind === "text")
-        .map((part) => (part.kind === "text" ? part.text : "")).join("")).toBe(provider.expectedText);
+        .map((part) => (part.kind === "text" ? part.text : "")).join("")).toBe(outbox.expectedText);
       // 结局要么是一个确定的 stopReason，要么是一个明确的 error，不许两者都没有。
       expect(assembled.stopReason !== null || assembled.error !== null).toBe(true);
     });
@@ -496,8 +496,8 @@ describe("终止事件出现两次：结局唯一且确定，不许把内容重�
 
 describe("事件乱序：partDelta 先于 partStart", () => {
   it("anthropic：上游先发 delta 再发 start，折叠时记 unhandled 而不是静默丢内容", async () => {
-    const provider = PROVIDERS[0]!;
-    const events = await collect(provider.egress.readUpstreamResponse(respond(provider, sseLf([
+    const outbox = OUTBOX_FIXTURES[0]!;
+    const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, sseLf([
       anthropicOk[0]!,
       anthropicFrame("content_block_delta", { index: 0, delta: { type: "text_delta", text: "orphan" } }),
       anthropicOk[1]!,
@@ -512,8 +512,8 @@ describe("事件乱序：partDelta 先于 partStart", () => {
   });
 
   it("anthropic：content_block_stop 先于 start —— 不许因此丢掉后来的内容", async () => {
-    const provider = PROVIDERS[0]!;
-    const events = await collect(provider.egress.readUpstreamResponse(respond(provider, sseLf([
+    const outbox = OUTBOX_FIXTURES[0]!;
+    const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, sseLf([
       anthropicOk[0]!,
       anthropicFrame("content_block_stop", { index: 0 }),
       anthropicOk[1]!, anthropicOk[2]!, anthropicOk[3]!, anthropicOk[4]!,
@@ -548,27 +548,27 @@ describe("事件乱序：partDelta 先于 partStart", () => {
  * 见文件末尾那组守卫用例。
  */
 describe("传输层断连", () => {
-  for (const provider of PROVIDERS) {
-    it(`${provider.name}：首字节前断开，绝不产出假成功`, async () => {
+  for (const outbox of OUTBOX_FIXTURES) {
+    it(`${outbox.name}：首字节前断开，绝不产出假成功`, async () => {
       let threw = false;
       let events: IREvent[] = [];
       try {
-        events = await collect(provider.egress.readUpstreamResponse(
-          new Response(severed(null), { status: 200, headers: { "content-type": provider.contentType } }),
+        events = await collect(outbox.outbox.readOutboxResponse(
+          new Response(severed(null), { status: 200, headers: { "content-type": outbox.contentType } }),
         ));
       } catch { threw = true; }
       expect(threw || events.some((event) => event.kind === "error")).toBe(true);
       expect(kinds(events)).not.toContain("messageStop");
     });
 
-    it(`${provider.name}：内容发了一半断开，绝不产出假成功`, async () => {
+    it(`${outbox.name}：内容发了一半断开，绝不产出假成功`, async () => {
       // 完整流的前 60% —— 一定切在某个帧的中间。
-      const prefix = provider.complete.slice(0, Math.floor(provider.complete.length * 0.6));
+      const prefix = outbox.complete.slice(0, Math.floor(outbox.complete.length * 0.6));
       let threw = false;
       let events: IREvent[] = [];
       try {
-        events = await collect(provider.egress.readUpstreamResponse(
-          new Response(severed(prefix), { status: 200, headers: { "content-type": provider.contentType } }),
+        events = await collect(outbox.outbox.readOutboxResponse(
+          new Response(severed(prefix), { status: 200, headers: { "content-type": outbox.contentType } }),
         ));
       } catch { threw = true; }
       expect(threw || events.some((event) => event.kind === "error")).toBe(true);
@@ -583,11 +583,11 @@ describe("传输层断连", () => {
 
 describe("红线：任何故障流都不许折出「没内容也没错误」的回合", () => {
   const faults = ["truncated", "heartbeatOnly", "withBadFrame", "doubleTerminal"] as const;
-  for (const provider of PROVIDERS) {
+  for (const outbox of OUTBOX_FIXTURES) {
     for (const fault of faults) {
-      it(`${provider.name} / ${fault}`, async () => {
+      it(`${outbox.name} / ${fault}`, async () => {
         clearThoughtSignatureCache();
-        const events = await collect(provider.egress.readUpstreamResponse(respond(provider, provider[fault])));
+        const events = await collect(outbox.outbox.readOutboxResponse(respond(outbox, outbox[fault])));
         await expectNoSilentSuccess(events);
       });
     }
@@ -599,7 +599,7 @@ describe("红线：任何故障流都不许折出「没内容也没错误」的�
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * `readUpstreamResponse` 的契约是 `AsyncIterable<IREvent>`，而 `IREvent` 里有 `error`
+ * `readOutboxResponse` 的契约是 `AsyncIterable<IREvent>`，而 `IREvent` 里有 `error`
  * 这一态；`response.ts` 写得很明白：「上游的失败是数据（error），不是控制流」。
  *
  * **传输层**的失败（TCP reset、TLS 中断、上游进程被杀）也必须落在这条契约里：
@@ -615,22 +615,22 @@ describe("红线：任何故障流都不许折出「没内容也没错误」的�
  */
 describe("传输层断连变成 error 事件，而不是异常", () => {
   it("DEFECT-6 提交后断连：守卫补一条协议内的 error 事件收尾", async () => {
-    const provider = PROVIDERS[0]!;
+    const outbox = OUTBOX_FIXTURES[0]!;
     const prefix = sseLf(anthropicOk.slice(0, 4));
     const response = new Response(severed(prefix), {
-      status: 200, headers: { "content-type": provider.contentType },
+      status: 200, headers: { "content-type": outbox.contentType },
     });
-    const events = await collect(superviseUpstreamStream(provider.egress.readUpstreamResponse(response)));
+    const events = await collect(superviseUpstreamStream(outbox.outbox.readOutboxResponse(response)));
     expect(kinds(events)).toContain("committed");
     expect(events.at(-1)?.kind).toBe("error");
   });
 
   it("DEFECT-6 提交前断连：同样应当是一条可重试的 error 事件", async () => {
-    const provider = PROVIDERS[0]!;
+    const outbox = OUTBOX_FIXTURES[0]!;
     const response = new Response(severed(null), {
-      status: 200, headers: { "content-type": provider.contentType },
+      status: 200, headers: { "content-type": outbox.contentType },
     });
-    const events = await collect(superviseUpstreamStream(provider.egress.readUpstreamResponse(response)));
+    const events = await collect(superviseUpstreamStream(outbox.outbox.readOutboxResponse(response)));
     expect(events.at(-1)).toMatchObject({ kind: "error", error: { kind: "transport", retryable: true } });
   });
 });

@@ -17,24 +17,24 @@
  * 不复制那些断言。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createGeminiCloudCodeUpstream } from "../src/egress/gemini_cloudcode.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createGeminiCloudCodeOutbox } from "../src/egress/gemini_cloudcode.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { IR_BUILD_PROBLEM_KINDS, clientValue, defaultValue } from "../src/ir/types.ts";
 import type {
-  IRBuildProblemKind, IREgress, IRIntent, IRRequest, IRTurn, IRWireBody,
+  IRBuildProblemKind, IROutbox, IRIntent, IRRequest, IRTurn, IRWireBody,
 } from "../src/ir/types.ts";
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
-const anthropic = createAnthropicUpstream({
+const anthropic = createAnthropicOutbox({
   baseUrl: "http://127.0.0.1:1", apiKey: "test-key", model: "claude-test",
 });
-const responses = createResponsesUpstream({
+const responses = createOpenAIResponsesOutbox({
   baseUrl: "http://127.0.0.1:1", apiKey: "test-key", model: "gpt-test",
 });
-const gemini = createGeminiCloudCodeUpstream({
+const gemini = createGeminiCloudCodeOutbox({
   model: "gemini-3.6-flash-high",
   accessToken: "ya29.test-token",
   project: "default-cli-project",
@@ -79,7 +79,7 @@ function request(turns: readonly IRTurn[], over: Partial<IRIntent> = {}): IRRequ
 interface ProblemCase {
   /** 哪个出口在什么情形下产出这一档。 */
   readonly why: string;
-  readonly egress: IREgress<IRWireBody>;
+  readonly outbox: IROutbox<IRWireBody>;
   readonly request: IRRequest;
   /** 期望的 IR 路径 —— 拒绝的价值全在于「是哪个字段」。 */
   readonly path: string;
@@ -97,7 +97,7 @@ const CASES = {
   /** 目标 wire 强制要求，而 IR 里**没有**这个值。 */
   requiredFieldMissing: {
     why: "Anthropic 必填 max_tokens，客户端一个都没给（网关不替它发明默认值）",
-    egress: anthropic,
+    outbox: anthropic,
     request: request([TEXT_TURN], { stopping: {} }),
     path: "$.intent.stopping.maxOutputTokens",
     detailContains: "max_tokens",
@@ -109,7 +109,7 @@ const CASES = {
    */
   unsatisfiableValue: {
     why: "CloudCode 的 maxOutputTokens 含 thinkingBudget，客户端的 20 装不下 10000 的预算",
-    egress: gemini,
+    outbox: gemini,
     request: request([TEXT_TURN], {
       reasoning: clientValue({ mode: "enabled", budgetTokens: 10000, display: "summarized" }),
       stopping: { maxOutputTokens: clientValue(20) },
@@ -120,7 +120,7 @@ const CASES = {
 
   danglingToolCall: {
     why: "声明了 tool_use 却没有对应结果，Anthropic 不接受悬空",
-    egress: anthropic,
+    outbox: anthropic,
     request: request([
       TEXT_TURN,
       { role: "assistant", parts: [{
@@ -134,7 +134,7 @@ const CASES = {
 
   orphanToolResult: {
     why: "工具结果找不到发起它的调用",
-    egress: anthropic,
+    outbox: anthropic,
     request: request([
       { role: "user", parts: [{
         kind: "toolResult",
@@ -147,7 +147,7 @@ const CASES = {
 
   unrepresentablePart: {
     why: "/v1/responses 没有实证过的 document 载体，网关不拿一句转述顶替正文",
-    egress: responses,
+    outbox: responses,
     request: request([
       { role: "user", parts: [{
         kind: "document",
@@ -171,7 +171,7 @@ describe("IRBuildProblemKind 的枚举闸门", () => {
   for (const kind of IR_BUILD_PROBLEM_KINDS) {
     const problemCase: ProblemCase = CASES[kind];
     it(`${kind}：${problemCase.why}`, async () => {
-      const built = await problemCase.egress.writeUpstreamRequest(problemCase.request);
+      const built = await problemCase.outbox.writeOutboxRequest(problemCase.request);
       expect(built.ok).toBe(false);
       if (built.ok) return;
       const found = built.problems.find((problem) => problem.kind === kind);
@@ -186,8 +186,8 @@ describe("IRBuildProblemKind 的枚举闸门", () => {
    * 分错了 kind，调用方会被指去补一个它已经有的值。
    */
   it("缺值 vs 值冲突：两者不共用一档 kind", async () => {
-    const missing = await anthropic.writeUpstreamRequest(CASES.requiredFieldMissing.request);
-    const unsatisfiable = await gemini.writeUpstreamRequest(CASES.unsatisfiableValue.request);
+    const missing = await anthropic.writeOutboxRequest(CASES.requiredFieldMissing.request);
+    const unsatisfiable = await gemini.writeOutboxRequest(CASES.unsatisfiableValue.request);
     expect(missing.ok).toBe(false);
     expect(unsatisfiable.ok).toBe(false);
     if (missing.ok || unsatisfiable.ok) return;

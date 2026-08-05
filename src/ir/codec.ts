@@ -1,19 +1,19 @@
 /**
  * 两条**不同的轴**：入口协议与出口供应商。
  *
- * 早先的版本把 `createEgress` 挂在协议 codec 上，等于假设「出口 ⊆ 入口协议」——这是错的。
+ * 早先的版本把 `createOutbox` 挂在协议 codec 上，等于假设「出口 ⊆ 入口协议」——这是错的。
  * Windsurf 的 Connect/protobuf、Gemini 的 `v1internal:streamGenerateContent` 根本不是任何
  * 客户端协议，它们**只能当出口**；Anthropic Messages 恰好两边都是，那是巧合（它既是客户端
  * 协议又是上游 API），不是结构规律。
  *
  *   inbox   封闭集，锁定三个   readClientRequest + writeClientResponse      写完永不再长
- *   outbox  开放集，3 + n      writeUpstreamRequest + readUpstreamResponse  每加一家只付两个
+ *   outbox  开放集，3 + n      writeOutboxRequest + readOutboxResponse  每加一家只付两个
  *
  * 于是路由数是 `3 × (3+n)`，不是 `N²`；而**新增一个上游的边际成本恒定是两个函数**，
  * 它换来的是「全部三个入口都能路由到它」。这是这套 IR 的全部经济意义：
  * 客户端协议的组合爆炸被入口侧一次性吸收，上游侧只按线性付费。
  */
-import type { ClientRequestReadResult, IREgress, IREvent, IRProtocol, IRRequest, IRWireBody } from "./types.ts";
+import type { ClientRequestReadResult, IROutbox, IREvent, IRProtocol, IRRequest, IRWireBody } from "./types.ts";
 import type { EncodeOptions } from "../ingress/shared.ts";
 
 // ── 入口：封闭集 ────────────────────────────────────────────────────────────
@@ -47,14 +47,14 @@ export type IRIngressRegistry = Readonly<Record<IRProtocol, IRIngressCodec>>;
  * 用 `name` 而不是 `IRProtocol` 作键：出口不必是客户端协议。加 Gemini CloudCode、
  * Windsurf Connect、Bedrock 都只是往这张表里加一行，入口侧零改动。
  */
-export interface IREgressDescriptor<TOptions = unknown, TBody extends IRWireBody = string> {
+export interface IROutboxDescriptor<TOptions = unknown, TBody extends IRWireBody = string> {
   readonly name: string;
   /** 上游的 wire 家族，仅用于诊断与文档，不参与裁决。 */
   readonly wire: string;
-  readonly create: (options: TOptions) => IREgress<TBody>;
+  readonly create: (options: TOptions) => IROutbox<TBody>;
 }
 
-export type IREgressRegistry = Readonly<Record<string, IREgressDescriptor<never, IRWireBody>>>;
+export type IROutboxRegistry = Readonly<Record<string, IROutboxDescriptor<never, IRWireBody>>>;
 
 // ── 路由 ────────────────────────────────────────────────────────────────────
 
@@ -71,18 +71,18 @@ export interface IRRoute {
  */
 export function availableRoutes(
   ingress: IRIngressRegistry,
-  egress: IREgressRegistry,
+  outbox: IROutboxRegistry,
 ): IRRoute[] {
   const routes: IRRoute[] = [];
   for (const protocol of Object.keys(ingress) as IRProtocol[]) {
-    for (const provider of Object.keys(egress)) {
-      routes.push({ from: protocol, to: provider });
+    for (const outboxName of Object.keys(outbox)) {
+      routes.push({ from: protocol, to: outboxName });
     }
   }
   return routes;
 }
 
 /** 接一家新上游的边际收益：恒等于入口数。用于把这套架构的经济性写成可断言的数字。 */
-export function routesPerNewEgress(ingress: IRIngressRegistry): number {
-  return Object.keys(ingress).length;
+export function routesPerNewOutbox(inbox: IRIngressRegistry): number {
+  return Object.keys(inbox).length;
 }

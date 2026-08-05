@@ -1,7 +1,7 @@
 /**
  * 「这条 problem 该开哪条 repair」—— 拒绝信息里最贵的那一句。
  *
- * **这张表必须住在 server 层**，不能下沉进 Core。Core（`src/ir`、`src/egress`）的契约是
+ * **这张表必须住在 server 层**，不能下沉进 Core。Core（`src/ir`、`src/outbox`）的契约是
  * 「目标 wire 表达不了就带精确路径拒绝」，它对 repair 层的存在一无所知也不该知道：
  * repair 是调用方的策略，换一个调用方（例如一个只想看 422、自己决定怎么改请求的 SDK）
  * 根本不会 compose 它。把 `IRRepairKind` 写进 `IRBuildProblem` 会让 Core 依赖策略层，

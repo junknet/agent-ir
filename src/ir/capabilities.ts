@@ -53,8 +53,8 @@ function collectPartNeeds(part: IRPart, path: string, needs: NeedCollector): voi
       });
       break;
     }
-    // opaque 不产生需求：它的处置由每个 egress 显式决定并记 loss，
-    // 在这里映射成某个能力等于替 egress 猜它是什么。
+    // opaque 不产生需求：它的处置由每个 outbox 显式决定并记 loss，
+    // 在这里映射成某个能力等于替 outbox 猜它是什么。
     case "opaque":
       break;
   }

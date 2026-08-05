@@ -11,8 +11,8 @@
  *      判别位藏在形状里（choices / usage / error）。因此 lift 先把 chunk 归形状，
  *      再对形状做 switch，缺省分支照样产出 unhandled —— 归不了形状的 chunk 就是上游漂移。
  *
- * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
- * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
+ * `writeOutboxRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `OutboxRequestReport`。
  *
  * 真实报文出处：`gateway-traffic-logs/*.ndjson` 里 108115 条
  * `chat.completion.chunk`（deepseek-v4-flash / kimi-k3 / glm-5 等兼容端点）。两个反直觉的
@@ -22,12 +22,12 @@
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable,
-  UpstreamRequestBuildResult, IRPart,
-  IRRequest, IRStopReason, IRToolResult, IRTurn, IRUpstreamError, IRUsage,
+  IRBuildProblem, IRCapability, IREffort, IROutbox, IROutboxProfile, IREvent, IRLoss, IRMandatoryFieldTable,
+  OutboxRequestBuildResult, IRPart,
+  IRRequest, IRStopReason, IRToolResult, IRTurn, IROutboxError, IRUsage,
 } from "../ir/types.ts";
 
-const PROVIDER = "openai_chat";
+const OUTBOX = "openai_chat";
 
 /**
  * 能承载且不失真的。
@@ -58,7 +58,7 @@ const SUPPORTED = [
  *   toolGroup                     没有 namespace，只能把分组拍进工具名。
  *   toolResultError               tool 消息没有 is_error，错误状态只能写进文本里。
  *   cacheBreakpoint               没有 cache_control（types.ts 已就此表态：不支持缓存的
- *                                 egress 直接忽略并记 degraded loss）。
+ *                                 outbox 直接忽略并记 degraded loss）。
  *   contextEdit                   没有 context_management。指令丢了只影响上游的上下文预算，
  *                                 不改变本次发出去的内容。
  *   topK                          Chat 没有 top_k，只是一个采样旋钮，不值得让整个上游失格。
@@ -80,7 +80,7 @@ const LOSSY = [
 //   toolResultImage   tool 消息只能是文本。把图片提到后续 user 消息里会改变「谁说的话」
 //                     并破坏 id 关联，写成占位文本则像素全丢 —— 两种都不是承载。
 
-export interface ChatCompletionsUpstreamOptions {
+export interface OpenAIChatOutboxOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
@@ -103,11 +103,11 @@ export interface ChatCompletionsUpstreamOptions {
  *
  * 拒绝是**收集齐再返回**，不是遇到第一个就短路：调用方一次看全才能一次修完。
  */
-class UpstreamRequestReport {
+class OutboxRequestReport {
   readonly #losses: IRLoss[] = [];
   readonly #problems: IRBuildProblem[] = [];
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "outbox", outbox: OUTBOX, ...loss });
   }
   reject(problem: IRBuildProblem): void {
     this.#problems.push(problem);
@@ -127,7 +127,7 @@ function flatToolName(group: string | null, name: string): string {
 }
 
 /** 缓存断点在 Chat 上无处安放。每个带断点的 part 各记一条，路径指到具体位置。 */
-function noteCacheBreakpoint(part: IRPart, path: string, report: UpstreamRequestReport): void {
+function noteCacheBreakpoint(part: IRPart, path: string, report: OutboxRequestReport): void {
   if (part.cacheBreakpoint === undefined) return;
   report.record({
     path: `${path}.cacheBreakpoint`, kind: "dropped",
@@ -142,7 +142,7 @@ function imageUrl(part: Extract<IRPart, { kind: "image" }>): string {
 }
 
 /** system 只能是文本。多个 part 之间用换行拼接，非文本 part 各记一条 loss。 */
-function lowerSystem(parts: readonly IRPart[], report: UpstreamRequestReport): string {
+function lowerSystem(parts: readonly IRPart[], report: OutboxRequestReport): string {
   const chunks: string[] = [];
   parts.forEach((part, index) => {
     const path = `$.conversation.system[${index}]`;
@@ -162,7 +162,7 @@ type ChatContent = string | Array<Record<string, unknown>>;
  * user 回合的内容。只要出现非文本元素就切成数组形态，否则保持字符串
  * —— 兼容端点对字符串 content 的支持面最广，能不用数组就不用。
  */
-function lowerUserContent(parts: readonly IRPart[], turnPath: string, report: UpstreamRequestReport): ChatContent {
+function lowerUserContent(parts: readonly IRPart[], turnPath: string, report: OutboxRequestReport): ChatContent {
   const blocks: Array<Record<string, unknown>> = [];
   let structured = false;
   parts.forEach((part, index) => {
@@ -227,7 +227,7 @@ interface AssistantMessage {
   readonly calls: Array<{ readonly id: string; readonly path: string }>;
 }
 
-function lowerAssistant(parts: readonly IRPart[], turnPath: string, report: UpstreamRequestReport): AssistantMessage {
+function lowerAssistant(parts: readonly IRPart[], turnPath: string, report: OutboxRequestReport): AssistantMessage {
   const texts: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
   const calls: Array<{ id: string; path: string }> = [];
@@ -317,7 +317,7 @@ function lowerAssistant(parts: readonly IRPart[], turnPath: string, report: Upst
  *     输出」，而 IR 说的只是「没有内容」，两者不是一回事：agent 会据此认为命令成功。
  *     想要占位的调用方显式 compose `src/repair` 的 `fillEmptyToolResult`。
  */
-function lowerToolResultContent(result: IRToolResult, path: string, report: UpstreamRequestReport): string {
+function lowerToolResultContent(result: IRToolResult, path: string, report: OutboxRequestReport): string {
   const texts: string[] = [];
   result.parts.forEach((part, index) => {
     const partPath = `${path}.result.parts[${index}]`;
@@ -373,7 +373,7 @@ function lowerToolResultContent(result: IRToolResult, path: string, report: Upst
  */
 function arrangeMessages(
   turns: readonly IRTurn[],
-  report: UpstreamRequestReport,
+  report: OutboxRequestReport,
 ): Array<Record<string, unknown>> {
   const resultsByCallId = new Map<string, { part: Extract<IRPart, { kind: "toolResult" }>; path: string }>();
   const stripped = turns.map((turn, turnIndex) => ({
@@ -456,9 +456,15 @@ function effortFromBudget(budgetTokens: number): string {
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
 
-export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOptions): IREgress {
-  const profile: IREgressProfile = {
-    provider: PROVIDER,
+/**
+ * 无已知危害。判据是**没有一条真实拒绝**是内容策略造成的：这家从未因系统提示词的
+ * 内容本身拒过请求（拒绝都来自 wire 层的字段问题，那是 `writeOutboxRequest` 的事）。
+ *
+ * `false` 是一次表态，不是缺省 —— 新增一种危害时编译器会回到这里逼人重新回答。
+ */
+
+export function createOpenAIChatOutbox(options: OpenAIChatOutboxOptions): IROutbox {
+  const profile: IROutboxProfile = {
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
     mandatory: MANDATORY,
@@ -467,8 +473,8 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
   return {
     profile,
 
-    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const report = new UpstreamRequestReport();
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult> {
+      const report = new OutboxRequestReport();
       const { conversation, intent } = request;
 
       const messages: Array<Record<string, unknown>> = [];
@@ -662,7 +668,7 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       };
     },
 
-    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+    readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
       return liftOpenAIChatStream(response, readOptions);
     },
   };
@@ -716,7 +722,7 @@ function usageFrom(raw: unknown): IRUsage | null {
   };
 }
 
-function classifyError(type: string, code: string, message: string, httpStatus: number | null): IRUpstreamError["kind"] {
+function classifyError(type: string, code: string, message: string, httpStatus: number | null): IROutboxError["kind"] {
   const text = `${code} ${message}`;
   if (/context[_ ]length|context window|maximum context|too many tokens|reduce the length/iu.test(text)) {
     return "contextLengthExceeded";
@@ -734,13 +740,13 @@ function classifyError(type: string, code: string, message: string, httpStatus: 
   }
   if (type === "server_error" || type === "api_error" || type === "overloaded_error"
     || (httpStatus !== null && (httpStatus >= 500 || httpStatus === 408))) {
-    return "upstreamUnavailable";
+    return "outboxUnavailable";
   }
   if (type === "invalid_request_error" || (httpStatus !== null && httpStatus >= 400)) return "invalidRequest";
   return "unknown";
 }
 
-function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstreamError {
+function mapOutboxError(payload: unknown, httpStatus: number | null): IROutboxError {
   const holder = isRecord(payload) ? payload : {};
   const inner = isRecord(holder.error) ? holder.error : holder;
   const type = typeof inner.type === "string" ? inner.type : "";
@@ -752,7 +758,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
   const kind = classifyError(type, code, message, httpStatus);
   return {
     kind, httpStatus, message,
-    retryable: kind === "rateLimited" || kind === "upstreamUnavailable" || kind === "transport",
+    retryable: kind === "rateLimited" || kind === "outboxUnavailable" || kind === "transport",
     raw: payload,
   };
 }
@@ -762,7 +768,7 @@ function transportError(message: string): Extract<IREvent, { kind: "error" }> {
 }
 
 function liftLoss(path: string, kind: IRLoss["kind"], detail: string): Extract<IREvent, { kind: "loss" }> {
-  return { kind: "loss", loss: { stage: "lift", provider: PROVIDER, path, kind, detail } };
+  return { kind: "loss", loss: { stage: "outbox", outbox: OUTBOX, path, kind, detail } };
 }
 
 /**
@@ -824,7 +830,7 @@ async function* liftOpenAIChatStream(
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
-    yield { kind: "error", error: mapUpstreamError(tryParseJson(text) ?? text, response.status) };
+    yield { kind: "error", error: mapOutboxError(tryParseJson(text) ?? text, response.status) };
     return;
   }
 
@@ -839,7 +845,7 @@ async function* liftOpenAIChatStream(
   let sawTerminal = false;
   let announced = false;
 
-  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
+  for await (const frame of iterateSse(response, readOptions?.inspectCompleteSseFrame)) {
     const data = frame.data.trim();
     // [DONE] 是哨兵，不是终止事件：它证明连接正常收尾，不证明这一轮完成了。
     if (data === "[DONE]") continue;
@@ -862,7 +868,7 @@ async function* liftOpenAIChatStream(
     switch (classifyChunk(payload, usage !== null)) {
       case "error":
         sawTerminal = true;
-        yield { kind: "error", error: mapUpstreamError(payload, null) };
+        yield { kind: "error", error: mapOutboxError(payload, null) };
         break;
 
       case "usageOnly":
@@ -1009,7 +1015,7 @@ async function* liftNonStreaming(response: Response): AsyncGenerator<IREvent> {
     return;
   }
   if (isRecord(payload.error) || typeof payload.error === "string") {
-    yield { kind: "error", error: mapUpstreamError(payload, response.status) };
+    yield { kind: "error", error: mapOutboxError(payload, response.status) };
     return;
   }
 

@@ -52,7 +52,7 @@ export interface IRBlob {
     | { readonly kind: "base64"; readonly data: string }
     | { readonly kind: "url"; readonly url: string };
   readonly mediaType: string;
-  /** 已知字节数。让 egress 不解码也能做尺寸预算。 */
+  /** 已知字节数。让 outbox 不解码也能做尺寸预算。 */
   readonly bytes?: number;
 }
 
@@ -66,7 +66,7 @@ export interface IRCacheBreakpoint {
 }
 
 export interface IRPartBase {
-  /** 该 part 之后设一个缓存断点。不支持缓存的 egress 直接忽略并记一条 degraded loss。 */
+  /** 该 part 之后设一个缓存断点。不支持缓存的 outbox 直接忽略并记一条 degraded loss。 */
   readonly cacheBreakpoint?: IRCacheBreakpoint;
 }
 
@@ -89,7 +89,7 @@ export interface IRToolCall {
   /**
    * 发起方标识。Anthropic `tool_use.caller` 实测形态是 `{type:'direct'}` 的**对象**，
    * 不是字符串；subagent 变体的完整形状尚未在语料中出现，因此 `kind` 取判别位、
-   * `raw` 原样保留，能表达它的 egress 可以无损还原，不能的记 loss。
+   * `raw` 原样保留，能表达它的 outbox 可以无损还原，不能的记 loss。
    */
   readonly caller?: { readonly kind: string; readonly raw: unknown };
 }
@@ -116,7 +116,7 @@ export type IRPart =
   | (IRPartBase & { readonly kind: "toolCall"; readonly call: IRToolCall })
   | (IRPartBase & { readonly kind: "toolResult"; readonly result: IRToolResult })
   /**
-   * 逃生舱（不变量 2）。任何 egress 遇到它都必须**显式决定**，类型系统强制写这个 case ——
+   * 逃生舱（不变量 2）。任何 outbox 遇到它都必须**显式决定**，类型系统强制写这个 case ——
    * 这正是 `[key: string]: unknown` 做不到的。
    *
    * 但「决定」的合法取值只有两个：**同源透传**（无损），或**拒绝**
@@ -238,7 +238,7 @@ export type IRReasoningDisplay = "hidden" | "summarized" | "full";
  * 阶段就丢掉其中一个，正是「有损发生在 ingress」这个反模式。
  *
  * `effort` 与 `budgetTokens` 保持各自的原始表示，**不在 ingress 互转**：
- * 谁的上游要哪种，谁在 egress 自己换算并记 loss。
+ * 谁的上游要哪种，谁在 outbox 自己换算并记 loss。
  */
 export interface IRReasoning {
   readonly mode: IRReasoningMode;
@@ -259,7 +259,7 @@ export type IROutputFormat =
 export interface IRContextEdit {
   readonly kind: "clearThinking" | "clearToolResults" | "unknown";
   readonly keep: "all" | "none" | { readonly lastTurns: number };
-  /** 原始 wire 指令，供能表达它的 egress 无损还原。 */
+  /** 原始 wire 指令，供能表达它的 outbox 无损还原。 */
   readonly raw: unknown;
 }
 
@@ -270,7 +270,7 @@ export interface IRSampling {
 }
 
 export interface IRStopping {
-  /** 单次输出上限。Anthropic 必填，Chat 可选，Codex Responses 直接拒收 —— 差异由 egress 记 loss。 */
+  /** 单次输出上限。Anthropic 必填，Chat 可选，Codex Responses 直接拒收 —— 差异由 outbox 记 loss。 */
   readonly maxOutputTokens?: IRValued<number>;
   readonly stopSequences?: IRValued<readonly string[]>;
 }
@@ -341,14 +341,20 @@ export type IRMandatoryField = (typeof IR_MANDATORY_FIELDS)[number];
  */
 export type IRMandatoryFieldTable = Readonly<Record<IRMandatoryField, boolean>>;
 
-export interface IREgressProfile {
-  readonly provider: string;
+/**
+ * Outbox 对 IR wire 编译的静态声明。这里只放能由所有 Outbox 共同解释的事实：
+ * 表达能力、明确有损的表达与 wire 强制字段。
+ *
+ * 目标厂商的私有策略、账户行为或内容分类规则不属于这份契约；它们由相应 Outbox 的
+ * `writeOutboxRequest` 在自己的模块内处理，不能让其他 Outbox 为一个私有事实增加占位字段。
+ */
+export interface IROutboxProfile {
   readonly supports: ReadonlySet<IRCapability>;
   /** 能承载但有损（如 toolGroup 靠拍平实现）。放行，但强制记 loss。 */
   readonly lossy: ReadonlySet<IRCapability>;
   /**
    * 目标**强制要求**哪些 IR 字段。判据是 wire 事实，不是偏好：
-   * 缺了这个字段，`writeUpstreamRequest` 会带 `requiredFieldMissing` 拒绝。
+   * 缺了这个字段，`writeOutboxRequest` 会带 `requiredFieldMissing` 拒绝。
    */
   readonly mandatory: IRMandatoryFieldTable;
 }
@@ -359,8 +365,8 @@ export const IR_LOSS_KINDS = ["dropped", "degraded", "substituted", "truncated"]
 export type IRLossKind = (typeof IR_LOSS_KINDS)[number];
 
 export interface IRLoss {
-  readonly stage: "ingress" | "egress" | "lift";
-  readonly provider: string | null;
+  readonly stage: "inbox" | "outbox";
+  readonly outbox: string | null;
   /** IR 路径，如 `$.intent.stopping.maxOutputTokens`。 */
   readonly path: string;
   readonly kind: IRLossKind;
@@ -407,10 +413,10 @@ export function inputTokensIncludingCache(usage: IRUsage): number {
   return usage.inputTokens + (usage.cacheReadTokens ?? 0);
 }
 
-export interface IRUpstreamError {
+export interface IROutboxError {
   readonly kind:
     | "invalidRequest" | "permissionDenied" | "rateLimited" | "quotaExhausted"
-    | "contextLengthExceeded" | "contentPolicy" | "upstreamUnavailable" | "transport" | "unknown";
+    | "contextLengthExceeded" | "contentPolicy" | "outboxUnavailable" | "transport" | "unknown";
   readonly httpStatus: number | null;
   readonly message: string;
   readonly retryable: boolean;
@@ -430,7 +436,7 @@ export type IREvent =
   | { readonly kind: "partEnd"; readonly index: number }
   | { readonly kind: "usage"; readonly usage: IRUsage }
   | { readonly kind: "messageStop"; readonly reason: IRStopReason }
-  | { readonly kind: "error"; readonly error: IRUpstreamError }
+  | { readonly kind: "error"; readonly error: IROutboxError }
   | { readonly kind: "loss"; readonly loss: IRLoss }
   | { readonly kind: "unhandled"; readonly rawType: string; readonly raw: unknown }
   /**
@@ -524,7 +530,7 @@ export interface IRBuildProblem {
  *
  * 判别联合而不是抛异常：失败是这个函数的**正常返回值之一**，调用方必须表态。
  */
-export type UpstreamRequestBuildResult<TBody extends IRWireBody = string> =
+export type OutboxRequestBuildResult<TBody extends IRWireBody = string> =
   | {
       readonly ok: true;
       readonly wire: IRWireRequest<TBody>;
@@ -538,8 +544,8 @@ export type UpstreamRequestBuildResult<TBody extends IRWireBody = string> =
       readonly losses: readonly IRLoss[];
     };
 
-export interface IREgress<TBody extends IRWireBody = string> {
-  readonly profile: IREgressProfile;
-  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult<TBody>>;
-  readUpstreamResponse(response: Response, options?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent>;
+export interface IROutbox<TBody extends IRWireBody = string> {
+  readonly profile: IROutboxProfile;
+  writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult<TBody>>;
+  readOutboxResponse(response: Response, options?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent>;
 }

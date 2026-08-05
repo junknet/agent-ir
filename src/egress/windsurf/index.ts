@@ -20,7 +20,17 @@
  *    八个家族（FDS 里 `exa.codeium_common_pb.Model` 共 334 个枚举值），模型只是
  *    `chat_model_uid` 一个字符串字段。所以**只有一份实现，不按家族分支**。
  *
- * wire 知识全部来自生产在用的实现，不凭印象：
+ * 5. **抓包证伪了一条流传很广的说法。** 「大体量 agent 脚手架会被 Windsurf 的内容分类器拒」
+ *    不成立：20945 / 21599 / 21593 字符的 system prompt 加 23 个工具定义，12 条全部 200。
+ *    真正被这些字节钉住的差异是**客户端身份行**（见 `WindsurfSystemIdentityPolicy`）。
+ *
+ * wire 知识全部来自真实收发过的字节，不凭印象：
+ *   - `test/fixtures/windsurf_capture/` —— **12 条真实 GetChatMessage 请求字节**（mitmproxy 抓自
+ *     Devin CLI，`metadata.apiKey` 已抹）。本文件下面每一条标「抓包」的判断都能在这 12 条上复算：
+ *     135 个 `ChatMessagePrompt`、4 个 `chat_model_uid`（kimi-k3-high / swe-1-6-fast /
+ *     gpt-5-6-terra-high / gemini-3-6-flash-high）、11/12 条带 23 个工具定义。
+ *     **12 条全部得到上游 HTTP 200**（抓包侧记录，不是这些字节自身能证明的）。
+ *     断言锁在 `test/egress_windsurf.test.ts` 的「抓包：…」几个 describe 里。
  *   - `cc_proxy_unified/packages/windsurf_protocol/src/{messages,connect_frame,schema_registry}.ts`
  *   - `cc_proxy_unified/packages/relay/src/windsurf_messages_relay.ts`（踩坑记录）
  *   - `cc_proxy_unified/packages/relay_core/src/{messages_failure_policy,upstream_application_error}.ts`
@@ -35,11 +45,11 @@ import {
 import { mapConnectError, mapHttpError, readConnectError } from "./errors.ts";
 import { getSharedWindsurfSchema, WINDSURF_TYPES, type WindsurfSchema } from "./schema.ts";
 import type {
-  IRBuildProblem, IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable, IRPart, IRRequest,
-  IRStopReason, IRToolResult, IRUsage, UpstreamRequestBuildResult,
+  IRBuildProblem, IRCapability, IROutbox, IROutboxProfile, IREvent, IRLoss, IRMandatoryFieldTable, IRPart, IRRequest,
+  IRStopReason, IRToolResult, IRUsage, OutboxRequestBuildResult,
 } from "../../ir/types.ts";
 
-const PROVIDER = "windsurf";
+const OUTBOX = "windsurf";
 const DEFAULT_SERVER = "https://server.codeium.com";
 const RPC_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 
@@ -47,39 +57,62 @@ const RPC_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 
 /**
  * 只放**有证据**的。证据分两级，二者不可混为一谈：
- *   (A) 行为实证 —— 生产在这条字段上真实收发过，上游按预期行为。
+ *   (A) 行为实证 —— 真实调用在这条字段上收发过，上游按预期行事。
  *   (B) 结构实证 —— FDS 里有字段，但没有任何一次真实调用证明上游会照它行事。
  *
  * `supports` 只收 (A)。(B) 一律进 `lossy` 或直接不收 —— 「不确定就不要放进 supports」，
  * 因为 supports 的唯一作用是让准入**放行**，放错了等于把请求送进一个语义模糊的上游行为。
+ *
+ * 「抓包」= `test/fixtures/windsurf_capture/` 那 12 条真实请求字节（135 个回合），全部 200。
+ * 计数写死在注释里是故意的：读的人能自己去那 12 条上复算，对不上就是有人改了夹具。
  */
 const SUPPORTED = [
   // (A) 生产数据面每天在跑：GetChatMessage 只有流式一种形态。
   "stream",
   // (A) 非流式由入口侧把流折叠成整段（生产 `createWindsurfMessage` 就是这么做的）；
-  //     lower 为此记一条 substituted。
+  //     lower 为此记一条 substituted。抓包全是流式，非流式这条仍靠生产实现背书。
   "nonStream",
-  // (A) 顶层 `prompt` 字段，生产实测「完全替换，无内置人格」。
+  // (A) 顶层 `prompt` 字段。抓包 12/12 条都非空，长度 202 / 20945 / 21599 / 21593 字符，
+  //     全部 200 —— 「system 太大会被拒」不成立。生产另有实测「完全替换，无内置人格」。
   "systemPrompt",
-  // (A) `chat_message_prompts` 就是多轮，生产每条请求都在用。
+  // (A) `chat_message_prompts` 就是多轮。抓包单条最长 21 个回合（getchatmessage_159），
+  //     按 source 分布是 user(1)=72 / assistant(2)=40 / tool(4)=23。
   "multiTurn",
-  // (A) `ChatMessagePrompt.images` = ImageData{base64Data,mimeType,caption}，
-  //     生产 `messages.test.ts` 有断言，数据面在跑。
+  // (A) `ChatMessagePrompt.images` = ImageData{base64Data,mimeType,caption}。
+  //     抓包 11/135 个回合带图，全部挂在 source=1 的 user 回合上，
+  //     `mimeType="image/png"`、`caption=""`（getchatmessage_035 起每条都有）。
   "image",
-  // (A) `ChatToolDefinition{name,description,json_schema_string}`，生产带 27 个真实工具放行(200)。
+  // (A) `ChatToolDefinition{name,description,json_schema_string}`。抓包 11/12 条各带 23 个工具，
+  //     且**只**用这三个字段：`server_name`/`strict`/`is_custom_tool`/`attribution_field_names`
+  //     在 253 个工具定义里无一被设置。
   "toolFunction",
-  // (A) 上游实测一条流里返回多个 tool call（生产「keeps parallel tools separate」用例）；
-  //     要关掉也有 `disable_parallel_tool_calls`，两个方向都表达得了。
+  // (A) 抓包 6 条（093/111/117/130/148/159）各有一个 source=2 的回合携带 **2 个 `tool_calls`**
+  //     （`web_search` × 2）并被正常受理；出站方向的并行因此是行为实证。
+  //     回读方向另有生产「keeps parallel tools separate」用例。
+  //     要关掉也有 `disable_parallel_tool_calls`——注意抓包 12/12 条都**没**设它。
   "toolParallel",
   // (A) `ChatMessagePrompt.tool_result_is_error`，生产断言过 true/false 两态。
+  //     ⚠ 抓包**没覆盖**这一条：23 个 source=4 回合的 `tool_result_is_error` 全是 false。
+  //     这条留在 supports 靠的仍是生产那份证据，不是这 12 条报文。
   "toolResultError",
-  // (A) `CompletionConfiguration.max_tokens`，生产每条请求都送。
+  // (A) `CompletionConfiguration.max_tokens`。抓包 12/12 条都送真实值，
+  //     10 条 = 128000（kimi/gpt/swe），2 条 = 65535（gemini）—— 同一字段两个量级都被受理。
   "maxOutputTokens",
-  // (A) `CompletionConfiguration.temperature`，生产透传客户端值。
+  // (A) `CompletionConfiguration.temperature`。抓包 12/12 条送 1。
   "temperature",
-  // (A/B) `top_p` / `top_k` 与 temperature 同处一个 message，生产每条请求都送真实值
-  //       并被正常受理；换成客户端的值是同一个字段的同一种用法。
+  // (A) `top_p` / `top_k` 与 temperature 同处一个 message。抓包 12/12 条送
+  //     top_p=0.95（float32 落成 0.949999988079071）、top_k=40，全部 200。
+  //     从 (A/B) 升到 (A)：真实客户端确实在送这两个字段并被正常受理。
   "topP", "topK",
+  // (A) `ChatMessagePrompt.thinking`。**这条是本次升级的主项**，双向都有实证：
+  //     出站——抓包 39/135 个回合回传非空 thinking（最早见 getchatmessage_027），全部 200；
+  //     回读——响应侧 `delta_thinking` 在抓包的 2107 帧里出现 850 次。
+  //     原注释「生产从不读写它，上游是否真把它当推理块消费未经实证」已被证伪。
+  //     ⚠ 仍然为真的两件事，各自另有 loss，不影响本条：
+  //       1. 请求侧**没有**任何「开/关思考」的开关（mode/display 无对应字段）；
+  //       2. `delta_thinking` 不是跨家族普遍事实 —— 抓包里 gemini-3-6-flash-high 上是 0 次，
+  //          kimi / gpt / swe 上大量出现。承载得了 ≠ 每个模型都会回流。
+  "thinking",
 ] as const satisfies readonly IRCapability[];
 
 /**
@@ -91,37 +124,51 @@ const SUPPORTED = [
  * 就是这个区别的落点。
  */
 const LOSSY = [
-  // (B) `ChatMessagePrompt.thinking` 字段存在（与 `signature`/`thinking_redacted` 同族），
-  //     响应侧也有 `delta_thinking`。但生产从不读写它，上游是否真把它当推理块消费未经实证。
-  //     另外：**请求侧没有任何「开/关思考」的开关** —— mode/display 无对应字段，只能丢。
-  "thinking",
-  // (B) `ChatMessagePrompt.signature` + `signature_type` 存在，同上未经实证。
+  // (A，但**确定有损**) `ChatMessagePrompt.signature` + `signature_type` 双向都有实证，
+  //     只是稀疏：出站抓包 2/135 个回合（getchatmessage_148 与 159 的 prompt[17]，
+  //     `signature` 1984 字符），回读侧 `delta_signature` + `delta_signature_type`
+  //     在 2107 帧里各出现 2 次、成对出现。
+  //     **它留在 lossy 不是因为缺证据，是因为 IR 装不下。** 抓到的那两条
+  //     `signature_type="openai"` 说明这个签名是**带家族标签**的（而且那两条请求的
+  //     `chat_model_uid` 是 gemini-3-6-flash-high —— 签名是上一轮由别的家族签发后被原样带回的）。
+  //     `IRPart.thinking.signature` 与 `IRPartDelta.thinkingSignature` 都只有一个裸字符串，
+  //     没有放 `signature_type` 的位置：出站送不出去、回读接不下来，两个方向各记一条 loss。
+  //     按 AGENTS.md 第 24 行，不为这一家往 IR 加字段。
   "thinkingSignature",
-  // (A) 反证：effort 在生产里是靠**出站模型 id** 表达的（`MODEL_GPT_5_2_HIGH`、
-  //     `claude-opus-4-8-high`），信封里没有 effort 字段。本出口不改写 model，只留痕。
+  // (A) 反证，且被抓包加强：effort 靠**出站模型 id** 表达。抓包 4 个 uid 里
+  //     kimi-k3-high / gpt-5-6-terra-high / gemini-3-6-flash-high 三个都带 `-high` 后缀，
+  //     而 `GetChatMessageRequest` 的 24 个字段里没有任何 effort 字段。本出口不改写 model，只留痕。
   "reasoningEffort",
   // (C) 没有 token 预算字段，丢。
   "reasoningBudget",
   // (B) `ChatToolDefinition.is_custom_tool` + `custom_tool_grammar{,_syntax}` 存在，
-  //     但 grammar 语法的取值集未知；包成单字段 JSON schema 才是有据可依的降级。
+  //     但抓包 253 个工具定义**无一**设置它们，grammar 语法的取值集仍然未知；
+  //     包成单字段 JSON schema 才是有据可依的降级。
   "toolFreeform",
-  // (B) `ChatToolDefinition.server_name` 看着就是 MCP 分组，但它对工具名/派发的影响未经实证；
-  //     拍进名字是确定可行的那条路。
+  // (B→仍 lossy，理由被抓包换掉了) `ChatToolDefinition.server_name` 看着就是 MCP 分组，
+  //     但抓包证明**真实客户端根本不用它做分组**：253 个工具定义里 `server_name` 全空，
+  //     MCP 是靠 `mcp_call_tool` / `mcp_list_servers` / `mcp_list_tools` / `mcp_read_resource`
+  //     四个**元工具**（普通 function 工具）做的。所以 server_name 的分组语义至今零实证，
+  //     拍进名字仍然是唯一确定可行的那条路 —— 但那是拍平，仍然有损。
   "toolGroup",
-  // (B) 工具结果就是一条 source=TOOL 的 ChatMessagePrompt，它**有** `images` 字段；
-  //     但模型是否把该图片与这条工具结果关联未经实证。
+  // (B) 工具结果就是一条 source=4 的 ChatMessagePrompt，它**有** `images` 字段；
+  //     但抓包 23 个 source=4 回合**全部 0 张图**，模型是否把该图片与这条工具结果关联
+  //     依旧零实证。差的就是这一条：需要一条「工具结果带图且上游按图行事」的真实报文。
   "toolResultImage",
   // (B) `ChatMessagePrompt.prompt_cache_options` 与顶层 `system_prompt_cache_options`
   //     的枚举正好是 `CACHE_CONTROL_TYPE_EPHEMERAL`，与 IR 的 scope 同名；
   //     且响应里的 `cache_read_tokens/cache_write_tokens` 生产实测确有非零值 —— 缓存确实在发生。
-  //     但「客户端设的断点是否驱动它」未经实证，且 `ttlSeconds` 无处安放。
+  //     但抓包 12/12 条**两个字段都没设**，「客户端设的断点是否驱动它」仍未实证，
+  //     且 `ttlSeconds` 无处安放。缓存在发生 ≠ 客户端能指挥它在哪儿断。
   "cacheBreakpoint",
   // (C) 没有服务端上下文管理指令。丢掉只是历史更长，不影响正确性。
   "contextEdit",
-  // (B) `CompletionConfiguration.stop_patterns` 存在，但字段名说的是 pattern；
-  //     字面量 vs 正则的语义差别未经实证，照送但留痕。
+  // (B) `CompletionConfiguration.stop_patterns` 存在，但抓包 12/12 条都是空数组；
+  //     字段名说的是 pattern，字面量 vs 正则的语义差别仍未实证，照送但留痕。
   "stopSequences",
   // (B) `CompletionConfiguration.service_tier` 是个 string，取值集未知。
+  //     抓包 12/12 条都是空串 —— 而它是 proto3 隐式存在性的 string，空串与省略在字节上
+  //     完全相同，所以这 12 条**连「客户端显式送了空串」都证明不了**，更不用说非空取值。
   //     猜一个字符串送上去可能整条 400，宁可丢并留痕。
   "serviceTier",
 ] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
@@ -131,11 +178,17 @@ const LOSSY = [
  * 两处保持同一条规则：`supports ∪ lossy` 之外的能力，编译不出合法 body。
  *
  *   document          —— 只有 `ImageData`，没有文档通道。用 mime_type 塞 PDF 是猜。
+ *                        抓包 11 张图全是 `image/png`，没有任何非图片附件出现过。
  *   toolBuiltin       —— IR 的 builtin 身份（computer_use、web_search…）没有对应物；
  *                        `computer_use_config` 只覆盖 computer-use 一种且形状未实证。
- *   toolChoiceSpecific—— `ChatToolChoice{option_name,tool_name}` 有字段，但 `option_name`
- *                        的取值集完全未知。猜错一个字符串，「必须调用工具 X」就会静默失效。
- *   structuredOutput  —— `GetChatMessageRequest` 里没有任何 response_format / json_schema 字段。
+ *                        抓包**正面加强了这一条**：真实客户端的 `web_search` 是一个普通
+ *                        function 工具（结果按 source=4 + `tool_call_id="web_search_1"` 回传），
+ *                        不是上游内建能力 —— builtin 身份在这条 wire 上确实无处安放。
+ *   toolChoiceSpecific—— `ChatToolChoice{option_name,tool_name}` 有字段（请求 #12），但 `option_name`
+ *                        的取值集完全未知，且抓包 12/12 条**都没设 tool_choice**。
+ *                        猜错一个字符串，「必须调用工具 X」就会静默失效。
+ *   structuredOutput  —— `GetChatMessageRequest` 的 24 个字段里没有任何 response_format /
+ *                        json_schema 字段（FDS 逐字段核对过）。
  */
 
 // ── protobuf 枚举常量（全部来自 FDS 实测） ──────────────────────────────────
@@ -185,9 +238,13 @@ const STOP_REASON_IR: Readonly<Record<number, IRStopReason>> = {
  * **这不是「默认值」，是 proto3 隐式存在性逼出来的表态**（见文件头第 3 点）：
  * 省略与送 0 在字节上一样，而 0 对这五个字段全是有害的强指令
  * （temperature=0 贪心解码、max_tokens=0 不许输出、max_newlines=0 第一个换行就停）。
- * 取值全部来自生产抓包里被上游正常受理的那份请求 —— 是唯一有证据的一组值。
+ * 取值全部来自抓包里被上游正常受理的那份请求 —— 是唯一有证据的一组值。逐条对得上：
+ *   `num_completions=1` / `max_newlines=400` / `temperature=1` / `top_k=40`  —— 12/12 条一致；
+ *   `top_p=0.95`  —— 12/12 条，float32 落地成 0.949999988079071；
+ *   `max_tokens`  —— **不一致**：kimi/gpt/swe 10 条送 128000，gemini 2 条送 65535。
+ *                    两个量级都被受理，所以这里取被观测最多的 128000，而不是声称它是「正确值」。
  *
- * `maxNewlines` 尤其要盯：它会把输出截在 400 个换行处。生产一直这么发，
+ * `maxNewlines` 尤其要盯：它会把输出截在 400 个换行处。真实客户端 12/12 条都这么发，
  * 但没人验证过省略它（=送 0）是「不限」还是「不许换行」。这条风险由 lower 记 loss 留痕。
  */
 const WIRE_NEUTRAL = {
@@ -207,7 +264,16 @@ async function resolveSource<T>(source: ValueSource<T>): Promise<T> {
   return typeof source === "function" ? await (source as () => T | Promise<T>)() : source;
 }
 
-/** Windsurf 客户端画像。生产实测服务端不校验 `metadata.f`，device fingerprint 也非必填。 */
+/**
+ * Windsurf 客户端画像。生产实测服务端不校验 `metadata.f`，device fingerprint 也非必填。
+ *
+ * 抓包里真实客户端的 `Metadata` 只设了 8 个字段：`ide_name` `ide_version` `extension_name`
+ * `extension_version` `api_key` `locale` `os` `f`。两条值得记下来的观测：
+ *   - 它填的是 `f`（732 个十六进制字符），**不是** `device_fingerprint`——后者 12/12 条全空。
+ *     本出口的 `deviceFingerprint` 因此是一条没有抓包背书的可选通道，默认不发。
+ *   - `request_id` 12/12 条都是 0。本出口仍从 traceId 派生一个非零值，因为「同一个 IR 两次
+ *     构造字节相同」比「与真实客户端逐字节一致」更值得保；两种做法都没有被上游拒绝的证据。
+ */
 export interface WindsurfClientProfile {
   readonly ideName: string;
   readonly extensionName: string;
@@ -218,7 +284,7 @@ export interface WindsurfClientProfile {
   readonly deviceFingerprint?: string;
 }
 
-/** 生产抓包中「携带工具定义的请求」用的就是这一份画像。 */
+/** 抓包 12/12 条用的就是这一份画像，逐字段一致。 */
 export const CHISEL_PROFILE: WindsurfClientProfile = {
   ideName: "chisel",
   extensionName: "chisel",
@@ -228,13 +294,150 @@ export const CHISEL_PROFILE: WindsurfClientProfile = {
   os: "linux",
 };
 
-export interface WindsurfEgressOptions {
+// ── 客户端身份：Windsurf 私有的策略限制 ─────────────────────────────────────
+
+/**
+ * 抓包里真实客户端 system prompt 的**第一行**，12/12 条完全一致。
+ *
+ * 它是这份夹具能钉住的最硬的一条事实，也是本模块唯一有据可依的替换目标。
+ */
+export const WINDSURF_OBSERVED_IDENTITY_LINE =
+  "You are Devin, an interactive command line agent from Cognition.";
+
+/**
+ * 一条身份行改写规则：**整行精确相等**才命中，命中就换成 `replacementLine`。
+ *
+ * 用整行相等而不是子串/正则，是因为这条改写会动客户端的指令内容 —— 判据必须窄到
+ * 「读注释的人能一眼算出它会不会命中」，宽判据在别人的 prompt 上会有意外命中。
+ */
+export interface WindsurfSystemIdentityRule {
+  readonly matchLine: string;
+  readonly replacementLine: string;
+}
+
+/**
+ * Windsurf 对**客户端身份**的策略限制。这是供应商私有事实，按 ARCHITECTURE §2.1 只住在
+ * 这个出口里：不做通用 repair、不进 `IROutboxProfile`、不加全局枚举。
+ *
+ * ## 抓包证明了什么
+ *
+ * 证伪了「关键词密度 / 体量触发内容分类器」这个流传的理由：20945–21599 字符的 agent 脚手架
+ * 加 23 个工具定义，12 条全部 200。生产 cc_proxy 里「识别到 Claude Code 就把整个 system
+ * 塌缩成中性提示」所依据的那条理由不成立。
+ *
+ * 被这 12 条字节钉住的唯一差异是**身份行**：真实客户端 12/12 条第一行都是
+ * `WINDSURF_OBSERVED_IDENTITY_LINE`，而 Claude Code 送的是
+ * `You are Claude Code, Anthropic's official CLI for Claude.`。
+ *
+ * ## 抓包**没有**证明什么（这一段不许被读成实证）
+ *
+ *   - 没有证明带 Claude Code 身份行的请求会被拒 —— 夹具里根本没有这样一条报文；
+ *   - 没有证明「只换身份行」就足以让 Claude Code 的 system 通过；
+ *   - 没有证明上游是按身份行判的，而不是按别的什么信号。
+ *
+ * 换句话说：默认策略是一条**推断**，不是实测结论。它的设计目标是「尽量让请求过、消耗配额，
+ * 不硬 ban 用户」，所以选了最轻的那一档改动，而不是丢弃客户端的全部指令。
+ * 不接受这条推断的调用方显式传 `{ kind: "passthrough" }`，改写就一步都不做。
+ *
+ * ## 为什么不是「只替换」：替换会静默失效
+ *
+ * 纯替换的失败模式很难被发现：Claude Code 把身份行改一个字，`matchLine` 就不再命中，
+ * 出站于是带着**原样的外来身份行**上去 —— 症状是「忽然每条请求都被拒」，而代码里
+ * 没有任何一处报错，因为「没命中」和「不需要改」在纯替换的实现里是同一个返回值。
+ *
+ * 所以这条策略的契约不是「尝试替换」，而是一条**后置条件**：
+ *
+ *   > 只要客户端给了非空 system，改写之后这段文本里**一定**含有 `identityLine`。
+ *
+ * 两条路达成它，命中与否都不会「什么都没做」：
+ *
+ *   1. **命中**已知外来身份行 → 整行换掉。首选这条，因为它顺带**移走**了那行外来身份，
+ *      不会留下两个互相矛盾的自我描述。
+ *   2. **没命中** → 把 `identityLine` 直接 prepend 到最前面，原文一字不动地跟在后面。
+ *      锚点漂了也照样有身份行，代价是客户端原来那句自我描述还留在下面。
+ *
+ * 空 system 是**故意的例外**：没有外来身份行要纠正，也没有客户端指令要保护，
+ * 这时 prepend 等于凭空发明一段客户端从没写过的系统提示词。按 AGENTS.md「Core 不发明内容」，
+ * 这一档保持不动。（真实客户端 12/12 条都带 system，这条路在实践中不会走到。）
+ *
+ * 无论走哪一档，只要真的改了字节就必然产出一条 `substituted` 的 `IRLoss`，
+ * 且 detail 里写明走的是替换还是 prepend：Core 不静默改写。
+ */
+export type WindsurfSystemIdentityPolicy =
+  | { readonly kind: "passthrough" }
+  | {
+      readonly kind: "ensureIdentityLine";
+      /** 保证出现在 system 里的身份行。没命中任何规则时它被 prepend 到最前面。 */
+      readonly identityLine: string;
+      /** 已知的外来身份行。命中即整行替换成 `identityLine`，从而不留下矛盾的第二个身份。 */
+      readonly supersededLines: readonly string[];
+    };
+
+/**
+ * 默认策略：优先把 Claude Code 的身份行换掉；换不掉就在最前面补一行。
+ *
+ * `supersededLines` 只列**已知会被这个网关转发的 agent 客户端**的身份行。列表漂了不再是
+ * 静默失败 —— 只是退化成 prepend，身份行仍然在。
+ */
+export const WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY: WindsurfSystemIdentityPolicy = {
+  kind: "ensureIdentityLine",
+  identityLine: WINDSURF_OBSERVED_IDENTITY_LINE,
+  supersededLines: [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+  ],
+};
+
+/** 这次改写实际走了哪条路。`null` = 一个字节都没动。 */
+export type WindsurfIdentityOutcome =
+  | { readonly kind: "replaced"; readonly supersededLine: string }
+  | { readonly kind: "prepended" };
+
+/**
+ * 保证 `identityLine` 出现在合并后的 system 文本里。
+ *
+ * 按行扫而不是只看第 0 行：Claude Code 的 system 是分块的，身份行是**第二块**
+ * （第一块是 `x-anthropic-billing-header: …`），合并成一个字符串后它不在首行。
+ * 只处理第一处命中，让「改了多少」有确定上界 —— 一次请求最多动一行。
+ *
+ * 已经含有 `identityLine` 的文本原样返回（`null`）：重复 prepend 会在多轮里越堆越多。
+ */
+function ensureWindsurfIdentityLine(
+  systemText: string,
+  policy: WindsurfSystemIdentityPolicy,
+): { readonly text: string; readonly outcome: WindsurfIdentityOutcome | null } {
+  // 空 system 不 prepend —— 那会凭空发明客户端没写过的指令，见上面的文档注释。
+  if (policy.kind === "passthrough" || systemText.length === 0) {
+    return { text: systemText, outcome: null };
+  }
+  const lines = systemText.split("\n");
+  // 幂等：身份行已经在了就什么都不做，否则同一段 system 反复过这条策略会越堆越长。
+  if (lines.includes(policy.identityLine)) return { text: systemText, outcome: null };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line === undefined || !policy.supersededLines.includes(line)) continue;
+    lines[index] = policy.identityLine;
+    return { text: lines.join("\n"), outcome: { kind: "replaced", supersededLine: line } };
+  }
+  // 没命中任何已知身份行 —— 补一行而不是放弃，见「替换会静默失效」那一段。
+  return { text: `${policy.identityLine}\n\n${systemText}`, outcome: { kind: "prepended" } };
+}
+
+export interface WindsurfOutboxOptions {
   /** 出站 `chat_model_uid`。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
   readonly model: string;
   /** `devin-session-token$<JWT>` 全串。同时进 `Authorization: Basic` 与 `metadata.api_key`。 */
   readonly apiKey: ValueSource<string>;
   readonly server?: string;
   readonly profile?: WindsurfClientProfile;
+  /**
+   * 客户端身份行的处置。省略时用 `WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY`
+   * （把 Claude Code 的身份行换成抓包里被受理过的那一行）。
+   * 完整的「实证 vs 推断」分界写在 `WindsurfSystemIdentityPolicy` 的文档注释里，
+   * 挂它之前请读完那一段。
+   */
+  readonly systemIdentity?: WindsurfSystemIdentityPolicy;
   readonly userAgent?: string;
   readonly extraHeaders?: Readonly<Record<string, string>>;
   /** 覆盖 FileDescriptorSet 位置。默认取本模块同级的 `windsurf_exa.fds.pb`。 */
@@ -249,15 +452,15 @@ export interface WindsurfEgressOptions {
 
 // ── loss / problem 收集 ─────────────────────────────────────────────────────
 
-class UpstreamRequestLosses {
+class OutboxRequestLosses {
   readonly #losses: IRLoss[] = [];
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "outbox", outbox: OUTBOX, ...loss });
   }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
 }
 
-class UpstreamRequestProblems {
+class OutboxRequestProblems {
   readonly #problems: IRBuildProblem[] = [];
   record(problem: IRBuildProblem): void { this.#problems.push(problem); }
   get rejected(): boolean { return this.#problems.length > 0; }
@@ -296,8 +499,8 @@ interface PromptSeed {
 }
 
 interface LowerContext {
-  readonly losses: UpstreamRequestLosses;
-  readonly problems: UpstreamRequestProblems;
+  readonly losses: OutboxRequestLosses;
+  readonly problems: OutboxRequestProblems;
 }
 
 /** 把工具结果的 parts 折成 wire 要的 `(prompt 文本, images)` 两样。 */
@@ -405,7 +608,8 @@ function lowerTurnToPrompts(
           ctx.losses.record({
             path, kind: "degraded",
             detail: `tool group '${part.call.toolRef.group}' 拍进工具名；`
-              + "ChatToolDefinition.server_name 看着能装分组，但它对派发的影响未经实证",
+              + "ChatToolDefinition.server_name 看着能装分组，但抓包里 253 个工具定义 server_name 全空，"
+              + "真实客户端用 mcp_call_tool 等元工具做 MCP 分组 —— 分组语义至今零实证",
           });
         }
         const argumentsJson = part.call.input.kind === "json"
@@ -465,11 +669,16 @@ function lowerTurnToPrompts(
       detail: `${texts.length} 个文本块被并成一条 ChatMessagePrompt.prompt 字符串；块边界丢失`,
     });
   }
-  if (thinkings.length > 0) {
+  // thinking 本身不再记 loss：抓包 39/135 个回合真实回传 `ChatMessagePrompt.thinking` 并全部 200，
+  // 它已经在 SUPPORTED 里。但**签名**仍然有损，且损在一个具体的地方 —— 见下。
+  if (signature !== undefined) {
     ctx.losses.record({
       path: `$.conversation.turns[${turnIndex}]`, kind: "degraded",
-      detail: "思考写入 ChatMessagePrompt.thinking/signature：字段确实存在（与 thinking_redacted 同族），"
-        + "但没有任何一次真实调用证明上游会把它当推理块消费",
+      detail: "签名写入 ChatMessagePrompt.signature，但 `signature_type` 送不出去："
+        + "抓包实证真实客户端是**成对**发的（getchatmessage_148/159 的 prompt[17]："
+        + 'signature 1984 字符 + signature_type="openai"），'
+        + "而 IRPart.thinking.signature 只有一个裸字符串，没有放家族标签的位置；"
+        + "上游因此收到一个不知道该按哪家格式解析的签名",
     });
   }
 
@@ -498,12 +707,12 @@ function lowerTurnToPrompts(
  * 所以这里**不需要重排**——但配不上的那些必须拒。
  *
  * ⚠ 这条拒绝是**推论，不是 Windsurf 侧的直接观测**：Windsurf 是聚合器，
- * `chat_message_prompts` 会被还原成下游各家 provider 的原生消息，而它前置的两个家族
+ * `chat_message_prompts` 会被还原成下游各家 outbox 的原生消息，而它前置的两个家族
  * （Anthropic 要求每个 tool_use 恰有一个 tool_result；OpenAI 要求每个 tool_call 恰有一条
  * role=tool）都不接受悬空。发过去只会换回一个语义模糊的上游错误，所以在这里带路径拒绝，
  * 由调用方决定是挂 `repair/fillDanglingToolCall` 还是回绝客户端。
  */
-function checkToolPairing(request: IRRequest, problems: UpstreamRequestProblems): void {
+function checkToolPairing(request: IRRequest, problems: OutboxRequestProblems): void {
   const callPaths = new Map<string, string>();
   const resultPaths = new Map<string, string>();
   request.conversation.turns.forEach((turn, turnIndex) => {
@@ -521,7 +730,7 @@ function checkToolPairing(request: IRRequest, problems: UpstreamRequestProblems)
       kind: "danglingToolCall",
       path,
       detail: `tool call '${id}' 在整段会话里没有对应的工具结果；`
-        + "Windsurf 会把 chat_message_prompts 还原成下游 provider 的原生消息，两个家族都不接受悬空调用",
+        + "Windsurf 会把 chat_message_prompts 还原成下游 outbox 的原生消息，两个家族都不接受悬空调用",
     });
   }
   for (const [id, path] of resultPaths) {
@@ -530,7 +739,7 @@ function checkToolPairing(request: IRRequest, problems: UpstreamRequestProblems)
       kind: "orphanToolResult",
       path,
       detail: `tool result 的 tool_call_id '${id}' 在会话里找不到对应的调用；`
-        + "该 id 上游从未签发过，还原出来的 provider 消息必然非法",
+        + "该 id 上游从未签发过，还原出来的 outbox 消息必然非法",
     });
   }
 }
@@ -544,15 +753,15 @@ function checkToolPairing(request: IRRequest, problems: UpstreamRequestProblems)
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
 
-export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress<Uint8Array> {
-  const profile: IREgressProfile = {
-    provider: PROVIDER,
+export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<Uint8Array> {
+  const profile: IROutboxProfile = {
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
     mandatory: MANDATORY,
   };
   const clientProfile = options.profile ?? CHISEL_PROFILE;
   const server = options.server ?? DEFAULT_SERVER;
+  const systemIdentity = options.systemIdentity ?? WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY;
   const userAgent = options.userAgent ?? "connect-go/1.18.1 (go1.26.4)";
   // 588KB 的 fds 只构造一次，之后每次请求复用。
   let schema: WindsurfSchema | null = null;
@@ -564,9 +773,9 @@ export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress
   return {
     profile,
 
-    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult<Uint8Array>> {
-      const losses = new UpstreamRequestLosses();
-      const problems = new UpstreamRequestProblems();
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult<Uint8Array>> {
+      const losses = new OutboxRequestLosses();
+      const problems = new OutboxRequestProblems();
       const ctx: LowerContext = { losses, problems };
       const { conversation, intent } = request;
       const newId = options.idFactory ?? ((label: string) => deterministicId(`${request.traceId}:${label}`));
@@ -603,7 +812,26 @@ export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress
           detail: `GetChatMessageRequest.prompt 是单个字符串字段，'${part.kind}' 无处安放`,
         });
       });
-      const systemText = systemTexts.join("\n\n");
+      // ── 客户端身份行（Windsurf 私有策略，见 WindsurfSystemIdentityPolicy） ──
+      const identity = ensureWindsurfIdentityLine(systemTexts.join("\n\n"), systemIdentity);
+      const systemText = identity.text;
+      if (identity.outcome !== null) {
+        const what = identity.outcome.kind === "replaced"
+          ? `客户端身份行 '${identity.outcome.supersededLine}' 被整行换成 `
+            + `'${systemIdentity.kind === "ensureIdentityLine" ? systemIdentity.identityLine : ""}'；`
+            + "system 的其余内容一字未动。"
+          : "没有命中任何已知的外来身份行，改为把身份行 prepend 到 system 最前面；"
+            + "客户端原文一字未动地跟在后面（因此它原来的自我描述仍然在下文里）。";
+        losses.record({
+          path: "$.conversation.system", kind: "substituted",
+          detail: what
+            + "抓包实证：20945–21599 字符的 agent 脚手架加 23 个工具定义 12/12 条得到 200，"
+            + "所以「体量或关键词密度触发内容分类器」不成立，被钉住的差异只有身份行。"
+            + "**未验证**：这 12 条里没有任何一条带 Claude Code 身份行，"
+            + "因此「不换会被拒」与「换了就够」两件事都还是推断，不是实测。"
+            + "不接受这条推断就传 systemIdentity={kind:'passthrough'}",
+        });
+      }
 
       // ── 对话回合 → chat_message_prompts ───────────────────────────────────
       checkToolPairing(request, problems);
@@ -618,7 +846,8 @@ export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress
           losses.record({
             path, kind: "degraded",
             detail: `tool group '${tool.ref.group}' 拍进工具名；`
-              + "ChatToolDefinition.server_name 看着能装分组，但它对派发的影响未经实证",
+              + "ChatToolDefinition.server_name 看着能装分组，但抓包里 253 个工具定义 server_name 全空，"
+              + "真实客户端用 mcp_call_tool 等元工具做 MCP 分组 —— 分组语义至今零实证",
           });
         }
         if (tool.kind === "builtin") {
@@ -887,7 +1116,7 @@ export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress
       };
     },
 
-    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
+    readOutboxResponse(response: Response): AsyncIterable<IREvent> {
       return liftWindsurfStream(response, loadSchema, options.model);
     },
   };
@@ -978,7 +1207,7 @@ function applyToolCallDelta(
     const id = synthesize();
     list.push({ id, name: call.name, argumentsJson: call.argumentsJson });
     return {
-      stage: "lift", provider: PROVIDER,
+      stage: "outbox", outbox: OUTBOX,
       path: "$.response.deltaToolCalls[0].id", kind: "substituted",
       detail: `上游先送了工具参数分片、之后才可能给 id；合成确定性 id '${id}' 以保住参数与关联键`,
     };
@@ -1006,9 +1235,22 @@ function mergeUsage(totals: IRUsage, frame: Record<string, unknown>): IRUsage {
   };
 }
 
-/** 一帧里被认为「有语义」的字段。全都没有 = 上游换了形状，走 unhandled。 */
+/**
+ * 一帧里被认为「有语义」的字段。全都没有 = 上游换了形状，走 unhandled。
+ *
+ * 抓包实测的覆盖情况（2107 帧）：`messageId` 2107、`usage` 1418、`deltaText` 1153、
+ * `deltaThinking` 850、`deltaToolCalls` 55、`stopReason` 8、`deltaSignature` 2、`outputId` 1。
+ *
+ * 两条**故意**不在这张表里的字段，各有各的理由：
+ *   - `latency` / `requestId` / `timestamp` / `deltaTokens` / `creditCost` —— 纯遥测与计费，
+ *     没有语义产出，本来就不该让一帧「算作有内容」。
+ *   - `responseDimensionGroups`（响应 #28，抓包 9 帧出现）—— 本出口对它**没有**任何映射。
+ *     不进这张表意味着：一帧只带它时会走 unhandled 而不是被静默吞掉，这正是要的行为。
+ *     ⚠ 如实说明：真实流里每一帧都带 `messageId`，所以这条兜底在抓包上从未被触发过 ——
+ *     它防的是「上游哪天单发一帧维度信息」，不是当前已观测到的形态。
+ */
 const SEMANTIC_FIELDS = [
-  "deltaText", "deltaThinking", "deltaSignature", "deltaToolCalls",
+  "deltaText", "deltaThinking", "deltaSignature", "deltaSignatureType", "deltaToolCalls",
   "usage", "stopReason", "thinkingRedacted", "messageId", "actualModelUid",
 ] as const;
 
@@ -1138,10 +1380,10 @@ async function* liftWindsurfStream(
         };
         break frames;
       }
-      const upstreamError = readConnectError(parsed.trailer);
-      terminal = upstreamError === null
+      const outboxError = readConnectError(parsed.trailer);
+      terminal = outboxError === null
         ? { kind: "stop" }
-        : { kind: "error", event: { kind: "error", error: mapConnectError(upstreamError) } };
+        : { kind: "error", event: { kind: "error", error: mapConnectError(outboxError) } };
       break frames;
     }
 
@@ -1217,6 +1459,23 @@ async function* liftWindsurfStream(
       };
     }
 
+    // `delta_signature_type`（响应 #21）与 `delta_signature` 成对到达 —— 抓包 2107 帧里
+    // 各 2 次，取值 "openai"。`IRPartDelta.thinkingSignature` 只有一个裸 signature 字符串，
+    // 没有装家族标签的位置，而按 AGENTS.md 第 24 行不能为一家出口往 IR 加字段。
+    // 于是这里如实留痕：下游拿到的签名不带「该按谁的格式解析」这条信息。
+    const deltaSignatureType = decoded.deltaSignatureType;
+    if (typeof deltaSignatureType === "string" && deltaSignatureType.length > 0) {
+      yield {
+        kind: "loss",
+        loss: {
+          stage: "outbox", outbox: OUTBOX,
+          path: "$.response.deltaSignatureType", kind: "dropped",
+          detail: `上游给出签名家族 '${deltaSignatureType}'，但 IRPartDelta.thinkingSignature `
+            + "只有一个裸 signature 字符串，没有承载它的字段；签名本身照常下发",
+        },
+      };
+    }
+
     if (decoded.thinkingRedacted === true && !redactedReported) {
       redactedReported = true;
       // `thinking_redacted` 是个 **bool**，不带被脱敏的密文；IR 的 redactedThinking 需要 `data`。
@@ -1224,7 +1483,7 @@ async function* liftWindsurfStream(
       yield {
         kind: "loss",
         loss: {
-          stage: "lift", provider: PROVIDER,
+          stage: "outbox", outbox: OUTBOX,
           path: "$.response.thinkingRedacted", kind: "dropped",
           detail: "上游标记本轮思考被脱敏，但 thinking_redacted 只是一个 bool，没有携带密文；"
             + "IRPart.redactedThinking 需要 data，无法从一个布尔位构造",

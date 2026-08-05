@@ -19,8 +19,8 @@
  *    响应，于是它只能走进程内的旁路缓存 —— 每条流首次遇到都记一条 `loss`，让这个缺口
  *    可见而不是隐形。
  *
- * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
- * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
+ * `writeOutboxRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `OutboxRequestReport`。
  * 唯一一处**明知是策略却仍留在这里**的是 `thoughtSignature` 占位符（见文件末尾的长注释）：
  * IR 侧还没有承载它的位置，剥离它等于让所有带工具历史的请求全部不可用。
  *
@@ -35,13 +35,13 @@ import { join } from "node:path";
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss,
+  IRBuildProblem, IRCapability, IREffort, IROutbox, IROutboxProfile, IREvent, IRJsonSchema, IRLoss,
   IRMandatoryFieldTable,
-  UpstreamRequestBuildResult, IRPart,
-  IRReasoning, IRRequest, IRStopReason, IRToolResult, IRUpstreamError, IRUsage,
+  OutboxRequestBuildResult, IRPart,
+  IRReasoning, IRRequest, IRStopReason, IRToolResult, IROutboxError, IRUsage,
 } from "../ir/types.ts";
 
-const PROVIDER = "gemini_cloudcode";
+const OUTBOX = "gemini_cloudcode";
 
 /**
  * 能进 supports 的只有**有实测证据**的。存疑的一律不放 —— 放错了准入就会把请求送进
@@ -112,7 +112,7 @@ async function resolveSource<T>(source: ValueSource<T>): Promise<T> {
   return typeof source === "function" ? await (source as () => T | Promise<T>)() : source;
 }
 
-export interface GeminiCloudCodeEgressOptions {
+export interface GeminiCloudCodeOutboxOptions {
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
   readonly model: string;
   readonly accessToken: ValueSource<string>;
@@ -268,11 +268,11 @@ export function createCloudCodeProjectSource(
  *
  * 拒绝**收集齐再返回**，不短路：调用方一次看全才能一次修完。
  */
-class UpstreamRequestReport {
+class OutboxRequestReport {
   readonly #losses: IRLoss[] = [];
   readonly #problems: IRBuildProblem[] = [];
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "outbox", outbox: OUTBOX, ...loss });
   }
   reject(problem: IRBuildProblem): void {
     this.#problems.push(problem);
@@ -340,7 +340,7 @@ type GeminiPart = Record<string, unknown>;
 
 interface LowerContext {
   readonly toolNameByCallId: ReadonlyMap<string, string>;
-  readonly report: UpstreamRequestReport;
+  readonly report: OutboxRequestReport;
 }
 
 /** 一条 IRPart → 0..n 个 Gemini part。返回数组而不是 `T | null`：一个 part 可能落成零个。 */
@@ -473,7 +473,7 @@ function writePartToUpstream(part: IRPart, path: string, ctx: LowerContext): Gem
  *     `[gateway: tool result missing…]`，`status==='ok'` 时发 `{result:""}`：前者是网关编了
  *     一段模型会读到的正文，后者是替客户端宣布「工具跑成功且无输出」。
  */
-function lowerToolResult(result: IRToolResult, path: string, report: UpstreamRequestReport): Record<string, unknown> {
+function lowerToolResult(result: IRToolResult, path: string, report: OutboxRequestReport): Record<string, unknown> {
   const texts: string[] = [];
   const images: Array<{ media_type: string; data: string }> = [];
   for (const [index, inner] of result.parts.entries()) {
@@ -561,8 +561,8 @@ const MIN_VISIBLE_TOKENS = 4096;
 
 function resolveThinking(
   reasoning: IRReasoning,
-  options: GeminiCloudCodeEgressOptions,
-  report: UpstreamRequestReport,
+  options: GeminiCloudCodeOutboxOptions,
+  report: OutboxRequestReport,
 ): { config: Record<string, unknown> | null; budget: number } {
   if (reasoning.mode === "disabled") {
     report.record({
@@ -621,9 +621,15 @@ function resolveThinking(
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
 
-export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOptions): IREgress {
-  const profile: IREgressProfile = {
-    provider: PROVIDER,
+/**
+ * 无已知危害。判据是**没有一条真实拒绝**是内容策略造成的：这家从未因系统提示词的
+ * 内容本身拒过请求（拒绝都来自 wire 层的字段问题，那是 `writeOutboxRequest` 的事）。
+ *
+ * `false` 是一次表态，不是缺省 —— 新增一种危害时编译器会回到这里逼人重新回答。
+ */
+
+export function createGeminiCloudCodeOutbox(options: GeminiCloudCodeOutboxOptions): IROutbox {
+  const profile: IROutboxProfile = {
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
     mandatory: MANDATORY,
@@ -634,8 +640,8 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
   return {
     profile,
 
-    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const report = new UpstreamRequestReport();
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult> {
+      const report = new OutboxRequestReport();
       const { conversation, intent } = request;
 
       const [accessToken, project, sessionId] = await Promise.all([
@@ -902,7 +908,7 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       };
     },
 
-    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+    readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
       return liftGeminiStream(response, options.model, readOptions);
     },
   };
@@ -984,7 +990,7 @@ function mapFinishReason(reason: string, hadToolCall: boolean): IRStopReason {
 
 const RETRYABLE_FINISH = new Set(["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "OTHER"]);
 
-function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstreamError {
+function mapOutboxError(payload: unknown, httpStatus: number | null): IROutboxError {
   // Google 的错误体有两种：`{error:{code,message,status}}`，以及某些边缘节点回的
   // `[{error:{...}}]`（数组包一层）。两种都要认，否则 message 会退化成 "upstream error"。
   const unwrapped = Array.isArray(payload) ? payload[0] : payload;
@@ -996,7 +1002,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
   const status = typeof inner.status === "string" ? inner.status : "";
   const code = typeof inner.code === "number" ? inner.code : httpStatus;
 
-  const kind: IRUpstreamError["kind"] = (() => {
+  const kind: IROutboxError["kind"] = (() => {
     if (status === "UNAUTHENTICATED" || status === "PERMISSION_DENIED" || code === 401 || code === 403) {
       return "permissionDenied";
     }
@@ -1009,7 +1015,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
     // 退避重试的请求判成 unknown + 不可重试，直接失败。
     if (status === "UNAVAILABLE" || status === "INTERNAL" || status === "DEADLINE_EXCEEDED"
       || (code !== null && code >= 500)) {
-      return "upstreamUnavailable";
+      return "outboxUnavailable";
     }
     if (status === "CANCELLED" || code === 499) return "transport";
     if (status === "INVALID_ARGUMENT" || status === "NOT_FOUND" || code === 400 || code === 404) {
@@ -1026,7 +1032,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
     kind,
     httpStatus: httpStatus ?? (typeof code === "number" ? code : null),
     message,
-    retryable: kind === "rateLimited" || kind === "upstreamUnavailable" || kind === "transport",
+    retryable: kind === "rateLimited" || kind === "outboxUnavailable" || kind === "transport",
     raw: payload,
   };
 }
@@ -1101,7 +1107,7 @@ async function* liftGeminiStream(
 ): AsyncGenerator<IREvent> {
   if (!response.ok) {
     const text = await response.text();
-    yield { kind: "error", error: mapUpstreamError(tryParseJson(text) ?? text, response.status) };
+    yield { kind: "error", error: mapOutboxError(tryParseJson(text) ?? text, response.status) };
     return;
   }
 
@@ -1113,14 +1119,14 @@ async function* liftGeminiStream(
     finishReason: null as string | null,
     usage: null as IRUsage | null,
     toolCallSeq: 0,
-    blocked: null as IRUpstreamError | null,
+    blocked: null as IROutboxError | null,
   };
 
   const contentType = response.headers.get("content-type") ?? "";
   const chunks: AsyncIterable<{ payload: unknown; rawText: string; event: string | null }> =
     contentType.includes("text/event-stream")
       ? (async function* () {
-          for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
+          for await (const frame of iterateSse(response, readOptions?.inspectCompleteSseFrame)) {
             yield { payload: tryParseJson<unknown>(frame.data), rawText: frame.data, event: frame.event };
           }
         })()
@@ -1144,7 +1150,7 @@ async function* liftGeminiStream(
       if (state.usage !== null) yield { kind: "usage", usage: state.usage };
       const closed = cursor.close();
       if (closed !== null) yield { kind: "partEnd", index: closed };
-      yield { kind: "error", error: mapUpstreamError(envelope, null) };
+      yield { kind: "error", error: mapOutboxError(envelope, null) };
       return;
     }
 
@@ -1193,7 +1199,7 @@ async function* liftGeminiStream(
       yield {
         kind: "loss",
         loss: {
-          stage: "lift", provider: PROVIDER, path: "$.response.candidates", kind: "dropped",
+          stage: "outbox", outbox: OUTBOX, path: "$.response.candidates", kind: "dropped",
           detail: `上游返回 ${candidates.length} 个 candidate，IR 的响应只有一个 assistant 回合，仅取第一个`,
         },
       };
@@ -1345,8 +1351,8 @@ async function* liftGeminiStream(
 
 function thoughtSignatureLoss(): IRLoss {
   return {
-    stage: "lift",
-    provider: PROVIDER,
+    stage: "outbox",
+    outbox: OUTBOX,
     path: "$.response.candidates[0].content.parts[].thoughtSignature",
     kind: "dropped",
     detail: "Gemini 的 thoughtSignature 挂在 functionCall/text part 上，与 Anthropic 挂在思考块上的 "

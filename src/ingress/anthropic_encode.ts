@@ -6,7 +6,7 @@
  */
 import { formatSse } from "../ir/sse.ts";
 import {
-  observeCompleteIRResponseBeforeStreamTermination, processCompleteIRResponse,
+  observeCompleteIRResponseBeforeStreamTermination, runCompleteIRResponseInterception,
 } from "../ir/ir_message_interception_extensions.ts";
 import type { IREvent, IRRequest, IRResponsePart, IRStopReason, IRUsage } from "../ir/types.ts";
 import { asResponsePart, assembleResponse } from "../ir/response.ts";
@@ -26,7 +26,7 @@ function discloseError(event: Extract<IREvent, { kind: "error" }>): { type: stri
     case "quotaExhausted": return { type: "rate_limit_error", message: "Upstream quota exhausted.", status: 429 };
     case "contextLengthExceeded": return { type: "invalid_request_error", message: "The conversation exceeds the model context window.", status: 400 };
     case "contentPolicy": return { type: "invalid_request_error", message: "The request was rejected by an upstream content policy.", status: 400 };
-    case "upstreamUnavailable": return { type: "overloaded_error", message: "Upstream is temporarily unavailable.", status: 503 };
+    case "outboxUnavailable": return { type: "overloaded_error", message: "Upstream is temporarily unavailable.", status: 503 };
     case "transport": return { type: "api_error", message: "The upstream connection failed before completion.", status: 502 };
     case "unknown": return { type: "api_error", message: "The upstream request failed.", status: 502 };
   }
@@ -64,8 +64,8 @@ export function writeAnthropicResponse(
 ): Response | Promise<Response> {
   return request.intent.stream.value
     ? encodeStream(
-      options.processCompleteIRResponse === undefined ? events
-        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      options.runCompleteIRResponseInterception === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.runCompleteIRResponseInterception),
       request,
       options,
     )
@@ -195,7 +195,7 @@ async function encodeAggregate(
   // 折叠只有一个实现（ir/response.ts）。此处只做 IRResponse → Anthropic wire 的映射，
   // 不再自己维护一份累积状态 —— 那样两个协议会各折各的，且都落不到 IR 上。
   const assembled = await assembleResponse(events, request.model);
-  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
+  await runCompleteIRResponseInterception(assembled, options.runCompleteIRResponseInterception);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {

@@ -18,7 +18,7 @@
  * 决定就该写下来。
  */
 import {
-  GatewayConfigError, readOptionalText, readTextList, type EnvLookup,
+  GatewaySettingsError, readOptionalText, readTextList, type EnvLookup,
 } from "./env.ts";
 
 /** 表里没有这个客户端模型时怎么办。三种，都是显式写出来的选择。 */
@@ -28,7 +28,7 @@ export type ModelFallback =
   /** 把客户端那串原样当上游 id 发出去。名字空间恰好一致的部署可以这么配。 */
   | { readonly kind: "passthrough" }
   /** 统一落到一个上游 id 上。单模型部署常用。 */
-  | { readonly kind: "pinned"; readonly upstreamModel: string };
+  | { readonly kind: "pinned"; readonly outboxModel: string };
 
 export interface ModelRoutingTable {
   /** 客户端模型名 → 上游模型 id。 */
@@ -41,20 +41,20 @@ export interface ModelRoutingTable {
  * 「路由到哪」和「为什么是它」都要进日志，而「没中」是调用方必须表态的正常返回值之一。
  */
 export type ModelResolution =
-  | { readonly kind: "routed"; readonly upstreamModel: string; readonly via: "table" | "passthrough" | "pinned" }
+  | { readonly kind: "routed"; readonly outboxModel: string; readonly via: "table" | "passthrough" | "pinned" }
   | { readonly kind: "unrouted"; readonly clientModel: string; readonly knownClientModels: readonly string[] };
 
 /** 一次查表。**唯一的查法**，没有第二处 `routes.get`。 */
-export function resolveUpstreamModel(
+export function resolveOutboxModel(
   table: ModelRoutingTable, clientModel: string,
 ): ModelResolution {
   const mapped = table.routes.get(clientModel);
-  if (mapped !== undefined) return { kind: "routed", upstreamModel: mapped, via: "table" };
+  if (mapped !== undefined) return { kind: "routed", outboxModel: mapped, via: "table" };
   switch (table.fallback.kind) {
     case "passthrough":
-      return { kind: "routed", upstreamModel: clientModel, via: "passthrough" };
+      return { kind: "routed", outboxModel: clientModel, via: "passthrough" };
     case "pinned":
-      return { kind: "routed", upstreamModel: table.fallback.upstreamModel, via: "pinned" };
+      return { kind: "routed", outboxModel: table.fallback.outboxModel, via: "pinned" };
     case "refuse":
       return {
         kind: "unrouted", clientModel,
@@ -72,14 +72,14 @@ function parseFallback(env: EnvLookup): ModelFallback {
   if (raw === undefined || raw === "refuse") return { kind: "refuse" };
   if (raw === "passthrough") return { kind: "passthrough" };
   if (raw.startsWith(PINNED_PREFIX)) {
-    const upstreamModel = raw.slice(PINNED_PREFIX.length).trim();
-    if (upstreamModel.length === 0) {
-      throw new GatewayConfigError(`${FALLBACK_VARIABLE}='${raw}' names no upstream model after '${PINNED_PREFIX}'`);
+    const outboxModel = raw.slice(PINNED_PREFIX.length).trim();
+    if (outboxModel.length === 0) {
+      throw new GatewaySettingsError(`${FALLBACK_VARIABLE}='${raw}' names no upstream model after '${PINNED_PREFIX}'`);
     }
-    return { kind: "pinned", upstreamModel };
+    return { kind: "pinned", outboxModel };
   }
-  throw new GatewayConfigError(
-    `${FALLBACK_VARIABLE}='${raw}' is not recognised; expected one of: refuse, passthrough, ${PINNED_PREFIX}<upstream-model-id>`,
+  throw new GatewaySettingsError(
+    `${FALLBACK_VARIABLE}='${raw}' is not recognised; expected one of: refuse, passthrough, ${PINNED_PREFIX}<outbox-model-id>`,
   );
 }
 
@@ -94,23 +94,23 @@ export function readModelRoutingTable(env: EnvLookup): ModelRoutingTable {
   for (const entry of readTextList(env, MAP_VARIABLE)) {
     const separator = entry.indexOf("=");
     if (separator <= 0 || separator === entry.length - 1) {
-      throw new GatewayConfigError(
-        `${MAP_VARIABLE} entry '${entry}' is not '<client-model>=<upstream-model>'`,
+      throw new GatewaySettingsError(
+        `${MAP_VARIABLE} entry '${entry}' is not '<client-model>=<outbox-model>'`,
       );
     }
     const clientModel = entry.slice(0, separator).trim();
-    const upstreamModel = entry.slice(separator + 1).trim();
-    if (clientModel.length === 0 || upstreamModel.length === 0) {
-      throw new GatewayConfigError(
-        `${MAP_VARIABLE} entry '${entry}' has an empty side; expected '<client-model>=<upstream-model>'`,
+    const outboxModel = entry.slice(separator + 1).trim();
+    if (clientModel.length === 0 || outboxModel.length === 0) {
+      throw new GatewaySettingsError(
+        `${MAP_VARIABLE} entry '${entry}' has an empty side; expected '<client-model>=<outbox-model>'`,
       );
     }
     if (routes.has(clientModel)) {
-      throw new GatewayConfigError(
-        `${MAP_VARIABLE} maps client model '${clientModel}' twice ('${routes.get(clientModel)}' and '${upstreamModel}')`,
+      throw new GatewaySettingsError(
+        `${MAP_VARIABLE} maps client model '${clientModel}' twice ('${routes.get(clientModel)}' and '${outboxModel}')`,
       );
     }
-    routes.set(clientModel, upstreamModel);
+    routes.set(clientModel, outboxModel);
   }
   return { routes, fallback: parseFallback(env) };
 }
@@ -121,6 +121,6 @@ export function describeUnroutedModel(resolution: Extract<ModelResolution, { kin
     ? "the gateway has no model mapping configured"
     : `mapped client models are: ${resolution.knownClientModels.join(", ")}`;
   return `model '${resolution.clientModel}' is not routed by this gateway; ${known}`
-    + ` (add '${resolution.clientModel}=<upstream-model-id>' to ${MAP_VARIABLE},`
-    + ` or set ${FALLBACK_VARIABLE}=passthrough / ${FALLBACK_VARIABLE}=${PINNED_PREFIX}<upstream-model-id>)`;
+    + ` (add '${resolution.clientModel}=<outbox-model-id>' to ${MAP_VARIABLE},`
+    + ` or set ${FALLBACK_VARIABLE}=passthrough / ${FALLBACK_VARIABLE}=${PINNED_PREFIX}<outbox-model-id>)`;
 }

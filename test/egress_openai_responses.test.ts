@@ -12,9 +12,11 @@
  *     `keepalive` / `response.failed` / 顶层 `error` 三例
  */
 import { describe, expect, it } from "bun:test";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
-import { checkUpstreamSupport } from "../src/ir/admission.ts";
+import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import {
   clientValue, defaultValue,
@@ -22,7 +24,7 @@ import {
   type IRToolset, type IRTurn,
 } from "../src/ir/types.ts";
 
-const egress = createResponsesUpstream({
+const outbox = createOpenAIResponsesOutbox({
   baseUrl: "https://api.openai.com/v1",
   apiKey: "sk-test",
   model: "gpt-5.6-sol",
@@ -59,14 +61,14 @@ function makeRequest(input: {
     ...input.intent,
   };
   const partial = {
-    traceId: "tr-egress", protocol: "openai_responses" as const, model: "client-model",
+    traceId: "tr-outbox", protocol: "openai_responses" as const, model: "client-model",
     conversation, intent,
   };
   return { ...partial, requires: deriveCapabilityNeeds(partial) };
 }
 
 /**
- * `writeUpstreamRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
+ * `writeOutboxRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
  * 万一被拒，失败信息里直接是 problems，而不是一句「wire is undefined」。
  */
 async function lowerBody(request: IRRequest): Promise<{
@@ -77,7 +79,7 @@ async function lowerBody(request: IRRequest): Promise<{
   readonly headers: Readonly<Record<string, string>>;
   readonly rawBody: string;
 }> {
-  const lowered = await egress.writeUpstreamRequest(request);
+  const lowered = await outbox.writeOutboxRequest(request);
   if (!lowered.ok) throw new Error(`expected a compiled request, got problems: ${JSON.stringify(lowered.problems)}`);
   const body = JSON.parse(lowered.wire.body) as Record<string, unknown>;
   return {
@@ -95,7 +97,7 @@ async function rejected(request: IRRequest): Promise<{
   readonly problems: readonly IRBuildProblem[];
   readonly losses: readonly { path: string; kind: string; detail: string }[];
 }> {
-  const lowered = await egress.writeUpstreamRequest(request);
+  const lowered = await outbox.writeOutboxRequest(request);
   if (lowered.ok) throw new Error(`expected a rejection, got a wire: ${lowered.wire.body}`);
   return {
     problems: lowered.problems,
@@ -114,7 +116,7 @@ function sse(frames: ReadonlyArray<Record<string, unknown>>): Response {
 
 async function collect(response: Response): Promise<IREvent[]> {
   const events: IREvent[] = [];
-  for await (const event of egress.readUpstreamResponse(response)) events.push(event);
+  for await (const event of outbox.readOutboxResponse(response)) events.push(event);
   return events;
 }
 
@@ -124,25 +126,25 @@ describe("能力声明", () => {
     // Anthropic 出口只能把 namespace 拍进名字、把 freeform 包成单字段 schema，两者都记 lossy。
     // Responses 两者都有原生载体：定义侧 {type:'namespace'} / {type:'custom'}，
     // 调用侧 function_call.namespace / custom_tool_call.input。
-    expect(egress.profile.supports.has("toolGroup")).toBe(true);
-    expect(egress.profile.supports.has("toolFreeform")).toBe(true);
-    expect(egress.profile.lossy.has("toolGroup")).toBe(false);
-    expect(egress.profile.lossy.has("toolFreeform")).toBe(false);
+    expect(outbox.profile.supports.has("toolGroup")).toBe(true);
+    expect(outbox.profile.supports.has("toolFreeform")).toBe(true);
+    expect(outbox.profile.lossy.has("toolGroup")).toBe(false);
+    expect(outbox.profile.lossy.has("toolFreeform")).toBe(false);
   });
 
   it("没核实过形状的一律不进 supports：stopSequences / topK / reasoningBudget", () => {
     for (const capability of ["stopSequences", "topK", "reasoningBudget", "thinkingSignature"] as const) {
-      expect(egress.profile.supports.has(capability)).toBe(false);
-      expect(egress.profile.lossy.has(capability)).toBe(true);
+      expect(outbox.profile.supports.has(capability)).toBe(false);
+      expect(outbox.profile.lossy.has(capability)).toBe(true);
     }
     // document 没有经验证的 wire 载体，必须在准入层拒绝。
-    expect(egress.profile.supports.has("document")).toBe(false);
-    expect(egress.profile.lossy.has("document")).toBe(false);
+    expect(outbox.profile.supports.has("document")).toBe(false);
+    expect(outbox.profile.lossy.has("document")).toBe(false);
     // function_call_output 原生接受 input_image；图像工具结果无需降级。
-    expect(egress.profile.supports.has("toolResultImage")).toBe(true);
-    expect(egress.profile.lossy.has("toolResultImage")).toBe(false);
+    expect(outbox.profile.supports.has("toolResultImage")).toBe(true);
+    expect(outbox.profile.lossy.has("toolResultImage")).toBe(false);
     // supports 与 lossy 不相交，否则 admission 的三条规则会退化成两条。
-    for (const capability of egress.profile.supports) expect(egress.profile.lossy.has(capability)).toBe(false);
+    for (const capability of outbox.profile.supports) expect(outbox.profile.lossy.has(capability)).toBe(false);
   });
 
   it("含分组 + freeform 工具的请求直接放行，且不产生 admission loss", () => {
@@ -157,7 +159,7 @@ describe("能力声明", () => {
         parallel: defaultValue(true),
       },
     });
-    const verdict = checkUpstreamSupport(request, egress.profile);
+    const verdict = checkOutboxSupport(request, outbox.profile);
     expect(verdict.admitted).toBe(true);
     expect(verdict.losses).toHaveLength(0);
   });
@@ -243,6 +245,41 @@ describe("lower：会话 → 扁平 item 序列", () => {
     expect(grouped?.namespace).toBe("collaboration");
     // 拍平的话名字会变成 collaboration__send_message —— 那正是 Anthropic 出口的有损做法。
     expect(String(grouped?.name)).not.toContain("__");
+  });
+
+  /**
+   * AGENTS.md 要求的「不影响其他 Outbox」的反例 —— 上一条只断言了本出口不拍平，
+   * 「那正是 Anthropic 的有损做法」到此为止还只是一句注释。把它变成断言：
+   * `toolGroup` 在本出口是 `supports`（零损失），在别处是 `lossy`（拍平 + 强制留痕）。
+   * 这条同时守住不变量 3 —— 拍平必须留痕，不许静默。
+   */
+  it("特化不外溢：同一条分组 IR 走 Anthropic / Chat 会被拍进名字，并各自记一条 degraded", async () => {
+    // 本出口：结构化 namespace，且这条链路上 toolset 不产生任何损失。
+    const { losses } = await lowerBody(conversation);
+    expect(losses.filter((loss) => loss.path.startsWith("$.conversation.toolset"))).toEqual([]);
+
+    const anthropic = createAnthropicOutbox({ baseUrl: "https://api.anthropic.com/", apiKey: "k", model: "m" });
+    const chat = createOpenAIChatOutbox({ baseUrl: "https://api.openai.com/v1", apiKey: "k", model: "m" });
+
+    // Anthropic 强制 max_tokens（本文件的 `conversation` 不带它，因为 /v1/responses 不要求）。
+    // 补上它，好让这条对照比的是分组的下场，而不是必填字段谁先拒。
+    const grouped = makeRequest({
+      system: conversation.conversation.system,
+      turns: conversation.conversation.turns,
+      toolset: conversation.conversation.toolset,
+      intent: { stopping: { maxOutputTokens: clientValue(256) } },
+    });
+
+    for (const other of [anthropic, chat]) {
+      const built = await other.writeOutboxRequest(grouped);
+      if (!built.ok) throw new Error(`expected a compiled request: ${JSON.stringify(built.problems)}`);
+      // 名字被拍平成 `${group}__${name}`，wire 上没有任何 namespace 承载位。
+      expect(built.wire.body).toContain("collaboration__send_message");
+      expect(built.wire.body).not.toContain("\"namespace\"");
+      // 拍平是有损的，必须留痕 —— 静默拍平正是这个出口存在的理由。
+      expect(built.losses.some((loss) => loss.kind === "degraded" && loss.detail.includes("collaboration")))
+        .toBe(true);
+    }
   });
 
   it("freeform 调用的入参是自由文本，不被包成 JSON", async () => {
@@ -369,7 +406,7 @@ describe("会话身份：承载得了的发，承载不了的留痕", () => {
   });
 
   it("必填字段：/v1/responses 不要求 max_output_tokens", () => {
-    expect(egress.profile.mandatory.maxOutputTokens).toBe(false);
+    expect(outbox.profile.mandatory.maxOutputTokens).toBe(false);
   });
 });
 
@@ -568,7 +605,7 @@ describe("lower：损失必须留痕", () => {
     }));
     expect(body.max_output_tokens).toBe(4096);
     expect(losses).toHaveLength(0);
-    expect(egress.profile.supports.has("maxOutputTokens")).toBe(true);
+    expect(outbox.profile.supports.has("maxOutputTokens")).toBe(true);
   });
 
   it("tool_choice 指定 freeform 工具时用 {type:'custom'}，指定分组工具时带 namespace", async () => {
@@ -617,7 +654,7 @@ describe("lift：正常流", () => {
   ];
 
   it("文本 delta、工具参数分片、推理摘要与加密思考全部落到 IR 上", async () => {
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(frames)), "fallback");
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse(frames)), "fallback");
     expect(assembled.model).toBe("gpt-5.6-sol");
     expect(assembled.stopReason).toBe("toolUse");
     expect(assembled.error).toBeNull();
@@ -634,7 +671,7 @@ describe("lift：正常流", () => {
   });
 
   it("usage 换算成 Anthropic 语义：input 必须减去 cached_tokens", async () => {
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse(frames)), "fallback");
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse(frames)), "fallback");
     // 实测 input_tokens 18661 **含** cached 17792；不减的话缓存被双倍计入输入。
     expect(assembled.usage).toEqual({
       inputTokens: 18661 - 17792,
@@ -663,7 +700,7 @@ describe("lift：正常流", () => {
   });
 
   it("freeform 工具调用走 custom_tool_call，入参保持自由文本", async () => {
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.output_item.added", output_index: 0, item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_p", name: "apply_patch", input: "" } },
       { type: "response.custom_tool_call_input.delta", output_index: 0, item_id: "ctc_1", delta: "*** Begin Patch" },
@@ -676,7 +713,7 @@ describe("lift：正常流", () => {
   });
 
   it("只有 done 带全量参数（没有任何 delta）时补发，不静默丢工具入参", async () => {
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_y", name: "T", arguments: "" } },
       { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_1", arguments: "{\"a\":1}" },
@@ -710,7 +747,7 @@ describe("lift：失败形态一个都不能吞", () => {
     expect(last?.kind === "error" && last.error.retryable).toBe(true);
 
     // 折叠后 stopReason 仍为 null —— 调用方据此区分「说完了」与「连接断了」。
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse([
       { type: "response.created", response: { model: "m" } },
     ])), "m");
     expect(assembled.stopReason).toBeNull();
@@ -718,7 +755,7 @@ describe("lift：失败形态一个都不能吞", () => {
   });
 
   it("response.failed 里的 context_length_exceeded 必须显形（实测一天 126 次被吞）", async () => {
-    const assembled = await assembleResponse(egress.readUpstreamResponse(sse([
+    const assembled = await assembleResponse(outbox.readOutboxResponse(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "response.failed", response: {
         status: "failed",
@@ -732,13 +769,13 @@ describe("lift：失败形态一个都不能吞", () => {
     expect(assembled.stopReason).toBeNull();
   });
 
-  it("顶层 error 事件（另一种失败形态）同样映射到 IRUpstreamError", async () => {
+  it("顶层 error 事件（另一种失败形态）同样映射到 IROutboxError", async () => {
     const events = await collect(sse([
       { type: "response.created", response: { model: "m" } },
       { type: "error", error: { type: "server_error", code: "server_error", message: "upstream blew up" } },
     ]));
     const failure = events.find((event) => event.kind === "error");
-    expect(failure?.kind === "error" && failure.error.kind).toBe("upstreamUnavailable");
+    expect(failure?.kind === "error" && failure.error.kind).toBe("outboxUnavailable");
     expect(failure?.kind === "error" && failure.error.retryable).toBe(true);
     // 已经有终止事件，不能再补一条 transport error。
     expect(events.filter((event) => event.kind === "error")).toHaveLength(1);
@@ -766,7 +803,7 @@ describe("lift：非流式 JSON 合成等价事件序列", () => {
       usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 10 },
     };
     const response = new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
-    const assembled = await assembleResponse(egress.readUpstreamResponse(response), "fallback");
+    const assembled = await assembleResponse(outbox.readOutboxResponse(response), "fallback");
 
     expect(assembled.model).toBe("gpt-5.6-sol");
     expect(assembled.turn.parts.map((part) => part.kind)).toEqual(["thinking", "redactedThinking", "text", "toolCall"]);
@@ -804,8 +841,8 @@ describe("lift：HTTP 层失败映射", () => {
     { status: 401, payload: { error: { code: "invalid_api_key", message: "no key" } }, kind: "permissionDenied", retryable: false },
     { status: 429, payload: { error: { code: "rate_limit_exceeded", message: "slow down" } }, kind: "rateLimited", retryable: true },
     { status: 429, payload: { error: { type: "insufficient_quota", message: "you ran out" } }, kind: "quotaExhausted", retryable: false },
-    { status: 500, payload: { error: { type: "server_error", message: "boom" } }, kind: "upstreamUnavailable", retryable: true },
-    { status: 503, payload: "upstream down", kind: "upstreamUnavailable", retryable: true },
+    { status: 500, payload: { error: { type: "server_error", message: "boom" } }, kind: "outboxUnavailable", retryable: true },
+    { status: 503, payload: "upstream down", kind: "outboxUnavailable", retryable: true },
   ];
 
   for (const testCase of cases) {

@@ -3,7 +3,7 @@
  * 收成一个可穷举的封闭集，由调用方显式 compose。
  *
  * Core 的分工不变：表达不了就带精确 IR 路径拒绝，绝不发明内容。这一层的存在意义正是
- * 让**原本会被 `checkUpstreamSupport` 拒掉的请求**在调用方明确同意某种降级之后通过：
+ * 让**原本会被 `checkOutboxSupport` 拒掉的请求**在调用方明确同意某种降级之后通过：
  *
  * ```ts
  * const policy: IRRepairPolicy = {
@@ -12,17 +12,17 @@
  *   textualizeUnsupportedDocument: { placeholderText: "[文档已省略：{title}]" },
  *   defaultMaxOutputTokens: { tokens: 8192 },
  * };
- * const { request, applied } = repairIRRequest(clientRequest, egress.profile, policy);
- * const check = checkUpstreamSupport(request, egress.profile);   // 现在可能过了
- * const losses = describeRepairsAsLosses(applied, egress.profile.provider);
+ * const { request, applied } = repairIRRequest(clientRequest, outbox.profile, policy);
+ * const check = checkOutboxSupport(request, outbox.profile);   // 现在可能过了
+ * const losses = describeRepairsAsLosses(applied, selectedOutboxName);
  * ```
  *
  * 不传策略（或传 `IR_REPAIR_POLICY_NONE`）时 `request` 是**入参那个对象本身**：
  * 确定性是默认值，修复是显式选择。
  */
-import { checkUpstreamSupport } from "../ir/admission.ts";
-import type { UpstreamSupportCheck } from "../ir/admission.ts";
-import type { IREgressProfile, IRLoss, IRRequest } from "../ir/types.ts";
+import { checkOutboxSupport } from "../ir/admission.ts";
+import type { OutboxSupportCheck } from "../ir/admission.ts";
+import type { IROutboxProfile, IRLoss, IRRequest } from "../ir/types.ts";
 import {
   IR_REPAIR_KINDS,
   type IRRepairCapabilityGate, type IRRepairKind, type IRRepairOptionsByKind, type IRRepairPolicy,
@@ -54,7 +54,7 @@ export {
  * `repairWhenMandatory` 读的是 `profile.mandatory` 而不是 supports：问的是「目标**要求**
  * 这个字段吗」，不是「目标认识它吗」。两者混用会让修复替不要求它的上游凭空造出约束。
  */
-function isGateSatisfied(gate: IRRepairCapabilityGate, profile: IREgressProfile): boolean {
+function isGateSatisfied(gate: IRRepairCapabilityGate, profile: IROutboxProfile): boolean {
   switch (gate.kind) {
     case "targetIndependent":
       return true;
@@ -70,7 +70,7 @@ function isGateSatisfied(gate: IRRepairCapabilityGate, profile: IREgressProfile)
  * `defaults` 三者的关联由编译器保证 —— 这里不存在也不允许存在任何 `switch (kind)`。
  */
 function runRepair<K extends IRRepairKind>(
-  kind: K, request: IRRequest, profile: IREgressProfile, policy: IRRepairPolicy,
+  kind: K, request: IRRequest, profile: IROutboxProfile, policy: IRRepairPolicy,
 ): IRRepairResult {
   const entry = policy[kind];
   // 键缺席 = 不修。没有 enabled 布尔，也就没有「配了却没生效」这种状态。
@@ -88,7 +88,7 @@ function runRepair<K extends IRRepairKind>(
  * 让流水线行为依赖它的书写顺序等于把「先摘孤儿再补悬空」这类真实依赖交给运气。
  */
 export function repairIRRequest(
-  request: IRRequest, profile: IREgressProfile, policy: IRRepairPolicy,
+  request: IRRequest, profile: IROutboxProfile, policy: IRRepairPolicy,
 ): IRRepairResult {
   let current = request;
   const applied: IRRepairRecord[] = [];
@@ -103,15 +103,15 @@ export function repairIRRequest(
 /**
  * 修复记录 → `IRLoss`。类别取自规格表，调用方不许各猜各的。
  *
- * `stage` 恒为 `egress`：修复发生在准入之前、出口之上，是「为了这一家上游而做的决定」，
+ * `stage` 恒为 `outbox`：修复发生在准入之前、出口之上，是「为了这一家上游而做的决定」，
  * 换一家上游结论就可能不同。
  */
 export function describeRepairsAsLosses(
-  applied: readonly IRRepairRecord[], provider: string,
+  applied: readonly IRRepairRecord[], outbox: string,
 ): IRLoss[] {
   return applied.map((record) => ({
-    stage: "egress",
-    provider,
+    stage: "outbox",
+    outbox,
     path: record.path,
     kind: IR_REPAIR_SPECS[record.kind].lossKind,
     detail: record.detail,
@@ -126,8 +126,8 @@ export function describeRepairsAsLosses(
  * 修复会改变 `requires`，拿旧裁决结果做决定必错。
  */
 export function repairForAdmission(
-  request: IRRequest, profile: IREgressProfile, policy: IRRepairPolicy,
-): IRRepairResult & { readonly admission: UpstreamSupportCheck } {
+  request: IRRequest, profile: IROutboxProfile, policy: IRRepairPolicy, outbox: string | null = null,
+): IRRepairResult & { readonly admission: OutboxSupportCheck } {
   const outcome = repairIRRequest(request, profile, policy);
-  return { ...outcome, admission: checkUpstreamSupport(outcome.request, profile) };
+  return { ...outcome, admission: checkOutboxSupport(outcome.request, profile, outbox) };
 }

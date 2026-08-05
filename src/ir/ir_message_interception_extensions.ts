@@ -30,24 +30,24 @@ export interface IRRequestInterceptionContext {
 }
 
 export interface IRResponseInterceptionContext extends IRRequestInterceptionContext {
-  readonly provider: string;
+  readonly outbox: string;
   readonly stream: boolean;
 }
 
-export type CompleteOutboxSseFrameProcessor = (frame: MutableSseEvent) => ValueOrPromise;
-export type CompleteIRResponseProcessor = (response: MutableIRResponse) => ValueOrPromise;
+export type CompleteOutboxSseFrameInspector = (frame: MutableSseEvent) => ValueOrPromise;
+export type CompleteIRResponseInterceptor = (response: MutableIRResponse) => ValueOrPromise;
 
 /** 只在拦截器边界解除 readonly；运行时仍是原对象，不会复制。 */
-export async function processCompleteIRResponse(
+export async function runCompleteIRResponseInterception(
   response: IRResponse,
-  processor: CompleteIRResponseProcessor | undefined,
+  processor: CompleteIRResponseInterceptor | undefined,
 ): Promise<void> {
   if (processor !== undefined) await processor(response as MutableIRResponse);
 }
 
 /** Outbox lift 的可选读入拦截；非 SSE wire（如 ConnectRPC）不会调用它。 */
 export interface OutboxResponseReadInterceptionOptions {
-  readonly processCompleteSseFrame?: CompleteOutboxSseFrameProcessor;
+  readonly inspectCompleteSseFrame?: CompleteOutboxSseFrameInspector;
 }
 
 /** OkHttp 同构的剩余链：每个 interceptor 对同一轮至多调用一次 `proceed`。 */
@@ -131,7 +131,7 @@ class MutableIRMessageInterceptorChain<T, Context> implements IRMessageIntercept
 /**
  * 网关默认即可直接使用的三条 interceptor chain：
  *
- * - `inboxRequestInterceptorChain`：decode 后、模型路由/repair/egress 前；
+ * - `inboxRequestInterceptorChain`：decode 后、模型路由/repair/outbox 前；
  * - `outboxSseFrameInterceptorChain`：共享分帧器完成一帧（空行）后、各出口 lift 前；
  * - `inboxCompletedResponseInterceptorChain`：完整 IRResponse 已形成；流式场景在终止事件下发前触发。
  */
@@ -156,7 +156,7 @@ export function createIRMessageInterceptionExtensions(): IRMessageInterceptionEx
 export async function* observeCompleteIRResponseBeforeStreamTermination(
   events: AsyncIterable<IREvent>,
   fallbackModel: string,
-  processCompleteResponse: CompleteIRResponseProcessor,
+  completeResponseInterceptor: CompleteIRResponseInterceptor,
 ): AsyncGenerator<IREvent> {
   const accumulator = new IRResponseAccumulator(fallbackModel);
   const deferred: IREvent[] = [];
@@ -173,7 +173,7 @@ export async function* observeCompleteIRResponseBeforeStreamTermination(
   }
 
   const response = accumulator.finish();
-  await processCompleteIRResponse(response, processCompleteResponse);
+  await runCompleteIRResponseInterception(response, completeResponseInterceptor);
   for (const event of deferred) {
     // 流正文已经交给客户端，唯一还能安全映射的可见字段是终止状态/错误。
     if (event.kind === "messageStop" && response.error === null && response.stopReason !== null) {

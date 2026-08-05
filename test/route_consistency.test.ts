@@ -17,32 +17,32 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeUpstream, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
 import { readClientRequestForProtocol } from "../src/ingress/index.ts";
-import { checkUpstreamSupport, describeUnsupportedCapabilities } from "../src/ir/admission.ts";
+import { checkOutboxSupport, describeUnsupportedCapabilities } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import { repairForAdmission, IR_REPAIR_KINDS } from "../src/repair/index.ts";
 import type { IRRepairKind, IRRepairPolicy } from "../src/repair/index.ts";
 import { IR_BUILD_PROBLEM_KINDS, IR_CAPABILITIES, IR_PROTOCOLS } from "../src/ir/types.ts";
 import type {
-  IRBuildProblemKind, IRCapability, IREgress, IRProtocol, IRRequest, IRWireBody,
+  IRBuildProblemKind, IRCapability, IROutbox, IRProtocol, IRRequest, IRWireBody,
 } from "../src/ir/types.ts";
 
 // ── 五个出口 ────────────────────────────────────────────────────────────────
 
-function buildEgresses(): Readonly<Record<string, IREgress<IRWireBody>>> {
+function buildEgresses(): Readonly<Record<string, IROutbox<IRWireBody>>> {
   return {
-    anthropic: createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
-    openai_chat: createChatCompletionsUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
-    openai_responses: createResponsesUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
-    gemini_cloudcode: createGeminiCloudCodeUpstream({
+    anthropic: createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
+    openai_chat: createOpenAIChatOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    openai_responses: createOpenAIResponsesOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    gemini_cloudcode: createGeminiCloudCodeOutbox({
       model: "gemini-test", accessToken: "ya29.t", project: "p", requestIdFactory: () => "agent/1/1/d/2",
     }),
-    windsurf: createWindsurfUpstream({ model: "claude-test-high", apiKey: "devin$h.e.s" }),
+    windsurf: createWindsurfOutbox({ model: "claude-test-high", apiKey: "devin$h.e.s" }),
   };
 }
 
@@ -187,26 +187,26 @@ describe("同一个 IR 送进五个出口", () => {
     const derived = deriveCapabilityNeeds(request);
     expect(derived).toEqual([...request.requires]);
     // 出口只读它，不改它：把 requires 交给每个出口裁决前后必须一模一样。
-    for (const egress of Object.values(EGRESSES)) {
-      checkUpstreamSupport(request, egress.profile);
+    for (const outbox of Object.values(EGRESSES)) {
+      checkOutboxSupport(request, outbox.profile);
       expect(request.requires).toEqual(derived);
     }
   });
 
   it("拒绝的理由集合可解释：每条 unsupported 都确实落在 supports ∪ lossy 之外", () => {
-    for (const [name, egress] of Object.entries(EGRESSES)) {
-      const verdict = checkUpstreamSupport(request, egress.profile);
+    for (const [name, outbox] of Object.entries(EGRESSES)) {
+      const verdict = checkOutboxSupport(request, outbox.profile, name);
       for (const need of verdict.unsupported) {
-        expect({ name, capability: need.capability, inSupports: egress.profile.supports.has(need.capability) })
+        expect({ name, capability: need.capability, inSupports: outbox.profile.supports.has(need.capability) })
           .toEqual({ name, capability: need.capability, inSupports: false });
-        expect(egress.profile.lossy.has(need.capability)).toBe(false);
+        expect(outbox.profile.lossy.has(need.capability)).toBe(false);
         // 拒绝的价值全在「是哪个字段」：路径必须指到 IR 位置。
         expect(need.paths.length).toBeGreaterThan(0);
       }
       // 记 loss 的那些必须真的在 lossy 里 —— 不许对 supports 里的能力也记一条。
       for (const loss of verdict.losses) {
-        expect(loss.stage).toBe("egress");
-        expect(loss.provider).toBe(egress.profile.provider);
+        expect(loss.stage).toBe("outbox");
+        expect(loss.outbox).toBe(name);
       }
       expect(describeUnsupportedCapabilities(verdict.unsupported))
         .toBe(verdict.unsupported.map((need) => `${need.capability} (${need.paths.slice(0, 3).join(", ")})`).join("; "));
@@ -214,21 +214,21 @@ describe("同一个 IR 送进五个出口", () => {
   });
 
   it("supports 与 lossy 必须不相交 —— 重叠会让「强制留痕」静默失效", () => {
-    for (const [name, egress] of Object.entries(EGRESSES)) {
-      const overlap = [...egress.profile.supports].filter((capability) => egress.profile.lossy.has(capability));
+    for (const [name, outbox] of Object.entries(EGRESSES)) {
+      const overlap = [...outbox.profile.supports].filter((capability) => outbox.profile.lossy.has(capability));
       expect({ name, overlap }).toEqual({ name, overlap: [] });
-      for (const capability of [...egress.profile.supports, ...egress.profile.lossy]) {
+      for (const capability of [...outbox.profile.supports, ...outbox.profile.lossy]) {
         expect(IR_CAPABILITIES).toContain(capability);
       }
     }
   });
 
   it("这段普通对话五个出口全都编译得出来，且 wire 里一个 marker 都不少", async () => {
-    for (const [name, egress] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(EGRESSES)) {
       clearThoughtSignatureCache();
-      const verdict = checkUpstreamSupport(request, egress.profile);
+      const verdict = checkOutboxSupport(request, outbox.profile);
       expect({ name, admitted: verdict.admitted }).toEqual({ name, admitted: true });
-      const built = await egress.writeUpstreamRequest(request);
+      const built = await outbox.writeOutboxRequest(request);
       expect({ name, ok: built.ok }).toEqual({ name, ok: true });
       if (!built.ok) continue;
       const text = wireText(built.wire.body);
@@ -243,9 +243,9 @@ describe("同一个 IR 送进五个出口", () => {
   });
 
   it("客户端没说的东西不许出现在 wire 上 —— Core 不发明内容", async () => {
-    for (const egress of Object.values(EGRESSES)) {
+    for (const outbox of Object.values(EGRESSES)) {
       clearThoughtSignatureCache();
-      const built = await egress.writeUpstreamRequest(request);
+      const built = await outbox.writeOutboxRequest(request);
       if (!built.ok) continue;
       const text = wireText(built.wire.body);
       // 这几句是 repair 层的占位文案，Core 路径上永远不该出现。
@@ -275,9 +275,9 @@ describe("表达不了的内容：拒绝必须指到那个 part，绝不静默�
 
   it("每个出口要么承载、要么在准入或构造阶段带路径拒绝 —— 没有第三种结局", async () => {
     const request = withMedia();
-    for (const [name, egress] of Object.entries(EGRESSES)) {
+    for (const [name, outbox] of Object.entries(EGRESSES)) {
       clearThoughtSignatureCache();
-      const verdict = checkUpstreamSupport(request, egress.profile);
+      const verdict = checkOutboxSupport(request, outbox.profile);
       if (!verdict.admitted) {
         // 准入拒了：理由必须精确到 part 路径。
         for (const need of verdict.unsupported) {
@@ -285,7 +285,7 @@ describe("表达不了的内容：拒绝必须指到那个 part，绝不静默�
         }
         continue;
       }
-      const built = await egress.writeUpstreamRequest(request);
+      const built = await outbox.writeOutboxRequest(request);
       if (!built.ok) {
         for (const problem of built.problems) {
           expect(IR_BUILD_PROBLEM_KINDS).toContain(problem.kind);
@@ -371,9 +371,9 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
 
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, egress] of Object.entries(EGRESSES)) {
+      for (const [name, outbox] of Object.entries(EGRESSES)) {
         clearThoughtSignatureCache();
-        const repaired = repairForAdmission(request, egress.profile, MAXIMAL_POLICY);
+        const repaired = repairForAdmission(request, outbox.profile, MAXIMAL_POLICY);
 
         if (!repaired.admission.admitted) {
           for (const need of repaired.admission.unsupported) {
@@ -386,7 +386,7 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
           continue;
         }
 
-        const built = await egress.writeUpstreamRequest(repaired.request);
+        const built = await outbox.writeOutboxRequest(repaired.request);
         if (built.ok) {
           outcomes.set(`${name}:ok`, (outcomes.get(`${name}:ok`) ?? 0) + 1);
           const body = built.wire.body;
@@ -404,7 +404,7 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
       }
     }
 
-    console.log("corpus × egress outcomes:", Object.fromEntries([...outcomes].sort()));
+    console.log("corpus × outbox outcomes:", Object.fromEntries([...outcomes].sort()));
     // 出现在这里的每一条都是「修复层认为自己能修，实际没修掉」或「没人想过的拒绝理由」。
     expect(unexplained.slice(0, 20)).toEqual([]);
   }, 120_000);
@@ -413,10 +413,10 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
     const problemKinds = new Set<IRBuildProblemKind>();
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [, egress] of Object.entries(EGRESSES)) {
+      for (const [, outbox] of Object.entries(EGRESSES)) {
         clearThoughtSignatureCache();
-        if (!checkUpstreamSupport(request, egress.profile).admitted) continue;
-        const built = await egress.writeUpstreamRequest(request);
+        if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
+        const built = await outbox.writeOutboxRequest(request);
         if (built.ok) continue;
         for (const problem of built.problems) problemKinds.add(problem.kind);
       }
@@ -429,18 +429,18 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
     let improved = 0;
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [, egress] of Object.entries(EGRESSES)) {
+      for (const [, outbox] of Object.entries(EGRESSES)) {
         clearThoughtSignatureCache();
-        const before = await egress.writeUpstreamRequest(request);
+        const before = await outbox.writeOutboxRequest(request);
         if (before.ok) continue;
-        const repaired = repairForAdmission(request, egress.profile, MAXIMAL_POLICY);
+        const repaired = repairForAdmission(request, outbox.profile, MAXIMAL_POLICY);
         if (!repaired.admission.admitted) continue;
         clearThoughtSignatureCache();
-        const after = await egress.writeUpstreamRequest(repaired.request);
+        const after = await outbox.writeOutboxRequest(repaired.request);
         if (after.ok) improved += 1;
       }
     }
-    console.log(`repairs turned ${improved} rejected (request, egress) pairs into compilable ones`);
+    console.log(`repairs turned ${improved} rejected (request, outbox) pairs into compilable ones`);
     expect(improved).toBeGreaterThan(0);
   }, 180_000);
 
@@ -452,19 +452,19 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
    */
   it.skipIf(corpus.length === 0)("raiseMaxOutputTokens 真的救得回 unsatisfiableValue", async () => {
     const gemini = EGRESSES.gemini_cloudcode;
-    if (gemini === undefined) throw new Error("gemini egress missing");
+    if (gemini === undefined) throw new Error("gemini outbox missing");
     let rejectedByCombination = 0;
     let rescued = 0;
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       clearThoughtSignatureCache();
-      const before = await gemini.writeUpstreamRequest(request);
+      const before = await gemini.writeOutboxRequest(request);
       if (before.ok || !before.problems.some((problem) => problem.kind === "unsatisfiableValue")) continue;
       rejectedByCombination += 1;
 
       const repaired = repairForAdmission(request, gemini.profile, { raiseMaxOutputTokens: {} });
       clearThoughtSignatureCache();
-      if ((await gemini.writeUpstreamRequest(repaired.request)).ok) rescued += 1;
+      if ((await gemini.writeOutboxRequest(repaired.request)).ok) rescued += 1;
     }
     console.log(`raiseMaxOutputTokens rescued ${rescued} of ${rejectedByCombination} unsatisfiableValue rejections`);
     expect(rejectedByCombination).toBeGreaterThan(0);
@@ -502,10 +502,10 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
  *   语料实测 18/807 条真实 gemini 请求因此从「能用」变成 422。
  *
  * 根因是契约缺了一个维度：闸门只能问 supports（认识），问不出 mandatory（要求）。
- * 补上 `IREgressProfile.mandatory` 之后闸门改问后者，下面两条就是它的守卫。
+ * 补上 `IROutboxProfile.mandatory` 之后闸门改问后者，下面两条就是它的守卫。
  */
 describe("单调性：开一条修复不许把本来能编译的请求弄成不能", () => {
-  const geminiEgress = createGeminiCloudCodeUpstream({
+  const geminiOutbox = createGeminiCloudCodeOutbox({
     model: "gemini-test", accessToken: "t", project: "p", requestIdFactory: () => "r",
   });
 
@@ -525,31 +525,31 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
 
     clearThoughtSignatureCache();
-    const before = await geminiEgress.writeUpstreamRequest(request);
+    const before = await geminiOutbox.writeOutboxRequest(request);
     expect(before.ok).toBe(true);
 
-    const repaired = repairForAdmission(request, geminiEgress.profile, { defaultMaxOutputTokens: {} });
+    const repaired = repairForAdmission(request, geminiOutbox.profile, { defaultMaxOutputTokens: {} });
     // 闸门问的是 mandatory：CloudCode 不要求这个字段 → 一个字段都不动，请求原样通过。
-    expect(geminiEgress.profile.mandatory.maxOutputTokens).toBe(false);
+    expect(geminiOutbox.profile.mandatory.maxOutputTokens).toBe(false);
     expect(repaired.applied).toEqual([]);
     expect(repaired.request).toBe(request);
     clearThoughtSignatureCache();
-    const after = await geminiEgress.writeUpstreamRequest(repaired.request);
+    const after = await geminiOutbox.writeOutboxRequest(repaired.request);
     expect(after.ok).toBe(true);
   });
 
   it("对照：强制要求 max_tokens 的目标照填不误 —— 闸门收窄不等于把这条修复废掉", async () => {
     const request = highEffortWithoutCeiling();
-    const anthropicEgress = createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
-    expect(anthropicEgress.profile.mandatory.maxOutputTokens).toBe(true);
+    const anthropicOutbox = createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+    expect(anthropicOutbox.profile.mandatory.maxOutputTokens).toBe(true);
 
-    const before = await anthropicEgress.writeUpstreamRequest(request);
+    const before = await anthropicOutbox.writeOutboxRequest(request);
     expect(before.ok).toBe(false);
     if (!before.ok) expect(before.problems.map((p) => p.kind)).toContain("requiredFieldMissing");
 
-    const repaired = repairForAdmission(request, anthropicEgress.profile, { defaultMaxOutputTokens: {} });
+    const repaired = repairForAdmission(request, anthropicOutbox.profile, { defaultMaxOutputTokens: {} });
     expect(repaired.applied.map((record) => record.kind)).toEqual(["defaultMaxOutputTokens"]);
-    const after = await anthropicEgress.writeUpstreamRequest(repaired.request);
+    const after = await anthropicOutbox.writeOutboxRequest(repaired.request);
     expect(after.ok).toBe(true);
   });
 
@@ -557,24 +557,24 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     const regressed: string[] = [];
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, egress] of Object.entries(EGRESSES)) {
+      for (const [name, outbox] of Object.entries(EGRESSES)) {
         // 基线必须与修复后**同口径**：准入通过 **且** 构造成功才算「本来能用」。
-        if (!checkUpstreamSupport(request, egress.profile).admitted) continue;
+        if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
         clearThoughtSignatureCache();
-        const before = await egress.writeUpstreamRequest(request);
+        const before = await outbox.writeOutboxRequest(request);
         if (!before.ok) continue;
 
-        const repaired = repairForAdmission(request, egress.profile, MAXIMAL_POLICY);
+        const repaired = repairForAdmission(request, outbox.profile, MAXIMAL_POLICY);
         if (!repaired.admission.admitted) {
           regressed.push(`${name}/${entry.traceId}:admission:${repaired.admission.unsupported.map((need) => need.capability).join(",")}`);
           continue;
         }
         clearThoughtSignatureCache();
-        const after = await egress.writeUpstreamRequest(repaired.request);
+        const after = await outbox.writeOutboxRequest(repaired.request);
         if (!after.ok) regressed.push(`${name}/${entry.traceId}:${after.problems.map((p) => p.kind).join(",")}`);
       }
     }
-    console.log(`repairs regressed ${regressed.length} (request, egress) pairs; first few:`, regressed.slice(0, 3));
+    console.log(`repairs regressed ${regressed.length} (request, outbox) pairs; first few:`, regressed.slice(0, 3));
     expect(regressed.length).toBe(0);
   }, 180_000);
 
@@ -587,15 +587,15 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
    * 也是唯一一份写在规格表里的值。
    */
   it.skipIf(corpus.length === 0)("逐条：任意一条默认修复单独打开，都不许让 ok:true 变成 ok:false", async () => {
-    interface Baseline { readonly name: string; readonly egress: IREgress<IRWireBody>; readonly request: IRRequest; }
+    interface Baseline { readonly name: string; readonly outbox: IROutbox<IRWireBody>; readonly request: IRRequest; }
     const compilable: Baseline[] = [];
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const [name, egress] of Object.entries(EGRESSES)) {
-        if (!checkUpstreamSupport(request, egress.profile).admitted) continue;
+      for (const [name, outbox] of Object.entries(EGRESSES)) {
+        if (!checkOutboxSupport(request, outbox.profile).admitted) continue;
         clearThoughtSignatureCache();
-        const before = await egress.writeUpstreamRequest(request);
-        if (before.ok) compilable.push({ name, egress, request });
+        const before = await outbox.writeOutboxRequest(request);
+        if (before.ok) compilable.push({ name, outbox, request });
       }
     }
     expect(compilable.length).toBeGreaterThan(0);
@@ -604,13 +604,13 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
     for (const kind of IR_REPAIR_KINDS) {
       const policy = { [kind]: {} } as IRRepairPolicy;
       let broken = 0;
-      for (const { name, egress, request } of compilable) {
-        const repaired = repairForAdmission(request, egress.profile, policy);
+      for (const { name, outbox, request } of compilable) {
+        const repaired = repairForAdmission(request, outbox.profile, policy);
         // 没动过就一定不会回退，省掉一次构造。
         if (repaired.request === request) continue;
         if (!repaired.admission.admitted) { broken += 1; continue; }
         clearThoughtSignatureCache();
-        const after = await egress.writeUpstreamRequest(repaired.request);
+        const after = await outbox.writeOutboxRequest(repaired.request);
         if (!after.ok) {
           broken += 1;
           if (regressions.length < 5) {
@@ -620,7 +620,7 @@ describe("单调性：开一条修复不许把本来能编译的请求弄成不�
       }
       if (broken > 0) regressions.push(`${kind} broke ${broken} of ${compilable.length} compilable pairs`);
     }
-    console.log(`per-repair monotonicity over ${compilable.length} compilable (request, egress) pairs:`,
+    console.log(`per-repair monotonicity over ${compilable.length} compilable (request, outbox) pairs:`,
       regressions.length === 0 ? "clean" : regressions);
     expect(regressions).toEqual([]);
   }, 300_000);

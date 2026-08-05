@@ -12,11 +12,11 @@
  * IR 一律由入口 decode 真实请求体得到，不手搓 —— 手搓的 IR 只能验证我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createCopilotUpstream } from "../src/egress/copilot.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createCopilotOutbox } from "../src/egress/copilot.ts";
 import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/ingress/index.ts";
 import type {
-  IRBuildProblem, IRCapability, IREvent, IRRequest, IRUpstreamError, UpstreamRequestBuildResult,
+  IRBuildProblem, IRCapability, IREvent, IRRequest, IROutboxError, OutboxRequestBuildResult,
 } from "../src/ir/types.ts";
 
 const TRACE = "tr-copilot";
@@ -24,24 +24,24 @@ const TRACE = "tr-copilot";
 /** 生产形态：base URL 是每个凭据自己的（`/copilot_internal/user` 的 endpoints.api）。 */
 const API_BASE = "https://api.enterprise.githubcopilot.com";
 
-const egress = createCopilotUpstream({
+const outbox = createCopilotOutbox({
   model: "claude-opus-5-copilot",
   apiBase: `${API_BASE}/`,
   sessionToken: "tid=deadbeef;exp=1;sku=max",
   githubToken: "gho_test",
 });
 
-function ok(result: UpstreamRequestBuildResult): { url: string; headers: Record<string, string>; body: string } {
+function ok(result: OutboxRequestBuildResult): { url: string; headers: Record<string, string>; body: string } {
   if (!result.ok) throw new Error(`expected ok:true, got problems: ${JSON.stringify(result.problems)}`);
   return { url: result.wire.url, headers: { ...result.wire.headers }, body: result.wire.body };
 }
 
-function rejected(result: UpstreamRequestBuildResult): readonly IRBuildProblem[] {
+function rejected(result: OutboxRequestBuildResult): readonly IRBuildProblem[] {
   if (result.ok) throw new Error(`expected ok:false, got body: ${result.wire.body}`);
   return result.problems;
 }
 
-function bodyOf(result: UpstreamRequestBuildResult): Record<string, unknown> {
+function bodyOf(result: OutboxRequestBuildResult): Record<string, unknown> {
   return JSON.parse(ok(result).body) as Record<string, unknown>;
 }
 
@@ -83,7 +83,7 @@ function fullRequest(): IRRequest {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("wire：端点与身份头", () => {
   it("url 与全部身份头逐字段固定 —— 缺 integration-id 鉴权失败、缺 api-version 会 404", async () => {
-    const wire = ok(await egress.writeUpstreamRequest(fullRequest()));
+    const wire = ok(await outbox.writeOutboxRequest(fullRequest()));
 
     // base URL 末尾的斜杠由出口规整，不靠调用方约定。
     expect(wire.url).toBe("https://api.enterprise.githubcopilot.com/v1/messages");
@@ -106,7 +106,7 @@ describe("wire：端点与身份头", () => {
   });
 
   it("身份头不可能缺：它是构造出来的，客户端头压不过它，anthropic-beta 会被剥掉", async () => {
-    const withForwarded = createCopilotUpstream({
+    const withForwarded = createCopilotOutbox({
       model: "m", apiBase: API_BASE, sessionToken: "s", githubToken: "g",
       extraHeaders: {
         // 三类都试：想顶掉身份头的、想塞回鉴权的、上游必拒的 beta。
@@ -119,7 +119,7 @@ describe("wire：端点与身份头", () => {
         "x-trace": "keep-me",
       },
     });
-    const wire = ok(await withForwarded.writeUpstreamRequest(fullRequest()));
+    const wire = ok(await withForwarded.writeOutboxRequest(fullRequest()));
 
     expect(wire.headers["copilot-integration-id"]).toBe("copilot-developer-cli");
     expect(wire.headers["user-agent"]).toBe("copilot/1.0.73 (linux v24.16.0) term/unknown");
@@ -134,7 +134,7 @@ describe("wire：端点与身份头", () => {
 
   it("凭据每条请求现取 —— session token 会过期，回调返回什么就发什么", async () => {
     const issued: string[] = [];
-    const rotating = createCopilotUpstream({
+    const rotating = createCopilotOutbox({
       model: "m",
       apiBase: () => Promise.resolve(API_BASE),
       sessionToken: () => {
@@ -144,8 +144,8 @@ describe("wire：端点与身份头", () => {
       },
       githubToken: () => "gho_rotating",
     });
-    const first = ok(await rotating.writeUpstreamRequest(fullRequest()));
-    const second = ok(await rotating.writeUpstreamRequest(fullRequest()));
+    const first = ok(await rotating.writeOutboxRequest(fullRequest()));
+    const second = ok(await rotating.writeOutboxRequest(fullRequest()));
 
     expect(first.headers["copilot-session-token"]).toBe("session-1");
     expect(second.headers["copilot-session-token"]).toBe("session-2");
@@ -155,24 +155,24 @@ describe("wire：端点与身份头", () => {
 
   it("凭据取不到是抛，不是「成功但打不通」的 wire", async () => {
     for (const field of ["apiBase", "sessionToken", "githubToken"] as const) {
-      const broken = createCopilotUpstream({
+      const broken = createCopilotOutbox({
         model: "m", apiBase: API_BASE, sessionToken: "s", githubToken: "g",
         [field]: () => "   ",
       });
-      await expect(broken.writeUpstreamRequest(fullRequest())).rejects.toThrow(`options.${field}`);
+      await expect(broken.writeOutboxRequest(fullRequest())).rejects.toThrow(`options.${field}`);
     }
   });
 
   it("编不出 wire 的请求不去刷 token —— 拒绝先于凭据解析", async () => {
     let resolved = 0;
-    const counting = createCopilotUpstream({
+    const counting = createCopilotOutbox({
       model: "m", apiBase: API_BASE, githubToken: "g",
       sessionToken: () => { resolved += 1; return "s"; },
     });
     const { request } = readChatCompletionsRequest({
       model: "gpt-5-mini", messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    expect(rejected(await counting.writeUpstreamRequest(request))).toHaveLength(1);
+    expect(rejected(await counting.writeOutboxRequest(request))).toHaveLength(1);
     expect(resolved).toBe(0);
   });
 });
@@ -180,17 +180,17 @@ describe("wire：端点与身份头", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("投影只有一份", () => {
   it("除 model 外与原生 Anthropic 逐字节相同 —— 谁复制一份投影，这条当场红", async () => {
-    const native = createAnthropicUpstream({
+    const native = createAnthropicOutbox({
       baseUrl: "https://api.anthropic.com", apiKey: "sk-ant-test", model: "claude-opus-5-copilot",
     });
     const request = fullRequest();
-    const copilotBody = ok(await egress.writeUpstreamRequest(request)).body;
-    const nativeBody = ok(await native.writeUpstreamRequest(request)).body;
+    const copilotBody = ok(await outbox.writeOutboxRequest(request)).body;
+    const nativeBody = ok(await native.writeOutboxRequest(request)).body;
     expect(copilotBody).toBe(nativeBody);
   });
 
   it("body 逐字段：位置不变量、工具、思考、缓存断点都由共享投影产出", async () => {
-    const body = bodyOf(await egress.writeUpstreamRequest(fullRequest()));
+    const body = bodyOf(await outbox.writeOutboxRequest(fullRequest()));
 
     expect(body.model).toBe("claude-opus-5-copilot");
     expect(body.max_tokens).toBe(1024);
@@ -218,18 +218,18 @@ describe("投影只有一份", () => {
 
   it("确定性：同一个 IR 连续构造两次，wire 字节完全相同", async () => {
     const request = fullRequest();
-    const first = ok(await egress.writeUpstreamRequest(request));
-    const second = ok(await egress.writeUpstreamRequest(request));
+    const first = ok(await outbox.writeOutboxRequest(request));
+    const second = ok(await outbox.writeOutboxRequest(request));
     expect(second.body).toBe(first.body);
     expect(second).toEqual(first);
     // 两个独立 decode 出来的等价 IR 也必须编译成同一份字节。
-    expect(ok(await egress.writeUpstreamRequest(fullRequest())).body).toBe(first.body);
+    expect(ok(await outbox.writeOutboxRequest(fullRequest())).body).toBe(first.body);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
 describe("拒绝条件与原生 Anthropic 一致", () => {
-  const native = createAnthropicUpstream({
+  const native = createAnthropicOutbox({
     baseUrl: "https://api.anthropic.com", apiKey: "k", model: "claude-opus-5-copilot",
   });
 
@@ -272,15 +272,15 @@ describe("拒绝条件与原生 Anthropic 一致", () => {
   for (const testCase of cases) {
     it(`${testCase.why}：与 anthropic 出口给出同一组 kind@path`, async () => {
       const request = testCase.build();
-      const mine = rejected(await egress.writeUpstreamRequest(request));
-      const theirs = rejected(await native.writeUpstreamRequest(request));
+      const mine = rejected(await outbox.writeOutboxRequest(request));
+      const theirs = rejected(await native.writeOutboxRequest(request));
       expect(mine.map((problem) => `${problem.kind}@${problem.path}`))
         .toEqual(theirs.map((problem) => `${problem.kind}@${problem.path}`));
       expect(mine.length).toBeGreaterThan(0);
     });
   }
 
-  it("拒绝时已攒下的 loss 一并交出，且 provider 记的是 copilot", async () => {
+  it("拒绝时已攒下的 loss 一并交出，且 outbox 记的是 copilot", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m",
       messages: [
@@ -288,11 +288,11 @@ describe("拒绝条件与原生 Anthropic 一致", () => {
         { role: "assistant", content: [{ type: "thinking", thinking: "unsigned" }] },
       ],
     }, TRACE);
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     expect(result.ok).toBe(false);
     expect(result.losses.map((loss) => loss.kind)).toEqual(["dropped"]);
-    expect(result.losses[0]?.provider).toBe("copilot");
-    expect(result.losses[0]?.stage).toBe("egress");
+    expect(result.losses[0]?.outbox).toBe("copilot");
+    expect(result.losses[0]?.stage).toBe("outbox");
   });
 });
 
@@ -310,14 +310,14 @@ describe("方言复核：两条有实证的差别", () => {
     const request = withContextManagement();
     expect(request.intent.contextEdits).toHaveLength(1);
 
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     const body = bodyOf(result);
     expect("context_management" in body).toBe(false);
     // 删了必须看得见：147/606 条真实流量带它，静默删掉就没人知道上游少了这道裁剪。
     if (!result.ok) throw new Error("expected ok");
     expect(result.losses).toEqual([{
-      stage: "egress",
-      provider: "copilot",
+      stage: "outbox",
+      outbox: "copilot",
       path: "$.intent.contextEdits",
       kind: "dropped",
       detail: expect.stringContaining("context_management"),
@@ -325,8 +325,8 @@ describe("方言复核：两条有实证的差别", () => {
   });
 
   it("同一条请求走原生 Anthropic 时 context_management 照发 —— 差别是 Copilot 的，不是投影的", async () => {
-    const native = createAnthropicUpstream({ baseUrl: API_BASE, apiKey: "k", model: "m" });
-    const body = bodyOf(await native.writeUpstreamRequest(withContextManagement()));
+    const native = createAnthropicOutbox({ baseUrl: API_BASE, apiKey: "k", model: "m" });
+    const body = bodyOf(await native.writeOutboxRequest(withContextManagement()));
     expect(body.context_management).toEqual({ edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
   });
 
@@ -339,11 +339,34 @@ describe("方言复核：两条有实证的差别", () => {
       ],
       messages: [{ role: "user", content: "go" }],
     }, TRACE);
-    const problems = rejected(await egress.writeUpstreamRequest(request));
+    const problems = rejected(await outbox.writeOutboxRequest(request));
     expect(problems).toHaveLength(1);
     expect(problems[0]?.kind).toBe("unrepresentablePart");
     expect(problems[0]?.path).toBe("$.conversation.toolset.tools[1]");
     expect(problems[0]?.detail).toContain("computer_20251124");
+  });
+
+  it("同一条请求走原生 Anthropic 时 computer_* 照发 —— 拒绝是 Copilot 上游的，不是共享投影的", async () => {
+    // `context_management` 那条差别已有对照，`computer_*` 这条一直只验了 Copilot 侧。
+    // 少了这半边，「computer_* 不可表达」就可能被误当成 Anthropic 系 wire 的通用结论，
+    // 顺手上提进共享投影 —— 那会让原生出口凭空丢掉一个上游本来收得下的工具。
+    const native = createAnthropicOutbox({ baseUrl: API_BASE, apiKey: "k", model: "m" });
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8,
+      tools: [
+        { name: "Read", description: "read", input_schema: { type: "object" } },
+        { type: "computer_20251124", name: "computer", display_width_px: 1280, display_height_px: 800 },
+      ],
+      messages: [{ role: "user", content: "go" }],
+    }, TRACE);
+
+    const built = await native.writeOutboxRequest(request);
+    if (!built.ok) throw new Error(`expected a compiled request: ${JSON.stringify(built.problems)}`);
+    expect((JSON.parse(built.wire.body) as Record<string, unknown>).tools).toEqual([
+      { name: "Read", description: "read", input_schema: { type: "object" } },
+      { type: "computer_20251124", name: "computer", display_width_px: 1280, display_height_px: 800 },
+    ]);
+    expect(built.losses).toEqual([]);
   });
 
   it("上游白名单里的内建工具照常编译 —— 拒的是 computer_*，不是内建工具本身", async () => {
@@ -355,7 +378,7 @@ describe("方言复核：两条有实证的差别", () => {
       ],
       messages: [{ role: "user", content: "go" }],
     }, TRACE);
-    const body = bodyOf(await egress.writeUpstreamRequest(request));
+    const body = bodyOf(await outbox.writeOutboxRequest(request));
     expect(body.tools).toEqual([
       { type: "web_search_20250305", name: "web_search" },
       { type: "bash_20250124", name: "bash" },
@@ -377,41 +400,40 @@ describe("会话身份与服务档位：共享投影的两条结论在这里也�
       messages: [{ role: "user", content: "hi" }],
     }, TRACE).request;
 
-    const body = bodyOf(await egress.writeUpstreamRequest(withIdentity));
+    const body = bodyOf(await outbox.writeOutboxRequest(withIdentity));
     expect(body.metadata).toEqual({
       user_id: JSON.stringify({ device_id: "d1", account_uuid: "a1", session_id: "s1" }),
     });
 
-    const native = createAnthropicUpstream({
+    const native = createAnthropicOutbox({
       baseUrl: API_BASE, apiKey: "k", model: "claude-opus-5-copilot",
     });
-    expect(ok(await egress.writeUpstreamRequest(withIdentity)).body)
-      .toBe(ok(await native.writeUpstreamRequest(withIdentity)).body);
+    expect(ok(await outbox.writeOutboxRequest(withIdentity)).body)
+      .toBe(ok(await native.writeOutboxRequest(withIdentity)).body);
   });
 
-  it("service_tier 一个字段都不写，priority 意图记一条 loss（provider 是 copilot）", async () => {
+  it("service_tier 一个字段都不写，priority 意图记一条 loss（outbox 是 copilot）", async () => {
     const priority = readAnthropicMessagesRequest({
       model: "claude-opus-4-8", max_tokens: 64, service_tier: "priority",
       messages: [{ role: "user", content: "hi" }],
     }, TRACE).request;
 
-    const built = await egress.writeUpstreamRequest(priority);
+    const built = await outbox.writeOutboxRequest(priority);
     expect(Object.hasOwn(bodyOf(built), "service_tier")).toBe(false);
     expect(built.losses).toContainEqual(expect.objectContaining({
-      provider: "copilot", path: "$.intent.serviceTier", kind: "dropped",
+      outbox: "copilot", path: "$.intent.serviceTier", kind: "dropped",
     }));
   });
 
   it("必填字段：Copilot 与原生同一条 wire，max_tokens 同样是强制的", () => {
-    expect(egress.profile.mandatory.maxOutputTokens).toBe(true);
+    expect(outbox.profile.mandatory.maxOutputTokens).toBe(true);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
 describe("能力声明", () => {
   it("supports 与 lossy 不相交，且合起来不多不少覆盖每一个 IRCapability", () => {
-    const { supports, lossy } = egress.profile;
-    expect(egress.profile.provider).toBe("copilot");
+    const { supports, lossy } = outbox.profile;
     for (const capability of supports) expect(lossy.has(capability)).toBe(false);
     // 一个能力落在两个集合之外 = 准入直接判这家不可用。Copilot 是 Anthropic wire，
     // 没有任何一个能力该落到那里 —— 真正拒的是具体的 computer_* 工具，在写出层。
@@ -419,8 +441,8 @@ describe("能力声明", () => {
   });
 
   it("与原生 Anthropic 的差异清单固定在这里 —— 每一条都有 Copilot 侧的独立实证", () => {
-    const native = createAnthropicUpstream({ baseUrl: API_BASE, apiKey: "k", model: "m" }).profile;
-    const mine = egress.profile;
+    const native = createAnthropicOutbox({ baseUrl: API_BASE, apiKey: "k", model: "m" }).profile;
+    const mine = outbox.profile;
 
     // 原生 supports 而 Copilot 不 supports 的：全部有 Copilot 侧的实证或零观测。
     const downgraded = [...native.supports].filter((capability) => !mine.supports.has(capability)).sort();
@@ -444,7 +466,7 @@ describe("能力声明", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe("readUpstreamResponse：与 Anthropic 同一条 wire", () => {
+describe("readOutboxResponse：与 Anthropic 同一条 wire", () => {
   function sse(...frames: readonly string[]): Response {
     return new Response(frames.map((frame) => `data: ${frame}\n\n`).join(""), {
       status: 200, headers: { "content-type": "text/event-stream" },
@@ -453,11 +475,11 @@ describe("readUpstreamResponse：与 Anthropic 同一条 wire", () => {
 
   async function collect(response: Response): Promise<IREvent[]> {
     const events: IREvent[] = [];
-    for await (const event of egress.readUpstreamResponse(response)) events.push(event);
+    for await (const event of outbox.readOutboxResponse(response)) events.push(event);
     return events;
   }
 
-  async function errorOf(response: Response): Promise<IRUpstreamError> {
+  async function errorOf(response: Response): Promise<IROutboxError> {
     const events = await collect(response);
     const failure = events.find((event) => event.kind === "error");
     if (failure === undefined) throw new Error(`expected an error event, got ${JSON.stringify(events)}`);
@@ -512,14 +534,14 @@ describe("readUpstreamResponse：与 Anthropic 同一条 wire", () => {
   it("上游 4xx/5xx 分类：判别位取 error.type，httpStatus 原样留给调用方", async () => {
     const cases: ReadonlyArray<{
       readonly status: number; readonly type: string;
-      readonly kind: IRUpstreamError["kind"]; readonly retryable: boolean;
+      readonly kind: IROutboxError["kind"]; readonly retryable: boolean;
     }> = [
       { status: 400, type: "invalid_request_error", kind: "invalidRequest", retryable: false },
       // Copilot 的 session token 过期 / 套餐无权 → 调用方该换号而不是重试同一个。
       { status: 401, type: "authentication_error", kind: "permissionDenied", retryable: false },
       { status: 403, type: "permission_error", kind: "permissionDenied", retryable: false },
       { status: 429, type: "rate_limit_error", kind: "rateLimited", retryable: true },
-      { status: 503, type: "overloaded_error", kind: "upstreamUnavailable", retryable: true },
+      { status: 503, type: "overloaded_error", kind: "outboxUnavailable", retryable: true },
     ];
     for (const testCase of cases) {
       const error = await errorOf(new Response(
@@ -536,11 +558,11 @@ describe("readUpstreamResponse：与 Anthropic 同一条 wire", () => {
     const error = await errorOf(new Response("<html>502 Bad Gateway</html>", { status: 502 }));
     expect(error.httpStatus).toBe(502);
     expect(error.raw).toBe("<html>502 Bad Gateway</html>");
-    // 正文里没有判别位时**状态码就是判据**：5xx 一律 upstreamUnavailable + 可重试。
+    // 正文里没有判别位时**状态码就是判据**：5xx 一律 outboxUnavailable + 可重试。
     // 这条曾经断言 unknown/不可重试，那是 DEFECT-7 修好之前的旧行为 —— nginx/Cloudflare
     // 插进来的 502 是瞬时故障，判成 unknown 会让本该退避重试的请求直接失败
     // （同一条断言在 egress_error_classification.test.ts 的 DEFECT-7e 里对五个出口都成立）。
-    expect(error.kind).toBe("upstreamUnavailable");
+    expect(error.kind).toBe("outboxUnavailable");
     expect(error.retryable).toBe(true);
   });
 

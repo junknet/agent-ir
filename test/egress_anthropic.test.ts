@@ -8,33 +8,35 @@
  * IR 一律由入口 decode 真实请求体得到，不手搓 —— 手搓的 IR 只能验证我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
 import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/ingress/index.ts";
-import type { IRBuildProblem, IRRequest, UpstreamRequestBuildResult } from "../src/ir/types.ts";
+import type { IRBuildProblem, IRRequest, OutboxRequestBuildResult } from "../src/ir/types.ts";
 
 const TRACE = "tr-anthropic";
 
-const egress = createAnthropicUpstream({
+const outbox = createAnthropicOutbox({
   baseUrl: "https://api.anthropic.com/",
   apiKey: "sk-ant-test",
   model: "claude-opus-5-upstream",
 });
 
-function ok(result: UpstreamRequestBuildResult): { url: string; headers: Record<string, string>; body: string } {
+function ok(result: OutboxRequestBuildResult): { url: string; headers: Record<string, string>; body: string } {
   if (!result.ok) throw new Error(`expected ok:true, got problems: ${JSON.stringify(result.problems)}`);
   return { url: result.wire.url, headers: { ...result.wire.headers }, body: result.wire.body };
 }
 
-function rejected(result: UpstreamRequestBuildResult): readonly IRBuildProblem[] {
+function rejected(result: OutboxRequestBuildResult): readonly IRBuildProblem[] {
   if (result.ok) throw new Error(`expected ok:false, got body: ${result.wire.body}`);
   return result.problems;
 }
 
-function bodyOf(result: UpstreamRequestBuildResult): Record<string, unknown> {
+function bodyOf(result: OutboxRequestBuildResult): Record<string, unknown> {
   return JSON.parse(ok(result).body) as Record<string, unknown>;
 }
 
-function messagesOf(result: UpstreamRequestBuildResult): Array<Record<string, unknown>> {
+function messagesOf(result: OutboxRequestBuildResult): Array<Record<string, unknown>> {
   return bodyOf(result).messages as Array<Record<string, unknown>>;
 }
 
@@ -81,7 +83,7 @@ function fullRequest(): IRRequest {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lower：编译成功的形状", () => {
   it("wire 逐字段：url / headers / body 全部由 IR 与 options 确定，没有第三方来源", async () => {
-    const wire = ok(await egress.writeUpstreamRequest(fullRequest()));
+    const wire = ok(await outbox.writeOutboxRequest(fullRequest()));
 
     expect(wire.url).toBe("https://api.anthropic.com/v1/messages");
     expect(wire.headers).toEqual({
@@ -110,7 +112,7 @@ describe("lower：编译成功的形状", () => {
   });
 
   it("工具结果按调用顺序重铺到紧随的 user 回合最前 —— [text, tool_result] 顺序上游必拒", async () => {
-    const messages = messagesOf(await egress.writeUpstreamRequest(fullRequest()));
+    const messages = messagesOf(await outbox.writeOutboxRequest(fullRequest()));
 
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
     const last = contentOf(messages[2]);
@@ -129,7 +131,7 @@ describe("lower：编译成功的形状", () => {
         { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: [] }] },
       ],
     }, TRACE);
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     expect(contentOf(messagesOf(result)[1])[0]).toEqual({ type: "tool_result", tool_use_id: "toolu_1", content: "" });
   });
 
@@ -137,27 +139,31 @@ describe("lower：编译成功的形状", () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [
-        { role: "user", content: [{ type: "text", text: "" }, { type: "text", text: "real" }] },
+        { role: "user", content: [{ type: "text", text: "", cache_control: { type: "ephemeral" } }, { type: "text", text: "real" }] },
         { role: "assistant", content: [{ type: "thinking", thinking: "no signature here" }, { type: "text", text: "answer" }] },
       ],
     }, TRACE);
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     expect(contentOf(messagesOf(result)[0])).toEqual([{ type: "text", text: "real" }]);
     expect(contentOf(messagesOf(result)[1])).toEqual([{ type: "text", text: "answer" }]);
     if (result.ok) {
-      expect(result.losses.map((loss) => loss.kind)).toEqual(["dropped"]);
-      expect(result.losses[0]?.path).toBe("$.conversation.turns[1].parts[0]");
+      expect(result.losses.map((loss) => loss.kind)).toEqual(["dropped", "dropped"]);
+      expect(result.losses.map((loss) => loss.path)).toEqual([
+        "$.conversation.turns[0].parts[0]",
+        "$.conversation.turns[1].parts[0]",
+      ]);
+      expect(result.losses[0]?.detail).toContain("cache breakpoint");
     }
   });
 
   it("确定性：同一个 IR 连续构造两次，wire 字节完全相同", async () => {
     const request = fullRequest();
-    const first = ok(await egress.writeUpstreamRequest(request));
-    const second = ok(await egress.writeUpstreamRequest(request));
+    const first = ok(await outbox.writeOutboxRequest(request));
+    const second = ok(await outbox.writeOutboxRequest(request));
     expect(second.body).toBe(first.body);
     expect(second).toEqual(first);
     // 两个独立 decode 出来的等价 IR 也必须编译成同一份字节，构造过程不许夹带任何外部状态。
-    const third = ok(await egress.writeUpstreamRequest(fullRequest()));
+    const third = ok(await outbox.writeOutboxRequest(fullRequest()));
     expect(third.body).toBe(first.body);
   });
 });
@@ -171,7 +177,7 @@ describe("lower：拒绝而不是发明内容", () => {
     }, TRACE);
     expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
 
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     const problems = rejected(result);
     expect(problems).toHaveLength(1);
     expect(problems[0]?.kind).toBe("requiredFieldMissing");
@@ -189,7 +195,7 @@ describe("lower：拒绝而不是发明内容", () => {
         { role: "assistant", content: [{ type: "tool_use", id: "toolu_missing", name: "Bash", input: {} }] },
       ],
     }, TRACE);
-    const problems = rejected(await egress.writeUpstreamRequest(request));
+    const problems = rejected(await outbox.writeOutboxRequest(request));
     expect(problems).toHaveLength(1);
     expect(problems[0]?.kind).toBe("danglingToolCall");
     expect(problems[0]?.path).toBe("$.conversation.turns[1].parts[0]");
@@ -206,7 +212,7 @@ describe("lower：拒绝而不是发明内容", () => {
         ] },
       ],
     }, TRACE);
-    const problems = rejected(await egress.writeUpstreamRequest(request));
+    const problems = rejected(await outbox.writeOutboxRequest(request));
     expect(problems).toHaveLength(1);
     expect(problems[0]?.kind).toBe("orphanToolResult");
     expect(problems[0]?.path).toBe("$.conversation.turns[0].parts[1]");
@@ -226,7 +232,7 @@ describe("lower：拒绝而不是发明内容", () => {
         { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ghost", content: "x" }] },
       ],
     }, TRACE);
-    const problems = rejected(await egress.writeUpstreamRequest(request));
+    const problems = rejected(await outbox.writeOutboxRequest(request));
 
     expect(problems).toHaveLength(4);
     expect(problems.map((problem) => `${problem.kind}@${problem.path}`)).toEqual([
@@ -245,15 +251,15 @@ describe("lower：拒绝而不是发明内容", () => {
         { role: "assistant", content: [{ type: "thinking", thinking: "unsigned" }] },
       ],
     }, TRACE);
-    const result = await egress.writeUpstreamRequest(request);
+    const result = await outbox.writeOutboxRequest(request);
     expect(result.ok).toBe(false);
     expect(result.losses.map((loss) => loss.kind)).toEqual(["dropped"]);
-    expect(result.losses[0]?.stage).toBe("egress");
-    expect(result.losses[0]?.provider).toBe("anthropic");
+    expect(result.losses[0]?.stage).toBe("outbox");
+    expect(result.losses[0]?.outbox).toBe("anthropic");
   });
 
   it("配齐结果之后同一形态的历史就能编译 —— 拒绝的是缺口，不是工具会话本身", async () => {
-    const result = await egress.writeUpstreamRequest(fullRequest());
+    const result = await outbox.writeOutboxRequest(fullRequest());
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.losses).toEqual([]);
   });
@@ -261,14 +267,14 @@ describe("lower：拒绝而不是发明内容", () => {
 
 describe("全空会话", () => {
   it("编不出任何内容时拒绝，而不是静默产出 messages: [] 让上游 400", async () => {
-    // 剥离 dropEmptyTurns 之后空回合会活到 egress，这条路径因此变常见。
+    // 剥离 dropEmptyTurns 之后空回合会活到 outbox，这条路径因此变常见。
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 8,
       messages: [{ role: "user", content: "" }, { role: "assistant", content: [] }],
     }, "tr-empty");
-    const built = await createAnthropicUpstream({
+    const built = await createAnthropicOutbox({
       baseUrl: "https://example.invalid", apiKey: "k", model: "claude-opus-5",
-    }).writeUpstreamRequest(request);
+    }).writeOutboxRequest(request);
 
     expect(built.ok).toBe(false);
     if (built.ok) return;
@@ -293,7 +299,7 @@ describe("会话身份：wire 有承载位就发", () => {
     }),
   };
 
-  it("metadata.user_id 原样往返 —— ingress 解出来的三段身份，egress 逐字装回去", async () => {
+  it("metadata.user_id 原样往返 —— ingress 解出来的三段身份，outbox 逐字装回去", async () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16, metadata: CLIENT_METADATA,
       messages: [{ role: "user", content: "hi" }],
@@ -304,7 +310,7 @@ describe("会话身份：wire 有承载位就发", () => {
       sessionId: "c508c824-8120-43b6-bec1-a569bf91d5d6",
     });
 
-    const body = bodyOf(await egress.writeUpstreamRequest(request));
+    const body = bodyOf(await outbox.writeOutboxRequest(request));
     const metadata = body.metadata as { user_id: string };
     expect(JSON.parse(metadata.user_id)).toEqual({
       device_id: "5378180456032bae90ae4ca4c77928756c9f3285caa54abbf81064f108a09818",
@@ -322,14 +328,14 @@ describe("会话身份：wire 有承载位就发", () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    expect(Object.hasOwn(bodyOf(await egress.writeUpstreamRequest(request)), "metadata")).toBe(false);
+    expect(Object.hasOwn(bodyOf(await outbox.writeOutboxRequest(request)), "metadata")).toBe(false);
   });
 });
 
 describe("服务档位：wire 没有这个取值就不发，并留痕", () => {
   it("serviceTier 归 lossy 而不是 supports —— 声明支持却不发才是最糟的那一种", () => {
-    expect(egress.profile.supports.has("serviceTier")).toBe(false);
-    expect(egress.profile.lossy.has("serviceTier")).toBe(true);
+    expect(outbox.profile.supports.has("serviceTier")).toBe(false);
+    expect(outbox.profile.lossy.has("serviceTier")).toBe(true);
   });
 
   it("客户端要 priority：body 里不写 service_tier，但必须有一条指到它的 loss", async () => {
@@ -339,11 +345,11 @@ describe("服务档位：wire 没有这个取值就不发，并留痕", () => {
     }, TRACE);
     expect(request.intent.serviceTier).toEqual({ value: "priority", source: "client" });
 
-    const built = await egress.writeUpstreamRequest(request);
+    const built = await outbox.writeOutboxRequest(request);
     // wire 的 service_tier 只收 auto / standard_only；发一个 auto 只是把缺省又写一遍。
     expect(Object.hasOwn(bodyOf(built), "service_tier")).toBe(false);
     expect(built.losses).toContainEqual(expect.objectContaining({
-      stage: "egress", provider: "anthropic", path: "$.intent.serviceTier", kind: "dropped",
+      stage: "outbox", outbox: "anthropic", path: "$.intent.serviceTier", kind: "dropped",
     }));
   });
 
@@ -351,21 +357,72 @@ describe("服务档位：wire 没有这个取值就不发，并留痕", () => {
     const { request } = readAnthropicMessagesRequest({
       model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
     }, TRACE);
-    const built = await egress.writeUpstreamRequest(request);
+    const built = await outbox.writeOutboxRequest(request);
     expect(built.losses.filter((loss) => loss.path === "$.intent.serviceTier")).toEqual([]);
   });
 });
 
 describe("必填字段维度", () => {
   it("Anthropic 强制要求 max_tokens —— 声明与那条 requiredFieldMissing 拒绝是同一个事实", async () => {
-    expect(egress.profile.mandatory.maxOutputTokens).toBe(true);
+    expect(outbox.profile.mandatory.maxOutputTokens).toBe(true);
     const { request } = readChatCompletionsRequest({
       model: "m", messages: [{ role: "user", content: "hi" }],
     }, TRACE);
     expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
-    expect(rejected(await egress.writeUpstreamRequest(request))).toContainEqual(expect.objectContaining({
+    expect(rejected(await outbox.writeOutboxRequest(request))).toContainEqual(expect.objectContaining({
       kind: "requiredFieldMissing",
       path: "$.intent.stopping.maxOutputTokens",
     }));
+  });
+
+  it("对照：Chat Completions 不强制 max_tokens —— 强制性是 Anthropic wire 的事实，不是 Core 规则", async () => {
+    // 同一条没有 max_tokens 的 IR：Anthropic 拒绝（上面那条），Chat 照编不误。
+    // 缺了这条对照，`mandatory.maxOutputTokens` 就可能被误当成一条全局准入规则。
+    const chat = createOpenAIChatOutbox({ baseUrl: "https://api.openai.com/v1", apiKey: "k", model: "m" });
+    expect(chat.profile.mandatory.maxOutputTokens).toBe(false);
+    const { request } = readChatCompletionsRequest({
+      model: "m", messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    const built = await chat.writeOutboxRequest(request);
+    expect(built.ok).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * AGENTS.md 要求每个 Outbox 特化都带「不影响其他 Outbox」的反例。
+ *
+ * 这个出口最容易被误读成通用规则的特化只有一条：**空工具结果补 `""`**。
+ * 它在本文件里被论证为编译事实（Anthropic 编码不出空内容数组），但「编译事实」的
+ * 判据是 *这条 wire* 的，不是 IR 的 —— 另外两个出口在同一条 IR 上必须**拒绝**。
+ * 一旦哪天有人把这个补值上提到共享投影或 Core，这条会当场红。
+ */
+describe("特化不外溢：空工具结果补最小合法值只属于 Anthropic wire", () => {
+  function emptyToolResult(): IRRequest {
+    return readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: [] }] },
+      ],
+    }, TRACE).request;
+  }
+
+  it("Anthropic 补 \"\" 并编译成功", async () => {
+    const result = await outbox.writeOutboxRequest(emptyToolResult());
+    expect(contentOf(messagesOf(result)[1])[0]).toEqual({ type: "tool_result", tool_use_id: "toolu_1", content: "" });
+  });
+
+  it("同一条 IR 走 openai_chat / openai_responses：拒绝，且路径指到那个 toolResult part", async () => {
+    const chat = createOpenAIChatOutbox({ baseUrl: "https://api.openai.com/v1", apiKey: "k", model: "m" });
+    const responses = createOpenAIResponsesOutbox({ baseUrl: "https://api.openai.com/v1", apiKey: "k", model: "m" });
+
+    for (const other of [chat, responses]) {
+      const problems = rejected(await other.writeOutboxRequest(emptyToolResult()));
+      expect(problems).toContainEqual(expect.objectContaining({
+        kind: "requiredFieldMissing",
+        path: "$.conversation.turns[1].parts[0]",
+      }));
+    }
   });
 });

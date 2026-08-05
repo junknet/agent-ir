@@ -18,23 +18,23 @@
  *
  * wire 知识全部来自生产在用的实现，不凭印象：
  *   - `cc_proxy_unified/packages/copilot_protocol/src/wire.ts`（常量，实抓还原自 Copilot CLI 1.0.73）
- *   - `cc_proxy_unified/packages/copilot_protocol/src/egress.ts`（`decorateCopilotEgress` 的头集与剥离表）
+ *   - `cc_proxy_unified/packages/copilot_protocol/src/outbox.ts`（`decorateCopilotEgress` 的头集与剥离表）
  *   - `cc_proxy_unified/packages/relay/src/copilot_messages_relay.ts`（端点、两段式鉴权、非流式分支）
  *   - `cc_proxy_unified/packages/relay/src/copilot_request_projection.ts`（能力表，判据是上游 400 原文）
  *   - `.corpus/requests.ndjson` 里 **606 条 `accountType:'copilot'` 的真实生产请求**
  *     （本文件所有带计数的能力判据都出自它，是 Copilot 侧的行为实证而不是对原生 Anthropic 的类推）
  */
 import {
-  createAnthropicMessagesUpstream,
+  createAnthropicMessagesOutbox,
   type AnthropicMessagesDialectReview,
   type AnthropicMessagesTarget,
 } from "./anthropic.ts";
 import type { ValueSource } from "./gemini_cloudcode.ts";
 import type {
-  IRBuildProblem, IRCapability, IREgress, IRLoss, IRMandatoryFieldTable, IRRequest,
+  IRBuildProblem, IRCapability, IROutbox, IRLoss, IRMandatoryFieldTable, IRRequest,
 } from "../ir/types.ts";
 
-const PROVIDER = "copilot";
+const OUTBOX = "copilot";
 
 // ── 身份头常量 ──────────────────────────────────────────────────────────────
 //
@@ -173,6 +173,13 @@ const LOSSY = [
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: true };
 
+/**
+ * 无已知危害。判据是**没有一条真实拒绝**是内容策略造成的：这家从未因系统提示词的
+ * 内容本身拒过请求（拒绝都来自 wire 层的字段问题，那是 `writeOutboxRequest` 的事）。
+ *
+ * `false` 是一次表态，不是缺省 —— 新增一种危害时编译器会回到这里逼人重新回答。
+ */
+
 // ── 凭据与 options ──────────────────────────────────────────────────────────
 
 /**
@@ -191,7 +198,7 @@ const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: true };
  * （刷新、冷却、多账号轮换）在调用方手里。出口要的只是「现在给我一个能用的 token」，
  * 这正是 `ValueSource<string>` 表达的东西。
  */
-export interface CopilotUpstreamOptions {
+export interface CopilotOutboxOptions {
   /** 出站模型名。Copilot 只接受 session token 里 available_models 清单内的 id，映射由调用方决定。 */
   readonly model: string;
   /** 数据面 base URL：取自该凭据的 `/copilot_internal/user` → `endpoints.api`。 */
@@ -226,7 +233,7 @@ async function resolveSource<T>(source: ValueSource<T>): Promise<T> {
 async function resolveRequired(source: ValueSource<string>, field: string): Promise<string> {
   const value = (await resolveSource(source)).trim();
   if (value.length === 0) {
-    throw new Error(`copilot egress: options.${field} resolved to an empty value`);
+    throw new Error(`copilot outbox: options.${field} resolved to an empty value`);
   }
   return value;
 }
@@ -247,7 +254,7 @@ function reviewCopilotBody(
   body: Record<string, unknown>,
   request: IRRequest,
 ): AnthropicMessagesDialectReview {
-  const losses: Array<Omit<IRLoss, "stage" | "provider">> = [];
+  const losses: Array<Omit<IRLoss, "stage" | "outbox">> = [];
   const problems: IRBuildProblem[] = [];
 
   request.conversation.toolset.tools.forEach((tool, index) => {
@@ -277,7 +284,7 @@ function reviewCopilotBody(
   return { body: projected, losses, ...(problems.length === 0 ? {} : { problems }) };
 }
 
-export function createCopilotUpstream(options: CopilotUpstreamOptions): IREgress {
+export function createCopilotOutbox(options: CopilotOutboxOptions): IROutbox {
   const integrationId = options.integrationId ?? INTEGRATION_ID;
   const editorVersion = options.editorVersion ?? EDITOR_VERSION;
   const apiVersion = options.apiVersion ?? API_VERSION;
@@ -318,8 +325,8 @@ export function createCopilotUpstream(options: CopilotUpstreamOptions): IREgress
     };
   }
 
-  return createAnthropicMessagesUpstream({
-    provider: PROVIDER,
+  return createAnthropicMessagesOutbox({
+    outbox: OUTBOX,
     model: options.model,
     supports: SUPPORTED,
     lossy: LOSSY,

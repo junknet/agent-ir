@@ -1,5 +1,5 @@
 /**
- * Connect 应用错误 → `IRUpstreamError`。
+ * Connect 应用错误 → `IROutboxError`。
  *
  * ══ 这个文件对应一次真实生产故障，值得把因果写全 ══
  *
@@ -8,10 +8,16 @@
  *
  *     {"error":{"code":"permission_denied","message":"an internal error occurred"}}
  *
- * 生产上这条被当成「未知协议错误」落进资源重试路径：换一个账号重发 → 同样的 prompt
- * 触发同样的内容策略分类器 → 同样的 permission_denied → 打遍整个账号池 → 池子空了
- * 之后以 `503 pool_exhausted` 回给客户端。客户端看到的是「上游过载」，于是继续退避重试，
- * 而真实原因是**这条请求本身**永远不会被接受。一次拒绝被放大成 N 次上游调用 + 一个假的过载信号。
+ * 生产上这条被当成「未知协议错误」落进资源重试路径：换一个账号重发 → 同一条请求
+ * 被上游以同样的理由再拒一次 → 打遍整个账号池 → 池子空了之后以 `503 pool_exhausted`
+ * 回给客户端。客户端看到的是「上游过载」，于是继续退避重试，而真实原因是**这条请求本身**
+ * 永远不会被接受。一次拒绝被放大成 N 次上游调用 + 一个假的过载信号。
+ *
+ * ⚠ 这里刻意**不写**上游为什么拒。早先的注释断言原因是「内容策略分类器按关键词密度判」，
+ * 那条断言已被 `test/fixtures/windsurf_capture/` 的 12 条真实报文证伪：20945–21599 字符的
+ * agent 系统提示词 + 23 个工具定义，12/12 条得到 200。**故障与修复都是真的，被证伪的只是
+ * 那条推测出来的原因。** 分类判据不依赖它：`permission_denied` 描述的是本次请求被拒，
+ * 至于上游按什么判，本模块不知道，也不该假装知道。
  *
  * 修复的判据只有一条：`permission_denied` 描述的是**本次请求**，不是凭据、不是容量。
  * 换账号重试对它没有任何意义 → `retryable: false`。
@@ -25,7 +31,7 @@
  * 前者换号必成、后者换号必败，两者在这里被迫共享同一个判别位。本文件对二者都取
  * `retryable:false`（保守：绝不把一次拒绝放大成打遍账号池），代价是会话失效时也不会自动换号。
  */
-import type { IRUpstreamError } from "../../ir/types.ts";
+import type { IROutboxError } from "../../ir/types.ts";
 
 /**
  * gRPC 数字码 → Connect 字符串码。
@@ -61,18 +67,18 @@ export function normalizeConnectCode(code: unknown): string | null {
  *   请求有病 —— `invalid_argument` 等：生产实测形态
  *               `stream error: {"code":"invalid_argument","message":"..."}`，重试必然重演。
  */
-const CONNECT_CODE_KIND: Readonly<Record<string, IRUpstreamError["kind"]>> = {
+const CONNECT_CODE_KIND: Readonly<Record<string, IROutboxError["kind"]>> = {
   // ── 永久：本次请求或本凭据被拒 ────────────────────────────────────────
   permission_denied: "permissionDenied",
   unauthenticated: "permissionDenied",
   // ── 容量 ──────────────────────────────────────────────────────────────
   resource_exhausted: "rateLimited",
   // ── 瞬时 ──────────────────────────────────────────────────────────────
-  unavailable: "upstreamUnavailable",
-  internal: "upstreamUnavailable",
-  unknown: "upstreamUnavailable",
-  deadline_exceeded: "upstreamUnavailable",
-  aborted: "upstreamUnavailable",
+  unavailable: "outboxUnavailable",
+  internal: "outboxUnavailable",
+  unknown: "outboxUnavailable",
+  deadline_exceeded: "outboxUnavailable",
+  aborted: "outboxUnavailable",
   // ── 传输 ──────────────────────────────────────────────────────────────
   canceled: "transport",
   // ── 请求本身 ──────────────────────────────────────────────────────────
@@ -92,8 +98,8 @@ const CONNECT_CODE_KIND: Readonly<Record<string, IRUpstreamError["kind"]>> = {
  * `quotaExhausted` 也不在：配额耗尽是账号的状态，重发同一请求只会再撞一次
  * （换账号是调用方的调度决定，不是「这条错误可重试」）。
  */
-const RETRYABLE_KINDS: ReadonlySet<IRUpstreamError["kind"]> = new Set([
-  "rateLimited", "upstreamUnavailable", "transport",
+const RETRYABLE_KINDS: ReadonlySet<IROutboxError["kind"]> = new Set([
+  "rateLimited", "outboxUnavailable", "transport",
 ]);
 
 /**
@@ -139,9 +145,9 @@ export function readConnectError(trailer: Record<string, unknown>): ConnectError
 }
 
 /** Connect 应用错误 → IR。`httpStatus` 恒为 null：传输层给的是 200，这是本出口的核心特性。 */
-export function mapConnectError(payload: ConnectErrorPayload): IRUpstreamError {
+export function mapConnectError(payload: ConnectErrorPayload): IROutboxError {
   const message = payload.message ?? payload.code ?? "windsurf upstream error";
-  let kind: IRUpstreamError["kind"] =
+  let kind: IROutboxError["kind"] =
     payload.code === null ? "unknown" : CONNECT_CODE_KIND[payload.code] ?? "unknown";
   if (kind === "rateLimited" && QUOTA_PATTERN.test(message)) kind = "quotaExhausted";
   if (kind === "invalidRequest" && CONTEXT_LENGTH_PATTERN.test(message)) kind = "contextLengthExceeded";
@@ -160,7 +166,7 @@ export function mapConnectError(payload: ConnectErrorPayload): IRUpstreamError {
  * HTTP 层错误（非 200）。Connect 的鉴权/路由失败仍会走真正的状态码，
  * 与尾帧错误是**两条**路径，不能合并处理。
  */
-export function mapHttpError(status: number, bodyText: string): IRUpstreamError {
+export function mapHttpError(status: number, bodyText: string): IROutboxError {
   const trimmed = bodyText.trim();
   let parsed: Record<string, unknown> | null = null;
   try {
@@ -172,7 +178,7 @@ export function mapHttpError(status: number, bodyText: string): IRUpstreamError 
     // Connect 的 HTTP 层错误体不保证是 JSON；状态码本身已经够判档。
   }
   const embedded = parsed === null ? null : readConnectError(parsed);
-  const kind: IRUpstreamError["kind"] = (() => {
+  const kind: IROutboxError["kind"] = (() => {
     if (embedded?.code !== null && embedded?.code !== undefined) {
       return CONNECT_CODE_KIND[embedded.code] ?? httpStatusKind(status);
     }
@@ -188,12 +194,12 @@ export function mapHttpError(status: number, bodyText: string): IRUpstreamError 
   };
 }
 
-function httpStatusKind(status: number): IRUpstreamError["kind"] {
+function httpStatusKind(status: number): IROutboxError["kind"] {
   if (status === 401 || status === 403) return "permissionDenied";
   if (status === 429) return "rateLimited";
   if (status === 402) return "quotaExhausted";
   if (status === 413) return "invalidRequest";
-  if (status >= 500) return "upstreamUnavailable";
+  if (status >= 500) return "outboxUnavailable";
   if (status >= 400) return "invalidRequest";
   return "unknown";
 }

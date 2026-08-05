@@ -78,7 +78,7 @@ function expectSelfConsistent(result: ClientRequestReadResult, protocol: IRProto
     expect(request.conversation.turns[i]!.role).not.toBe(request.conversation.turns[i - 1]!.role);
   }
   for (const loss of losses) {
-    expect(loss.stage).toBe("ingress");
+    expect(loss.stage).toBe("inbox");
     expect(IR_LOSS_KINDS).toContain(loss.kind);
     expect(loss.path.startsWith("$")).toBe(true);
     expect(loss.detail.length).toBeGreaterThan(0);

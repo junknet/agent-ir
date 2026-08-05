@@ -85,12 +85,12 @@ describe("corpus replay", () => {
     for (const entry of corpus) {
       const { losses } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
       for (const loss of losses) {
-        expect(loss.stage).toBe("ingress");
+        expect(loss.stage).toBe("inbox");
         expect(IR_LOSS_KINDS).toContain(loss.kind);
         details.set(loss.detail, (details.get(loss.detail) ?? 0) + 1);
       }
     }
-    if (details.size > 0) console.log("ingress losses:", Object.fromEntries(details));
+    if (details.size > 0) console.log("inbox losses:", Object.fromEntries(details));
   });
 
   it.skipIf(corpus.length === 0)("preserves tool call/result correlation without positional assumptions", () => {

@@ -1,5 +1,5 @@
 /**
- * 网关配置的**唯一装配点**：一份环境 → 一个完整可用的 `GatewayConfig`。
+ * 网关配置的**唯一装配点**：一份环境 → 一个完整可用的 `GatewayRuntimeSettings`。
  *
  * 「构造成功即可用」（Construct valid or fail）：这个函数返回之后不存在任何
  * 「还没校验」的字段 —— 出口已绑好、模型表已解析、修复策略已核对、流策略已成型。
@@ -11,14 +11,14 @@ import {
   DEFAULT_STREAM_POLICY, type IRStreamPolicy,
 } from "../ir/stream_guard.ts";
 import {
-  jsonSink, parseLogLevel, textSink, type LoggerConfig,
+  parseLogLevel, type LoggingSettings,
 } from "../obs/log.ts";
 import {
   IR_REPAIR_KINDS, type IRRepairKind, type IRRepairPolicy,
 } from "../repair/index.ts";
 import {
-  EGRESS_CONFIGS, EGRESS_NAMES, type EgressFactory, type EgressName,
-} from "./egress_selection.ts";
+  OUTBOX_SELECTIONS, OUTBOX_NAMES, type OutboxFactory, type OutboxName,
+} from "./outbox_selection.ts";
 import {
   readEnumeratedList, readEnumeratedText, readOptionalDurationMs, readOptionalText,
   readPositiveInteger, type EnvLookup,
@@ -26,19 +26,19 @@ import {
 import { readModelRoutingTable, type ModelRoutingTable } from "./model_routing.ts";
 import { REPAIR_KINDS_VARIABLE } from "./repair_advice.ts";
 
-export const EGRESS_VARIABLE = "AGENT_IR_EGRESS";
+export const OUTBOX_VARIABLE = "AGENT_IR_OUTBOX";
 
-export interface SelectedEgress {
-  readonly name: EgressName;
+export interface SelectedOutbox {
+  readonly name: OutboxName;
   readonly wire: string;
   /** 上游模型 id → 出口实例。已按模型 id 记忆化。 */
-  readonly resolve: EgressFactory;
+  readonly resolve: OutboxFactory;
 }
 
-export interface GatewayConfig {
+export interface GatewayRuntimeSettings {
   readonly port: number;
-  readonly logging: LoggerConfig;
-  readonly egress: SelectedEgress;
+  readonly logging: LoggingSettings;
+  readonly outbox: SelectedOutbox;
   readonly models: ModelRoutingTable;
   /**
    * 修复策略。`IR_REPAIR_POLICY_NONE` 的等价物（空对象）= 一条都不修，这是**默认值**：
@@ -81,31 +81,31 @@ function readStreamPolicy(env: EnvLookup): IRStreamPolicy {
   };
 }
 
-function readLoggingConfig(env: EnvLookup): LoggerConfig {
+function readLoggingConfig(env: EnvLookup): LoggingSettings {
   const dev = (readOptionalText(env, "AGENT_IR_ENV") ?? "dev") === "dev";
   const format = readEnumeratedText(
     env, "AGENT_IR_LOG_FORMAT", ["text", "json"] as const, dev ? "text" : "json");
   return {
     level: parseLogLevel(readOptionalText(env, "AGENT_IR_LOG_LEVEL"), dev ? "debug" : "info"),
     service: readOptionalText(env, "AGENT_IR_SERVICE") ?? "agent-ir",
-    sink: format === "text" ? textSink() : jsonSink(),
+    format,
   };
 }
 
 /**
- * 读一份完整配置。任何一处不合法都抛 `GatewayConfigError`，进程别起来。
+ * 读一份完整配置。任何一处不合法都抛 `GatewaySettingsError`，进程别起来。
  *
  * 出口名没有默认值：**必须显式选**。给一个默认出口意味着「什么都不配也能起」，
  * 而那正是这次改造要消灭的形态 —— 进程起来了，路由却不是运维以为的那条。
  */
-export function readGatewayConfig(env: EnvLookup): GatewayConfig {
-  const name = readEnumeratedText(env, EGRESS_VARIABLE, EGRESS_NAMES, null);
-  const selected = EGRESS_CONFIGS[name];
+export function readGatewayRuntimeSettings(env: EnvLookup): GatewayRuntimeSettings {
+  const name = readEnumeratedText(env, OUTBOX_VARIABLE, OUTBOX_NAMES, null);
+  const selected = OUTBOX_SELECTIONS[name];
   const { policy, kinds } = readRepairPolicy(env);
   return {
     port: readPositiveInteger(env, "AGENT_IR_PORT", 9797),
     logging: readLoggingConfig(env),
-    egress: { name: selected.name, wire: selected.wire, resolve: selected.bind(env) },
+    outbox: { name: selected.name, wire: selected.wire, resolve: selected.bind(env) },
     models: readModelRoutingTable(env),
     repairPolicy: policy,
     repairKinds: kinds,

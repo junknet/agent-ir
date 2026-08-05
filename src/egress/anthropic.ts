@@ -1,7 +1,7 @@
 /**
- * Anthropic Messages 出口：writeUpstreamRequest（IR → wire）+ readUpstreamResponse（上游 SSE → IREvent）。
+ * Anthropic Messages 出口：writeOutboxRequest（IR → wire）+ readOutboxResponse（上游 SSE → IREvent）。
  *
- * writeUpstreamRequest 是**唯一**恢复 Anthropic 位置不变量的地方：
+ * writeOutboxRequest 是**唯一**恢复 Anthropic 位置不变量的地方：
  *   每个 tool_use 恰好一个 tool_result，且位于紧随该 assistant 回合之后那条 user 回合的最前面。
  * IR 内部靠 id 关联、与位置无关，所以三个入口都不需要各自维护这套排列规则 ——
  * agent-all-sdk-ts 里那份 179 行的 anthropic_constraints.ts 在这个架构下只剩这一个函数。
@@ -15,9 +15,9 @@
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable, UpstreamRequestBuildResult,
+  IRCapability, IROutbox, IROutboxProfile, IREvent, IRLoss, IRMandatoryFieldTable, OutboxRequestBuildResult,
   IRBuildProblem, IRPart, IRRequest, IRSessionIdentity,
-  IRStopReason, IRTurn, IRUpstreamError, IRUsage,
+  IRStopReason, IRTurn, IROutboxError, IRUsage,
 } from "../ir/types.ts";
 
 const SUPPORTED = [
@@ -50,7 +50,14 @@ const LOSSY = [
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: true };
 
-export interface AnthropicUpstreamOptions {
+/**
+ * 无已知危害。判据是**没有一条真实拒绝**是内容策略造成的：这家从未因系统提示词的
+ * 内容本身拒过请求（拒绝都来自 wire 层的字段问题，那是 `writeOutboxRequest` 的事）。
+ *
+ * `false` 是一次表态，不是缺省 —— 新增一种危害时编译器会回到这里逼人重新回答。
+ */
+
+export interface AnthropicOutboxOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly anthropicVersion?: string;
@@ -71,14 +78,15 @@ export interface AnthropicUpstreamOptions {
  *     不在这里（ARCHITECTURE §7 的划线判据）。
  */
 export interface AnthropicMessagesDialect {
-  /** 落进 `IREgressProfile.provider` 与每一条 `IRLoss.provider`。 */
-  readonly provider: string;
+  /** 写入这家 Outbox 自己产出的每一条 `IRLoss.outbox`。 */
+  readonly outbox: string;
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
   readonly model: string;
   readonly supports: readonly IRCapability[];
   readonly lossy: readonly IRCapability[];
   /** 目标强制要求的 IR 字段。两家跑同一条 wire，但表态各自给出，不许一家替另一家决定。 */
   readonly mandatory: IRMandatoryFieldTable;
+  /** 目标的已知危害。同上：共享 wire 不等于共享上游策略层，两家各自表态。 */
   resolveTarget(request: IRRequest): Promise<AnthropicMessagesTarget>;
   review?(body: Record<string, unknown>, request: IRRequest): AnthropicMessagesDialectReview;
 }
@@ -91,19 +99,19 @@ export interface AnthropicMessagesTarget {
 export interface AnthropicMessagesDialectReview {
   /** 复核后的 body。省略 = 原样采用（复核只提意见、不改字段的常见情况）。 */
   readonly body?: Record<string, unknown>;
-  readonly losses?: readonly Omit<IRLoss, "stage" | "provider">[];
+  readonly losses?: readonly Omit<IRLoss, "stage" | "outbox">[];
   readonly problems?: readonly IRBuildProblem[];
 }
 
-class UpstreamRequestReport {
-  readonly #provider: string;
+class OutboxRequestReport {
+  readonly #outbox: string;
   readonly #losses: IRLoss[] = [];
   readonly #problems: IRBuildProblem[] = [];
-  constructor(provider: string) {
-    this.#provider = provider;
+  constructor(outbox: string) {
+    this.#outbox = outbox;
   }
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: this.#provider, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "outbox", outbox: this.#outbox, ...loss });
   }
   reject(problem: IRBuildProblem): void {
     this.#problems.push(problem);
@@ -135,11 +143,19 @@ function flatToolName(group: string | null, name: string): string {
   return group === null ? name : `${group}__${name}`;
 }
 
-function writePartToUpstream(part: IRPart, path: string, report: UpstreamRequestReport): Record<string, unknown> | null {
+function writePartToOutbox(part: IRPart, path: string, report: OutboxRequestReport): Record<string, unknown> | null {
   const cache = part.cacheBreakpoint === undefined ? {} : { cache_control: { type: "ephemeral" } };
   switch (part.kind) {
     case "text":
-      return part.text.length === 0 ? null : { type: "text", text: part.text, ...cache };
+      if (part.text.length === 0) {
+        report.record({
+          path,
+          kind: "dropped",
+          detail: "empty text block is rejected by this wire and was omitted, including any cache breakpoint",
+        });
+        return null;
+      }
+      return { type: "text", text: part.text, ...cache };
     case "image":
       return {
         type: "image",
@@ -177,7 +193,7 @@ function writePartToUpstream(part: IRPart, path: string, report: UpstreamRequest
       };
     case "toolResult": {
       const inner = part.result.parts
-        .map((child, index) => writePartToUpstream(child, `${path}.result.parts[${index}]`, report))
+        .map((child, index) => writePartToOutbox(child, `${path}.result.parts[${index}]`, report))
         .filter((block): block is Record<string, unknown> => block !== null);
       return {
         type: "tool_result",
@@ -212,7 +228,7 @@ function writePartToUpstream(part: IRPart, path: string, report: UpstreamRequest
  *     Core 一律带精确 IR 路径拒绝，由调用方显式 compose `src/repair` 决定。
  *   两者都会让上游 400，但前者的补法是 wire 强制的，后者是策略。
  */
-function arrangeToolTurns(turns: readonly IRTurn[], report: UpstreamRequestReport): IRTurn[] {
+function arrangeToolTurns(turns: readonly IRTurn[], report: OutboxRequestReport): IRTurn[] {
   // 1. 摘出全部工具结果，按 callId 索引（带精确路径，拒绝时要把位置指到那个 part）
   const resultsByCallId = new Map<string, { part: IRPart; path: string }>();
   const stripped: IRTurn[] = turns.map((turn, turnIndex) => ({
@@ -286,14 +302,13 @@ function arrangeToolTurns(turns: readonly IRTurn[], report: UpstreamRequestRepor
 
 /**
  * Anthropic Messages wire 的出口工厂。**投影只有这一份**，方言只换端点、身份头、
- * 能力声明与复核 —— `createAnthropicUpstream` 与 `createCopilotUpstream` 都是它的薄封装。
+ * 能力声明与复核 —— `createAnthropicOutbox` 与 `createCopilotOutbox` 都是它的薄封装。
  *
- * `readUpstreamResponse` 不做方言化：读回来的就是同一条 wire 的同一套 SSE 事件，
+ * `readOutboxResponse` 不做方言化：读回来的就是同一条 wire 的同一套 SSE 事件，
  * 给它开一个 hook 等于给「Anthropic 事件语义」开第二份认知。
  */
-export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialect): IREgress {
-  const profile: IREgressProfile = {
-    provider: dialect.provider,
+export function createAnthropicMessagesOutbox(dialect: AnthropicMessagesDialect): IROutbox {
+  const profile: IROutboxProfile = {
     supports: new Set(dialect.supports),
     lossy: new Set(dialect.lossy),
     mandatory: dialect.mandatory,
@@ -302,18 +317,18 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
   return {
     profile,
 
-    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const report = new UpstreamRequestReport(dialect.provider);
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult> {
+      const report = new OutboxRequestReport(dialect.outbox);
       const { conversation, intent } = request;
 
       const system = conversation.system
-        .map((part, index) => writePartToUpstream(part, `$.conversation.system[${index}]`, report))
+        .map((part, index) => writePartToOutbox(part, `$.conversation.system[${index}]`, report))
         .filter((block): block is Record<string, unknown> => block !== null);
 
       const messages = arrangeToolTurns(conversation.turns, report).map((turn, turnIndex) => ({
         role: turn.role,
         content: turn.parts
-          .map((part, partIndex) => writePartToUpstream(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, report))
+          .map((part, partIndex) => writePartToOutbox(part, `$.conversation.turns[${turnIndex}].parts[${partIndex}]`, report))
           .filter((block): block is Record<string, unknown> => block !== null),
       })).filter((message) => message.content.length > 0);
 
@@ -455,16 +470,16 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
       };
     },
 
-    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+    readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
       return liftAnthropicStream(response, readOptions);
     },
   };
 }
 
 /** 原生 Anthropic：`x-api-key` + 固定 baseUrl，没有方言复核。 */
-export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREgress {
-  return createAnthropicMessagesUpstream({
-    provider: "anthropic",
+export function createAnthropicOutbox(options: AnthropicOutboxOptions): IROutbox {
+  return createAnthropicMessagesOutbox({
+    outbox: "anthropic",
     model: options.model,
     supports: SUPPORTED,
     lossy: LOSSY,
@@ -481,7 +496,7 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
   });
 }
 
-// ── readUpstreamResponse ───────────────────────────────────────────────────────────────────
+// ── readOutboxResponse ───────────────────────────────────────────────────────────────────
 
 function mapStopReason(raw: unknown): IRStopReason {
   switch (raw) {
@@ -511,37 +526,37 @@ function mapStopReason(raw: unknown): IRStopReason {
  *   （`error code: 524`），解不出 type 也解不出 message。只看正文会把这些瞬时故障判成
  *   `unknown` + 不可重试，本该退避重试的请求直接失败。
  */
-const UPSTREAM_ERROR_TYPE_KINDS: Readonly<Record<string, IRUpstreamError["kind"]>> = {
+const UPSTREAM_ERROR_TYPE_KINDS: Readonly<Record<string, IROutboxError["kind"]>> = {
   invalid_request_error: "invalidRequest",
   authentication_error: "permissionDenied",
   permission_error: "permissionDenied",
   permission_denied: "permissionDenied",
   rate_limit_error: "rateLimited",
-  overloaded_error: "upstreamUnavailable",
-  api_error: "upstreamUnavailable",
+  overloaded_error: "outboxUnavailable",
+  api_error: "outboxUnavailable",
 };
 
 /** 正文语义证据。命中即定，压过类型与状态码。 */
 const CONTEXT_LENGTH_PATTERN = /context.{0,12}length|too long|exceeds? the (maximum|context)/iu;
 
-function kindFromHttpStatus(httpStatus: number | null): IRUpstreamError["kind"] {
+function kindFromHttpStatus(httpStatus: number | null): IROutboxError["kind"] {
   if (httpStatus === null) return "unknown";
   if (httpStatus === 401 || httpStatus === 403) return "permissionDenied";
   if (httpStatus === 429) return "rateLimited";
-  if (httpStatus === 408) return "upstreamUnavailable";
+  if (httpStatus === 408) return "outboxUnavailable";
   // 5xx 一律当上游暂时不可用：包含 520–529 这些 Cloudflare 自造码，
   // 只枚举 500/502/503/504 会把边缘层的瞬时故障判成不可重试。
-  if (httpStatus >= 500) return "upstreamUnavailable";
+  if (httpStatus >= 500) return "outboxUnavailable";
   if (httpStatus >= 400) return "invalidRequest";
   return "unknown";
 }
 
 /** 可重试性由 kind 单点派生，不在各处各判一次。 */
-function isRetryableKind(kind: IRUpstreamError["kind"]): boolean {
-  return kind === "rateLimited" || kind === "upstreamUnavailable" || kind === "transport";
+function isRetryableKind(kind: IROutboxError["kind"]): boolean {
+  return kind === "rateLimited" || kind === "outboxUnavailable" || kind === "transport";
 }
 
-function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstreamError {
+function mapOutboxError(payload: unknown, httpStatus: number | null): IROutboxError {
   const holder = typeof payload === "object" && payload !== null ? payload as Record<string, unknown> : {};
   const inner = typeof holder.error === "object" && holder.error !== null
     ? holder.error as Record<string, unknown> : holder;
@@ -552,7 +567,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
   const rawText = typeof payload === "string" && payload.trim().length > 0 ? payload : null;
   const evidence = bodyMessage ?? rawText ?? "";
 
-  const kind: IRUpstreamError["kind"] =
+  const kind: IROutboxError["kind"] =
     CONTEXT_LENGTH_PATTERN.test(evidence) ? "contextLengthExceeded"
     : UPSTREAM_ERROR_TYPE_KINDS[type] ?? kindFromHttpStatus(httpStatus);
 
@@ -592,7 +607,7 @@ async function* liftAnthropicStream(
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
-    yield { kind: "error", error: mapUpstreamError(tryParseJson(text) ?? text, response.status) };
+    yield { kind: "error", error: mapOutboxError(tryParseJson(text) ?? text, response.status) };
     return;
   }
 
@@ -602,11 +617,11 @@ async function* liftAnthropicStream(
     const text = await response.text();
     const payload = tryParseJson<Record<string, unknown>>(text);
     if (payload === null) {
-      yield { kind: "error", error: mapUpstreamError(text, response.status) };
+      yield { kind: "error", error: mapOutboxError(text, response.status) };
       return;
     }
     if (payload.type === "error") {
-      yield { kind: "error", error: mapUpstreamError(payload, response.status) };
+      yield { kind: "error", error: mapOutboxError(payload, response.status) };
       return;
     }
     yield { kind: "messageStart", model: typeof payload.model === "string" ? payload.model : "" };
@@ -628,7 +643,7 @@ async function* liftAnthropicStream(
   const toolInputBuffers = new Map<number, string>();
   let sawTerminal = false;
 
-  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
+  for await (const frame of iterateSse(response, readOptions?.inspectCompleteSseFrame)) {
     const payload = tryParseJson<Record<string, unknown>>(frame.data);
     if (payload === null) {
       yield { kind: "unhandled", rawType: frame.event ?? "<no-event>", raw: frame.data };
@@ -703,7 +718,7 @@ async function* liftAnthropicStream(
 
       case "error":
         sawTerminal = true;
-        yield { kind: "error", error: mapUpstreamError(payload, null) };
+        yield { kind: "error", error: mapOutboxError(payload, null) };
         break;
 
       case "ping":

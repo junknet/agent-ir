@@ -129,6 +129,8 @@ startGateway(process.env, irMessageInterceptionExtensions);
   `openai_responses` 80），来自生产 ClickHouse 原文归档，无截断，最深会话 turn_index 1689
 - **5 天 108 万行网关流量日志**
 - **6 份真实 codex rollout**（Responses input item 的类型与键集）
+- **12 条真实 Devin CLI 的 Windsurf `GetChatMessage` 抓包**（`test/fixtures/windsurf_capture/`，
+  凭据已抹除，全部 HTTP 200）—— 出站 protobuf 信封侧的唯一一手证据
 
 `docs/EVIDENCE.md` 逐条记录了「哪个字段出现多少次 → 因此 IR 怎么建模」。
 
@@ -137,9 +139,10 @@ startGateway(process.env, irMessageInterceptionExtensions);
 ```bash
 bun install
 
-AGENT_IR_UPSTREAM_BASE_URL=https://your-upstream \
-AGENT_IR_UPSTREAM_API_KEY=sk-... \
-AGENT_IR_UPSTREAM_MODEL=claude-opus-5 \
+AGENT_IR_OUTBOX=openai_chat \
+AGENT_IR_OPENAI_CHAT_BASE_URL=https://api.openai.com/v1 \
+AGENT_IR_OPENAI_CHAT_API_KEY=sk-... \
+AGENT_IR_MODEL_FALLBACK=passthrough \
 bun run dev
 ```
 
@@ -154,8 +157,8 @@ bun run dev
 真实客户端注入不了自定义头，这是上一版踩过的坑）：
 
 ```
-ingress_received → ingress_decoded → admission_decided → egress_lowered
-→ upstream_responded → egress_lifted(unhandled 计数) → request_completed
+inbox_received → inbox_decoded → admission_decided → outbox_lowered
+→ outbox_responded → outbox_lifted(unhandled 计数) → inbox_response_completed
 ```
 
 ## 测试
@@ -185,7 +188,9 @@ bun run typecheck
 
 出口侧已接六家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode` · `windsurf` · `copilot`，
 因此当前可用路由是 3 入口 × 6 出口 = 18 条。Windsurf 使用统一的
-ConnectRPC/Protobuf `GetChatMessage` outbox；模型家族只由 `chat_model_uid` 选择，不另拆出口。
+ConnectRPC/Protobuf `GetChatMessage` outbox；模型家族只由 `chat_model_uid` 选择，不另拆出口 ——
+这条有抓包实证：12 条真实报文覆盖 kimi / gpt / gemini / swe 四个家族，除 `chat_model_uid`
+外信封逐字段同构（见 `docs/EVIDENCE.md`）。
 
 codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍进名字，
 `ir_loss_recorded` 显式记下 `'toolGroup' only with loss of fidelity` ——
@@ -193,18 +198,27 @@ codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍�
 
 ## 加一个出口
 
-实现 `IREgress`：
+实现 `IROutbox`：
 
 ```ts
-interface IREgress {
-  readonly profile: IREgressProfile;              // supports / lossy 静态声明
-  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult>; // IR → wire + losses
-  readUpstreamResponse(response, options?): AsyncIterable<IREvent>;              // 上游响应 → IR 事件流
+interface IROutbox {
+  readonly profile: IROutboxProfile;              // supports / lossy 静态声明
+  writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult>; // IR → wire + losses
+  readOutboxResponse(response, options?): AsyncIterable<IREvent>;              // 上游响应 → IR 事件流
 }
 ```
 
-两条硬要求：
+`IROutboxProfile` 只声明所有 Outbox 都能共同解释的 wire 事实（`supports` / `lossy` / `mandatory`）。
+供应商自己的鉴权、编码、内建工具映射、内容策略统统留在该出口的 `src/egress/` 模块里，
+不往 profile 上挂布尔开关 —— 判据见 [AGENTS.md](AGENTS.md) 的「接口边界」。
 
-1. `readUpstreamResponse` 的 switch **必须有 default 产出 `{kind:'unhandled'}`**。上游协议漂移要能自己冒头，
+三条硬要求：
+
+1. `readOutboxResponse` 的 switch **必须有 default 产出 `{kind:'unhandled'}`**。上游协议漂移要能自己冒头，
    不能等故障反推。
 2. 任何丢弃/降级/替换都要 `IRLoss`。「这个字段这个上游不支持」是设计信息，不是可以省略的细节。
+3. `test/egress_<outbox>.test.ts` 要覆盖三样：wire 形状、失败边界（编译拒绝 + 错误分类），
+   以及**不影响其他 Outbox 的反例**。第三样最容易漏：一条特化如果没人证明它不外溢，
+   下一个人就会把它当通用规则上提进 Core。反例长这样 —— 同一条 IR 换一个出口，
+   结局必须不同（Anthropic 给空工具结果补 `""`，`openai_chat` / `openai_responses`
+   在同一条 IR 上必须拒绝）。

@@ -6,29 +6,29 @@
  * 所以每个 parse 都有三个用例：合法、非法（且错误信息列全合法值）、缺省。
  *
  * 枚举完整性一律不靠人肉核对：
- *   - 出口清单从 `EGRESS_PROVIDERS` 取，不在这里手抄第二份；
- *   - 每个出口的 env 夹具写成以 `EgressName` 为键的映射类型 —— 注册表加一家而这里没给夹具，
+ *   - 出口清单从 `OUTBOX_REGISTRY` 取，不在这里手抄第二份；
+ *   - 每个出口的 env 夹具写成以 `OutboxName` 为键的映射类型 —— 注册表加一家而这里没给夹具，
  *     本文件当场编译失败；
  *   - problem → repair 映射两侧分别用 `IR_BUILD_PROBLEM_KINDS` 与 `IR_REPAIR_KINDS` 枚举核对。
  */
 import { describe, expect, it } from "bun:test";
-import type { AnthropicUpstreamOptions } from "../src/egress/anthropic.ts";
-import type { WindsurfEgressOptions } from "../src/egress/windsurf/index.ts";
-import { EGRESS_VARIABLE, readGatewayConfig } from "../src/gateway/config.ts";
+import type { AnthropicOutboxOptions } from "../src/egress/anthropic.ts";
+import type { WindsurfOutboxOptions } from "../src/egress/windsurf/index.ts";
+import { OUTBOX_VARIABLE, readGatewayRuntimeSettings } from "../src/gateway/config.ts";
 import {
-  EGRESS_CONFIGS, EGRESS_NAMES,
-  type EgressBodyOf, type EgressName, type EgressOptionsOf,
-} from "../src/gateway/egress_selection.ts";
-import { GatewayConfigError, type EnvLookup } from "../src/gateway/env.ts";
+  OUTBOX_SELECTIONS, OUTBOX_NAMES,
+  type OutboxBodyOf, type OutboxName, type OutboxOptionsOf,
+} from "../src/gateway/outbox_selection.ts";
+import { GatewaySettingsError, type EnvLookup } from "../src/gateway/env.ts";
 import {
-  describeUnroutedModel, readModelRoutingTable, resolveUpstreamModel,
+  describeUnroutedModel, readModelRoutingTable, resolveOutboxModel,
 } from "../src/gateway/model_routing.ts";
 import {
   REPAIRS_FOR_PROBLEM_KIND, REPAIR_KINDS_VARIABLE, describeProblemWithRepairAdvice,
 } from "../src/gateway/repair_advice.ts";
 import { DEFAULT_STREAM_POLICY } from "../src/ir/stream_guard.ts";
 import { IR_BUILD_PROBLEM_KINDS, type IRBuildProblem } from "../src/ir/types.ts";
-import { EGRESS_PROVIDERS } from "../src/protocols.ts";
+import { OUTBOX_REGISTRY } from "../src/protocols.ts";
 import { IR_REPAIR_KINDS, type IRRepairKind } from "../src/repair/index.ts";
 
 // ── 类型层断言工具 ──────────────────────────────────────────────────────────
@@ -39,10 +39,10 @@ type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
 /**
- * 每个出口的最小可用环境。**键由 `EgressName` 穷举**：注册表加一家而这里漏给夹具，
+ * 每个出口的最小可用环境。**键由 `OutboxName` 穷举**：注册表加一家而这里漏给夹具，
  * 这份赋值当场编译失败 —— 新出口不可能悄悄地「没人测过配置」就上线。
  */
-const EGRESS_FIXTURES: Readonly<Record<EgressName, {
+const OUTBOX_FIXTURES: Readonly<Record<OutboxName, {
   readonly env: EnvLookup;
   /**
    * 一个变量都不给时能不能 bind 成功。
@@ -51,7 +51,7 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
    * 免得哪天它变成 false 而没人发现。
    */
   readonly bindsWithoutEnv: boolean;
-  readonly provider: string;
+  readonly outbox: OutboxName;
 }>> = {
   copilot: {
     env: {
@@ -60,7 +60,7 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
       AGENT_IR_COPILOT_GITHUB_TOKEN: "gho_test",
     },
     bindsWithoutEnv: false,
-    provider: "copilot",
+    outbox: "copilot",
   },
 
   anthropic: {
@@ -69,7 +69,7 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
       AGENT_IR_ANTHROPIC_API_KEY: "sk-test",
     },
     bindsWithoutEnv: false,
-    provider: "anthropic",
+    outbox: "anthropic",
   },
   openai_chat: {
     env: {
@@ -77,7 +77,7 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
       AGENT_IR_OPENAI_CHAT_API_KEY: "sk-test",
     },
     bindsWithoutEnv: false,
-    provider: "openai_chat",
+    outbox: "openai_chat",
   },
   openai_responses: {
     env: {
@@ -85,7 +85,7 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
       AGENT_IR_OPENAI_RESPONSES_API_KEY: "sk-test",
     },
     bindsWithoutEnv: false,
-    provider: "openai_responses",
+    outbox: "openai_responses",
   },
   gemini_cloudcode: {
     env: {
@@ -93,88 +93,88 @@ const EGRESS_FIXTURES: Readonly<Record<EgressName, {
       AGENT_IR_GEMINI_CLOUDCODE_PROJECT: "default-cli-project",
     },
     bindsWithoutEnv: true,
-    provider: "gemini_cloudcode",
+    outbox: "gemini_cloudcode",
   },
   windsurf: {
     env: { AGENT_IR_WINDSURF_API_KEY: "devin-session-token$test" },
     bindsWithoutEnv: false,
-    provider: "windsurf",
+    outbox: "windsurf",
   },
 };
 
-function envFor(name: EgressName, extra: EnvLookup = {}): EnvLookup {
-  return { [EGRESS_VARIABLE]: name, ...EGRESS_FIXTURES[name].env, ...extra };
+function envFor(name: OutboxName, extra: EnvLookup = {}): EnvLookup {
+  return { [OUTBOX_VARIABLE]: name, ...OUTBOX_FIXTURES[name].env, ...extra };
 }
 
 // ── 出口选择 ────────────────────────────────────────────────────────────────
 
 describe("出口按配置选，选不中就不起", () => {
   it("合法出口名各起一次，profile 与注册表对得上", () => {
-    for (const name of EGRESS_NAMES) {
-      const config = readGatewayConfig(envFor(name));
-      expect(config.egress.name).toBe(name);
-      expect(config.egress.wire).toBe(EGRESS_PROVIDERS[name].wire);
-      const egress = config.egress.resolve("upstream-model-id");
-      expect(egress.profile.provider).toBe(EGRESS_FIXTURES[name].provider);
+    for (const name of OUTBOX_NAMES) {
+      const config = readGatewayRuntimeSettings(envFor(name));
+      expect(config.outbox.name).toBe(name);
+      expect(config.outbox.wire).toBe(OUTBOX_REGISTRY[name].wire);
+      expect(config.outbox.resolve("outbox-model-id")).toBeDefined();
+      expect(config.outbox.name).toBe(OUTBOX_FIXTURES[name].outbox);
     }
   });
 
   it("出口名拼错：启动失败，且把全部合法值列出来", () => {
     let thrown: unknown;
-    try { readGatewayConfig({ [EGRESS_VARIABLE]: "anthropi" }); } catch (error) { thrown = error; }
-    expect(thrown).toBeInstanceOf(GatewayConfigError);
+    try { readGatewayRuntimeSettings({ [OUTBOX_VARIABLE]: "anthropi" }); } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(GatewaySettingsError);
     const message = (thrown as Error).message;
     expect(message).toContain("anthropi");
     // 「列出全部合法值」不是列一部分：逐个断言，漏一个就失败。
-    for (const name of EGRESS_NAMES) expect(message).toContain(name);
+    for (const name of OUTBOX_NAMES) expect(message).toContain(name);
   });
 
   it("出口名缺省：没有默认出口，必须显式选", () => {
-    expect(() => readGatewayConfig({})).toThrow(GatewayConfigError);
+    expect(() => readGatewayRuntimeSettings({})).toThrow(GatewaySettingsError);
     let thrown: unknown;
-    try { readGatewayConfig({}); } catch (error) { thrown = error; }
+    try { readGatewayRuntimeSettings({}); } catch (error) { thrown = error; }
     const message = (thrown as Error).message;
-    expect(message).toContain(EGRESS_VARIABLE);
-    for (const name of EGRESS_NAMES) expect(message).toContain(name);
+    expect(message).toContain(OUTBOX_VARIABLE);
+    for (const name of OUTBOX_NAMES) expect(message).toContain(name);
   });
 
   it("必填变量缺失：启动期就抛，且点名是哪个变量", () => {
-    for (const name of EGRESS_NAMES) {
-      const fixture = EGRESS_FIXTURES[name];
+    for (const name of OUTBOX_NAMES) {
+      const fixture = OUTBOX_FIXTURES[name];
       if (fixture.bindsWithoutEnv) {
-        expect(() => readGatewayConfig({ [EGRESS_VARIABLE]: name })).not.toThrow();
+        expect(() => readGatewayRuntimeSettings({ [OUTBOX_VARIABLE]: name })).not.toThrow();
         continue;
       }
       let thrown: unknown;
-      try { readGatewayConfig({ [EGRESS_VARIABLE]: name }); } catch (error) { thrown = error; }
-      expect(thrown).toBeInstanceOf(GatewayConfigError);
+      try { readGatewayRuntimeSettings({ [OUTBOX_VARIABLE]: name }); } catch (error) { thrown = error; }
+      expect(thrown).toBeInstanceOf(GatewaySettingsError);
       // 变量名以注册表键机械派生，所以错误信息里一定带这个前缀。
       expect((thrown as Error).message).toContain(`AGENT_IR_${name.toUpperCase()}_`);
     }
   });
 
   it("同一个上游模型 id 只造一次出口实例，不同 id 各造各的", () => {
-    const config = readGatewayConfig(envFor("anthropic"));
-    const first = config.egress.resolve("model-a");
-    expect(config.egress.resolve("model-a")).toBe(first);
-    expect(config.egress.resolve("model-b")).not.toBe(first);
+    const config = readGatewayRuntimeSettings(envFor("anthropic"));
+    const first = config.outbox.resolve("model-a");
+    expect(config.outbox.resolve("model-a")).toBe(first);
+    expect(config.outbox.resolve("model-b")).not.toBe(first);
   });
 
   it("配置表的键与注册表的键完全一致，且每一行绑的是同名那一家", () => {
-    expect(Object.keys(EGRESS_CONFIGS).sort()).toEqual(Object.keys(EGRESS_PROVIDERS).sort());
-    for (const name of EGRESS_NAMES) {
-      expect(EGRESS_CONFIGS[name].name).toBe(name);
-      expect(EGRESS_CONFIGS[name].wire).toBe(EGRESS_PROVIDERS[name].wire);
+    expect(Object.keys(OUTBOX_SELECTIONS).sort()).toEqual(Object.keys(OUTBOX_REGISTRY).sort());
+    for (const name of OUTBOX_NAMES) {
+      expect(OUTBOX_SELECTIONS[name].name).toBe(name);
+      expect(OUTBOX_SELECTIONS[name].wire).toBe(OUTBOX_REGISTRY[name].wire);
     }
   });
 
   it("「按选中出口取对应 options / body」在类型层成立", () => {
     // 写错任何一条，这个文件编译不过 —— 断言发生在 tsc，不在 expect。
-    const anthropicOptions: Equal<EgressOptionsOf<"anthropic">, AnthropicUpstreamOptions> = true;
-    const windsurfOptions: Equal<EgressOptionsOf<"windsurf">, WindsurfEgressOptions> = true;
+    const anthropicOptions: Equal<OutboxOptionsOf<"anthropic">, AnthropicOutboxOptions> = true;
+    const windsurfOptions: Equal<OutboxOptionsOf<"windsurf">, WindsurfOutboxOptions> = true;
     // body 泛型没有被抹平成 string：windsurf 的 wire body 是字节。
-    const windsurfBody: Equal<EgressBodyOf<"windsurf">, Uint8Array> = true;
-    const anthropicBody: Equal<EgressBodyOf<"anthropic">, string> = true;
+    const windsurfBody: Equal<OutboxBodyOf<"windsurf">, Uint8Array> = true;
+    const anthropicBody: Equal<OutboxBodyOf<"anthropic">, string> = true;
     expect([anthropicOptions, windsurfOptions, windsurfBody, anthropicBody]).toEqual([true, true, true, true]);
   });
 });
@@ -183,13 +183,13 @@ describe("出口按配置选，选不中就不起", () => {
 
 describe("修复种类是名单，不是布尔", () => {
   it("缺省：一条都不修", () => {
-    const config = readGatewayConfig(envFor("anthropic"));
+    const config = readGatewayRuntimeSettings(envFor("anthropic"));
     expect(config.repairKinds).toEqual([]);
     expect(Object.keys(config.repairPolicy)).toEqual([]);
   });
 
   it("合法名单：逐条进策略，且键存在即启用（没有 enabled 布尔）", () => {
-    const config = readGatewayConfig(envFor("anthropic", {
+    const config = readGatewayRuntimeSettings(envFor("anthropic", {
       [REPAIR_KINDS_VARIABLE]: "defaultMaxOutputTokens, fillDanglingToolCall",
     }));
     expect(config.repairKinds).toEqual(["defaultMaxOutputTokens", "fillDanglingToolCall"]);
@@ -199,7 +199,7 @@ describe("修复种类是名单，不是布尔", () => {
   });
 
   it("全部合法种类都能被名单接受", () => {
-    const config = readGatewayConfig(envFor("anthropic", {
+    const config = readGatewayRuntimeSettings(envFor("anthropic", {
       [REPAIR_KINDS_VARIABLE]: IR_REPAIR_KINDS.join(","),
     }));
     expect([...config.repairKinds].sort()).toEqual([...IR_REPAIR_KINDS].sort());
@@ -208,18 +208,18 @@ describe("修复种类是名单，不是布尔", () => {
   it("种类拼错：启动失败，且把全部合法值列出来", () => {
     let thrown: unknown;
     try {
-      readGatewayConfig(envFor("anthropic", { [REPAIR_KINDS_VARIABLE]: "defaultMaxTokens" }));
+      readGatewayRuntimeSettings(envFor("anthropic", { [REPAIR_KINDS_VARIABLE]: "defaultMaxTokens" }));
     } catch (error) { thrown = error; }
-    expect(thrown).toBeInstanceOf(GatewayConfigError);
+    expect(thrown).toBeInstanceOf(GatewaySettingsError);
     const message = (thrown as Error).message;
     expect(message).toContain("defaultMaxTokens");
     for (const kind of IR_REPAIR_KINDS) expect(message).toContain(kind);
   });
 
   it("同一种类重复登记：失败而不是静默去重", () => {
-    expect(() => readGatewayConfig(envFor("anthropic", {
+    expect(() => readGatewayRuntimeSettings(envFor("anthropic", {
       [REPAIR_KINDS_VARIABLE]: "dropEmptyTurn,dropEmptyTurn",
-    }))).toThrow(GatewayConfigError);
+    }))).toThrow(GatewaySettingsError);
   });
 });
 
@@ -228,15 +228,15 @@ describe("修复种类是名单，不是布尔", () => {
 describe("模型映射：客户端名 → 上游 id", () => {
   it("命中表：走表里那条", () => {
     const table = readModelRoutingTable({ AGENT_IR_MODEL_MAP: "claude-opus-5=upstream-opus,gpt-5=upstream-gpt" });
-    expect(resolveUpstreamModel(table, "claude-opus-5"))
-      .toEqual({ kind: "routed", upstreamModel: "upstream-opus", via: "table" });
-    expect(resolveUpstreamModel(table, "gpt-5"))
-      .toEqual({ kind: "routed", upstreamModel: "upstream-gpt", via: "table" });
+    expect(resolveOutboxModel(table, "claude-opus-5"))
+      .toEqual({ kind: "routed", outboxModel: "upstream-opus", via: "table" });
+    expect(resolveOutboxModel(table, "gpt-5"))
+      .toEqual({ kind: "routed", outboxModel: "upstream-gpt", via: "table" });
   });
 
   it("不中且未配兜底：拒绝，并把已登记的客户端模型列出来", () => {
     const table = readModelRoutingTable({ AGENT_IR_MODEL_MAP: "claude-opus-5=upstream-opus" });
-    const resolution = resolveUpstreamModel(table, "claude-sonnet-9");
+    const resolution = resolveOutboxModel(table, "claude-sonnet-9");
     expect(resolution.kind).toBe("unrouted");
     if (resolution.kind !== "unrouted") throw new Error("unreachable");
     expect(resolution.knownClientModels).toEqual(["claude-opus-5"]);
@@ -249,31 +249,31 @@ describe("模型映射：客户端名 → 上游 id", () => {
 
   it("兜底 passthrough：原样透传，且透传这件事在结果里留痕", () => {
     const table = readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "passthrough" });
-    expect(resolveUpstreamModel(table, "whatever"))
-      .toEqual({ kind: "routed", upstreamModel: "whatever", via: "passthrough" });
+    expect(resolveOutboxModel(table, "whatever"))
+      .toEqual({ kind: "routed", outboxModel: "whatever", via: "passthrough" });
   });
 
   it("兜底 pinned：统一落到一个上游 id", () => {
     const table = readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "pinned:upstream-only" });
-    expect(resolveUpstreamModel(table, "whatever"))
-      .toEqual({ kind: "routed", upstreamModel: "upstream-only", via: "pinned" });
+    expect(resolveOutboxModel(table, "whatever"))
+      .toEqual({ kind: "routed", outboxModel: "upstream-only", via: "pinned" });
   });
 
   it("缺省：空表 + refuse", () => {
     const table = readModelRoutingTable({});
     expect(table.routes.size).toBe(0);
     expect(table.fallback).toEqual({ kind: "refuse" });
-    expect(resolveUpstreamModel(table, "anything").kind).toBe("unrouted");
+    expect(resolveOutboxModel(table, "anything").kind).toBe("unrouted");
   });
 
   it("非法配置一律启动失败", () => {
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "no-separator" })).toThrow(GatewayConfigError);
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "=upstream" })).toThrow(GatewayConfigError);
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "client=" })).toThrow(GatewayConfigError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "no-separator" })).toThrow(GatewaySettingsError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "=upstream" })).toThrow(GatewaySettingsError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "client=" })).toThrow(GatewaySettingsError);
     // 同一个客户端名两条冲突登记：静默取一个等于替写表的人挑了一个。
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "a=x,a=y" })).toThrow(GatewayConfigError);
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "whatever" })).toThrow(GatewayConfigError);
-    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "pinned:" })).toThrow(GatewayConfigError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_MAP: "a=x,a=y" })).toThrow(GatewaySettingsError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "whatever" })).toThrow(GatewaySettingsError);
+    expect(() => readModelRoutingTable({ AGENT_IR_MODEL_FALLBACK: "pinned:" })).toThrow(GatewaySettingsError);
   });
 });
 
@@ -281,11 +281,11 @@ describe("模型映射：客户端名 → 上游 id", () => {
 
 describe("流守卫策略可配，但默认就是生产标定值", () => {
   it("缺省：逐字段等于 DEFAULT_STREAM_POLICY", () => {
-    expect(readGatewayConfig(envFor("anthropic")).streamPolicy).toEqual(DEFAULT_STREAM_POLICY);
+    expect(readGatewayRuntimeSettings(envFor("anthropic")).streamPolicy).toEqual(DEFAULT_STREAM_POLICY);
   });
 
   it("逐字段覆盖", () => {
-    const config = readGatewayConfig(envFor("anthropic", {
+    const config = readGatewayRuntimeSettings(envFor("anthropic", {
       AGENT_IR_STREAM_PRECOMMIT_TOTAL_MS: "30000",
       AGENT_IR_STREAM_PRECOMMIT_IDLE_MS: "12000",
       AGENT_IR_STREAM_POSTCOMMIT_IDLE_MS: "90000",
@@ -298,17 +298,17 @@ describe("流守卫策略可配，但默认就是生产标定值", () => {
   });
 
   it("提交后静默上限可以显式关掉，且 'none' 与 0 不是一回事", () => {
-    const off = readGatewayConfig(envFor("anthropic", { AGENT_IR_STREAM_POSTCOMMIT_IDLE_MS: "none" }));
+    const off = readGatewayRuntimeSettings(envFor("anthropic", { AGENT_IR_STREAM_POSTCOMMIT_IDLE_MS: "none" }));
     expect(off.streamPolicy.postcommitIdleMs).toBeNull();
-    expect(() => readGatewayConfig(envFor("anthropic", { AGENT_IR_STREAM_POSTCOMMIT_IDLE_MS: "0" })))
-      .toThrow(GatewayConfigError);
+    expect(() => readGatewayRuntimeSettings(envFor("anthropic", { AGENT_IR_STREAM_POSTCOMMIT_IDLE_MS: "0" })))
+      .toThrow(GatewaySettingsError);
   });
 
   it("非整数 / 非正数一律失败", () => {
-    expect(() => readGatewayConfig(envFor("anthropic", { AGENT_IR_STREAM_HEARTBEAT_MS: "5s" })))
-      .toThrow(GatewayConfigError);
-    expect(() => readGatewayConfig(envFor("anthropic", { AGENT_IR_PORT: "-1" })))
-      .toThrow(GatewayConfigError);
+    expect(() => readGatewayRuntimeSettings(envFor("anthropic", { AGENT_IR_STREAM_HEARTBEAT_MS: "5s" })))
+      .toThrow(GatewaySettingsError);
+    expect(() => readGatewayRuntimeSettings(envFor("anthropic", { AGENT_IR_PORT: "-1" })))
+      .toThrow(GatewaySettingsError);
   });
 });
 

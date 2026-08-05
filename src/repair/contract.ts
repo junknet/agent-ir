@@ -16,7 +16,9 @@
  * 新增一种修复的完整动作：在 `IR_REPAIR_KINDS` 里登记一个名字，然后跟着编译错误走完
  * `IRRepairOptionsByKind`（它的选项形状）与 `IR_REPAIR_SPECS`（它的规格与实现）。
  */
-import type { IRCapability, IREgressProfile, IRLoss, IRMandatoryField, IRRequest } from "../ir/types.ts";
+import type {
+  IRCapability, IROutboxProfile, IRLoss, IRMandatoryField, IRRequest,
+} from "../ir/types.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 种类 —— 唯一授权定义
@@ -176,12 +178,12 @@ export const IR_REPAIR_POLICY_NONE: IRRepairPolicy = Object.freeze({});
 export type IRRepairCapabilityGate =
   | { readonly kind: "targetIndependent" }
   | { readonly kind: "repairWhenMissing"; readonly capabilities: readonly IRCapability[] }
-  /** 目标**强制要求**这些字段才修。判据是 `IREgressProfile.mandatory`，不是 supports。 */
+  /** 目标**强制要求**这些字段才修。判据是 `IROutboxProfile.mandatory`，不是 supports。 */
   | { readonly kind: "repairWhenMandatory"; readonly fields: readonly IRMandatoryField[] };
 
 export interface IRRepairInput<K extends IRRepairKind> {
   readonly request: IRRequest;
-  readonly profile: IREgressProfile;
+  readonly profile: IROutboxProfile;
   /** 已与 `defaults` 合并过，字段全部就位。 */
   readonly options: Required<IRRepairOptionsByKind[K]>;
 }

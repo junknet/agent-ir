@@ -1,5 +1,5 @@
 /** SSE 原语。解析与生成各一处，三个协议共用。 */
-import type { CompleteOutboxSseFrameProcessor } from "./ir_message_interception_extensions.ts";
+import type { CompleteOutboxSseFrameInspector } from "./ir_message_interception_extensions.ts";
 
 export interface SseEvent {
   event: string | null;
@@ -14,7 +14,7 @@ export interface SseEvent {
  * 「回答少了一段」，最难查。
  */
 export async function* iterateSse(
-  response: Response, processCompleteSseFrame?: CompleteOutboxSseFrameProcessor,
+  response: Response, inspectCompleteSseFrame?: CompleteOutboxSseFrameInspector,
 ): AsyncGenerator<SseEvent> {
   const body = response.body;
   if (body === null) return;
@@ -43,7 +43,7 @@ export async function* iterateSse(
       const parsed = parseSseLines(pending);
       pending = [];
       if (parsed !== null) {
-        await processCompleteSseFrame?.(parsed);
+        await inspectCompleteSseFrame?.(parsed);
         yield parsed;
       }
     }
@@ -55,7 +55,7 @@ export async function* iterateSse(
     const parsed = parseSseLines(pending);
     pending = [];
     if (parsed !== null) {
-      await processCompleteSseFrame?.(parsed);
+      await inspectCompleteSseFrame?.(parsed);
       yield parsed;
     }
   }
@@ -63,7 +63,7 @@ export async function* iterateSse(
   // 上游没有以空行收尾时，残留的最后一个事件仍然要发出去，不能因为「格式不完美」丢内容。
   const tail = parseSseLines(pending);
   if (tail !== null) {
-    await processCompleteSseFrame?.(tail);
+    await inspectCompleteSseFrame?.(tail);
     yield tail;
   }
 }

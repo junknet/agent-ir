@@ -16,16 +16,16 @@
  */
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
-import { createGeminiCloudCodeUpstream, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createGeminiCloudCodeOutbox, clearThoughtSignatureCache } from "../src/egress/gemini_cloudcode.ts";
+import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
 import { readClientRequestForProtocol } from "../src/ingress/index.ts";
 import { assembleResponse } from "../src/ir/response.ts";
 import { superviseUpstreamStream, DEFAULT_STREAM_POLICY } from "../src/ir/stream_guard.ts";
 import { IR_PROTOCOLS } from "../src/ir/types.ts";
-import type { IREgress, IREvent, IRProtocol, IRRequest, IRWireBody } from "../src/ir/types.ts";
+import type { IROutbox, IREvent, IRProtocol, IRRequest, IRWireBody } from "../src/ir/types.ts";
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 
@@ -36,20 +36,20 @@ function bodyBytes(body: IRWireBody): string {
 }
 
 /** 每次调用都造一个全新的出口实例：实例级状态会在这里现形。 */
-function freshEgresses(): Readonly<Record<string, IREgress<IRWireBody>>> {
+function freshEgresses(): Readonly<Record<string, IROutbox<IRWireBody>>> {
   return {
-    anthropic: createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
-    openai_chat: createChatCompletionsUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
-    openai_responses: createResponsesUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
-    gemini_cloudcode: createGeminiCloudCodeUpstream({
+    anthropic: createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "claude-test" }),
+    openai_chat: createOpenAIChatOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    openai_responses: createOpenAIResponsesOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "gpt-test" }),
+    gemini_cloudcode: createGeminiCloudCodeOutbox({
       model: "gemini-test", accessToken: "ya29.t", project: "p",
       sessionId: "1785856733829", requestIdFactory: () => "agent/1785856733829/1785856733829/d/2",
     }),
-    windsurf: createWindsurfUpstream({ model: "claude-test-high", apiKey: "devin$h.e.s" }),
+    windsurf: createWindsurfOutbox({ model: "claude-test-high", apiKey: "devin$h.e.s" }),
   };
 }
 
-const EGRESS_NAMES = Object.keys(freshEgresses());
+const OUTBOX_NAMES = Object.keys(freshEgresses());
 
 /** 一条尽量宽的请求：文本 / 思考 / 工具调用 / 工具结果 / 图片 / 采样参数全都有。 */
 const RICH_BODY: Readonly<Record<IRProtocol, unknown>> = {
@@ -160,13 +160,13 @@ describe("入口解码：同一份报文连续解两次，产出逐字节相同"
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同", () => {
-  for (const name of EGRESS_NAMES) {
+  for (const name of OUTBOX_NAMES) {
     it(`${name}：同一个实例`, async () => {
       const request = decodeRich("anthropic_messages");
-      const egress = freshEgresses()[name]!;
+      const outbox = freshEgresses()[name]!;
       clearThoughtSignatureCache();
-      const first = await egress.writeUpstreamRequest(request);
-      const second = await egress.writeUpstreamRequest(request);
+      const first = await outbox.writeOutboxRequest(request);
+      const second = await outbox.writeOutboxRequest(request);
       expect(first.ok).toBe(second.ok);
       if (!first.ok || !second.ok) {
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
@@ -181,9 +181,9 @@ describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同"
     it(`${name}：换一个新实例（相同 options）结果也一样 —— 出口不许攒实例级状态`, async () => {
       const request = decodeRich("anthropic_messages");
       clearThoughtSignatureCache();
-      const first = await freshEgresses()[name]!.writeUpstreamRequest(request);
+      const first = await freshEgresses()[name]!.writeOutboxRequest(request);
       clearThoughtSignatureCache();
-      const second = await freshEgresses()[name]!.writeUpstreamRequest(request);
+      const second = await freshEgresses()[name]!.writeOutboxRequest(request);
       expect(first.ok).toBe(second.ok);
       if (first.ok && second.ok) {
         expect(bodyBytes(second.wire.body)).toBe(bodyBytes(first.wire.body));
@@ -194,11 +194,11 @@ describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同"
   it("构造不修改入参 IR —— 构造十次之后 IR 与出发时逐字节相同", async () => {
     const request = decodeRich("anthropic_messages");
     const snapshot = JSON.stringify(request);
-    for (const name of EGRESS_NAMES) {
+    for (const name of OUTBOX_NAMES) {
       clearThoughtSignatureCache();
-      const egress = freshEgresses()[name]!;
-      await egress.writeUpstreamRequest(request);
-      await egress.writeUpstreamRequest(request);
+      const outbox = freshEgresses()[name]!;
+      await outbox.writeOutboxRequest(request);
+      await outbox.writeOutboxRequest(request);
       expect(JSON.stringify(request)).toBe(snapshot);
     }
   });
@@ -219,7 +219,7 @@ describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同"
     };
     const reference = readClientRequestForProtocol("anthropic_messages", simple.anthropic_messages, "tr_same").request;
 
-    for (const name of EGRESS_NAMES) {
+    for (const name of OUTBOX_NAMES) {
       const built: string[] = [];
       for (const protocol of IR_PROTOCOLS) {
         const { request } = readClientRequestForProtocol(protocol, simple[protocol], "tr_same");
@@ -229,7 +229,7 @@ describe("出口构造：同一个 IR 连续构造两次，wire 逐字节相同"
           ...request, traceId: reference.traceId, model: reference.model, intent: reference.intent,
         };
         clearThoughtSignatureCache();
-        const result = await freshEgresses()[name]!.writeUpstreamRequest(aligned);
+        const result = await freshEgresses()[name]!.writeOutboxRequest(aligned);
         expect({ name, protocol, ok: result.ok }).toEqual({ name, protocol, ok: true });
         if (result.ok) built.push(bodyBytes(result.wire.body));
       }
@@ -250,19 +250,19 @@ describe("出口构造：确定性的边界 —— 进程内缓存是唯一的�
   it("清过缓存之后，gemini 的构造是确定的", async () => {
     const request = decodeRich("anthropic_messages");
     clearThoughtSignatureCache();
-    const first = await freshEgresses().gemini_cloudcode!.writeUpstreamRequest(request);
+    const first = await freshEgresses().gemini_cloudcode!.writeOutboxRequest(request);
     clearThoughtSignatureCache();
-    const second = await freshEgresses().gemini_cloudcode!.writeUpstreamRequest(request);
+    const second = await freshEgresses().gemini_cloudcode!.writeOutboxRequest(request);
     expect(first.ok && second.ok).toBe(true);
     if (first.ok && second.ok) expect(bodyBytes(second.wire.body)).toBe(bodyBytes(first.wire.body));
   });
 
   it("另外四个出口没有任何进程内状态：不清缓存也照样逐字节相同", async () => {
     const request = decodeRich("anthropic_messages");
-    for (const name of EGRESS_NAMES) {
+    for (const name of OUTBOX_NAMES) {
       if (name === "gemini_cloudcode") continue;
-      const first = await freshEgresses()[name]!.writeUpstreamRequest(request);
-      const second = await freshEgresses()[name]!.writeUpstreamRequest(request);
+      const first = await freshEgresses()[name]!.writeOutboxRequest(request);
+      const second = await freshEgresses()[name]!.writeOutboxRequest(request);
       if (first.ok && second.ok) {
         expect({ name, same: bodyBytes(second.wire.body) === bodyBytes(first.wire.body) })
           .toEqual({ name, same: true });
@@ -290,7 +290,7 @@ const FOLD_EVENTS: readonly IREvent[] = [
   { kind: "partDelta", index: 2, delta: { kind: "toolInputJson", json: '{"path":' } },
   { kind: "partDelta", index: 2, delta: { kind: "toolInputJson", json: '"/a"}' } },
   { kind: "partEnd", index: 2 },
-  { kind: "loss", loss: { stage: "lift", provider: "anthropic", path: "$.x", kind: "dropped", detail: "d" } },
+  { kind: "loss", loss: { stage: "outbox", outbox: "anthropic", path: "$.x", kind: "dropped", detail: "d" } },
   { kind: "unhandled", rawType: "future_event", raw: { a: 1 } },
   { kind: "usage", usage: { inputTokens: 12, outputTokens: 5, cacheReadTokens: 800 } },
   { kind: "messageStop", reason: "toolUse" },
@@ -381,11 +381,11 @@ describe("语料上的确定性", () => {
     // 取前 60 条即可：确定性是结构性质，跑满 807 × 5 × 2 只是把同一件事重复更多遍。
     for (const entry of corpus.slice(0, 60)) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
-      for (const name of EGRESS_NAMES) {
+      for (const name of OUTBOX_NAMES) {
         clearThoughtSignatureCache();
-        const first = await freshEgresses()[name]!.writeUpstreamRequest(request);
+        const first = await freshEgresses()[name]!.writeOutboxRequest(request);
         clearThoughtSignatureCache();
-        const second = await freshEgresses()[name]!.writeUpstreamRequest(request);
+        const second = await freshEgresses()[name]!.writeOutboxRequest(request);
         expect({ name, trace: entry.traceId, ok: second.ok }).toEqual({ name, trace: entry.traceId, ok: first.ok });
         if (first.ok && second.ok) {
           expect({ name, trace: entry.traceId, same: bodyBytes(second.wire.body) === bodyBytes(first.wire.body) })

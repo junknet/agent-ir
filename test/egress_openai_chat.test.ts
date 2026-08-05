@@ -12,9 +12,11 @@
  * 我对自己的假设。
  */
 import { describe, expect, it } from "bun:test";
-import { createChatCompletionsUpstream } from "../src/egress/openai_chat_completions.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
 import { readAnthropicMessagesRequest } from "../src/ingress/index.ts";
-import { checkUpstreamSupport } from "../src/ir/admission.ts";
+import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
   clientValue, defaultValue,
@@ -24,7 +26,7 @@ import {
 
 const TRACE = "tr-test";
 
-const egress = createChatCompletionsUpstream({
+const outbox = createOpenAIChatOutbox({
   baseUrl: "https://api.openai.com/v1/",
   apiKey: "sk-test",
   model: "gpt-5-mini",
@@ -71,14 +73,14 @@ function findLoss(losses: readonly IRLoss[], fragment: string): IRLoss | undefin
 }
 
 /**
- * `writeUpstreamRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
+ * `writeOutboxRequest` 是**编译或拒绝**的判别联合。成功用例统一从这里剥出 wire ——
  * 万一被拒，失败信息里直接是 problems，而不是一句「wire is undefined」。
  */
 async function compiled(request: IRRequest): Promise<{
   readonly wire: IRWireRequest;
   readonly losses: readonly IRLoss[];
 }> {
-  const built = await egress.writeUpstreamRequest(request);
+  const built = await outbox.writeOutboxRequest(request);
   if (!built.ok) throw new Error(`expected a compiled request, got problems: ${JSON.stringify(built.problems)}`);
   return { wire: built.wire, losses: built.losses };
 }
@@ -88,7 +90,7 @@ async function rejected(request: IRRequest): Promise<{
   readonly problems: readonly IRBuildProblem[];
   readonly losses: readonly IRLoss[];
 }> {
-  const built = await egress.writeUpstreamRequest(request);
+  const built = await outbox.writeOutboxRequest(request);
   if (built.ok) throw new Error(`expected a rejection, got a wire: ${built.wire.body}`);
   return { problems: built.problems, losses: built.losses };
 }
@@ -109,7 +111,7 @@ async function collect(events: AsyncIterable<IREvent>): Promise<IREvent[]> {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("能力声明", () => {
   it("supports 与 lossy 不相交；两个集合都不放的三项是真的表达不了的", () => {
-    const { supports, lossy } = egress.profile;
+    const { supports, lossy } = outbox.profile;
     for (const capability of supports) expect(lossy.has(capability)).toBe(false);
     // 文档、内建工具、工具结果里的图片：降级之后模型看到的东西就少了，只能让准入层拒。
     for (const capability of ["document", "toolBuiltin", "toolResultImage"] as const) {
@@ -136,7 +138,7 @@ describe("能力声明", () => {
         },
       ],
     }, TRACE);
-    const verdict = checkUpstreamSupport(request, egress.profile);
+    const verdict = checkOutboxSupport(request, outbox.profile);
     expect(verdict.admitted).toBe(false);
     expect(verdict.unsupported.map((need) => need.capability)).toContain("toolResultImage");
     const need = verdict.unsupported.find((entry) => entry.capability === "toolResultImage");
@@ -151,7 +153,7 @@ describe("能力声明", () => {
         { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig" }, { type: "text", text: "ok" }] },
       ],
     }, TRACE);
-    const verdict = checkUpstreamSupport(request, egress.profile);
+    const verdict = checkOutboxSupport(request, outbox.profile);
     expect(verdict.admitted).toBe(true);
     expect(verdict.losses.map((loss) => loss.path).length).toBeGreaterThan(0);
   });
@@ -381,8 +383,8 @@ describe("lower：每一处降级都留痕", () => {
 
     const thinkingLoss = findLoss(losses, "its signature has no field at all");
     expect(thinkingLoss?.kind).toBe("dropped");
-    expect(thinkingLoss?.stage).toBe("egress");
-    expect(thinkingLoss?.provider).toBe("openai_chat");
+    expect(thinkingLoss?.stage).toBe("outbox");
+    expect(thinkingLoss?.outbox).toBe("openai_chat");
     expect(thinkingLoss?.path).toBe("$.conversation.turns[1].parts[0]");
     expect(findLoss(losses, "redacted thinking")?.kind).toBe("dropped");
   });
@@ -512,6 +514,47 @@ describe("lower：每一处降级都留痕", () => {
     expect(findLoss(losses, "at most 4 stop sequences")?.kind).toBe("truncated");
   });
 
+  /**
+   * AGENTS.md 要求的「不影响其他 Outbox」的反例。
+   *
+   * 上面那条截断的判据是 **Chat Completions 的 `stop` 只装得下 4 条**，不是「IR 认为
+   * 超过 4 条就该砍」。判据既然是 wire 的，同一条 IR 换个出口就必须是另一种结局 ——
+   * Anthropic 有 `stop_sequences` 且不限 4 条，`/v1/responses` 根本没有这个参数。
+   * 三条路由三种结局，正好把「这是 wire 容量，不是 Core 规则」钉死。
+   */
+  it("特化不外溢：同一条 5 项 stop 换出口是三种结局，截断只属于 Chat 的 wire", async () => {
+    const fiveStops = irRequest({
+      // Anthropic 编不出空 messages，所以这条对照必须带一句真实正文 ——
+      // 要比的是 stop 的三种结局，不是「空会话谁先拒」。
+      conversation: { turns: [{ role: "user", parts: [{ kind: "text", text: "go" }] }] },
+      intent: {
+        stopping: {
+          maxOutputTokens: clientValue(256),
+          stopSequences: clientValue(["a", "b", "c", "d", "e"]),
+        },
+      },
+    });
+
+    const anthropic = createAnthropicOutbox({ baseUrl: "https://api.anthropic.com/", apiKey: "k", model: "m" });
+    const anthropicBuilt = await anthropic.writeOutboxRequest(fiveStops);
+    if (!anthropicBuilt.ok) throw new Error(`expected a compiled request: ${JSON.stringify(anthropicBuilt.problems)}`);
+    // 全 5 条原样送达，一条 loss 都不该有。
+    expect((JSON.parse(anthropicBuilt.wire.body) as Record<string, unknown>).stop_sequences)
+      .toEqual(["a", "b", "c", "d", "e"]);
+    expect(anthropicBuilt.losses.filter((loss) => loss.path === "$.intent.stopping.stopSequences")).toEqual([]);
+
+    const responses = createOpenAIResponsesOutbox({ baseUrl: "https://api.openai.com/v1", apiKey: "k", model: "m" });
+    const responsesBuilt = await responses.writeOutboxRequest(fiveStops);
+    if (!responsesBuilt.ok) throw new Error(`expected a compiled request: ${JSON.stringify(responsesBuilt.problems)}`);
+    const responsesBody = JSON.parse(responsesBuilt.wire.body) as Record<string, unknown>;
+    // Responses 没有 stop 参数：整条丢掉并记 dropped，而不是悄悄截成 4 条。
+    expect(Object.hasOwn(responsesBody, "stop")).toBe(false);
+    expect(Object.hasOwn(responsesBody, "stop_sequences")).toBe(false);
+    expect(responsesBuilt.losses).toContainEqual(expect.objectContaining({
+      path: "$.intent.stopping.stopSequences", kind: "dropped",
+    }));
+  });
+
   it("客户端给了 json_schema.name 就照发", async () => {
     const { wire, losses } = await compiled(irRequest({
       intent: {
@@ -554,7 +597,7 @@ describe("lift：正常流", () => {
   });
 
   it("文本 + 推理 + 工具调用分片累加 + finish_reason + usage", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       first,
       chunk({ content: null, reasoning_content: "let me" }),
       chunk({ content: null, reasoning_content: " think" }),
@@ -615,7 +658,7 @@ describe("lift：正常流", () => {
   });
 
   it("finish_reason=length → maxTokens；[DONE] 本身不是终止信号", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       chunk({ content: "half" }),
       chunk({}, "length"),
     ])));
@@ -627,7 +670,7 @@ describe("lift：正常流", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lift：没匹配上的一律进 unhandled", () => {
   it("未知 delta 字段 / 未知 finish_reason / 认不出形状的 chunk / 非 JSON 帧", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "hi", audio: { id: "a" } }, finish_reason: null }] },
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "recitation" }] },
       { object: "chat.completion.pigeon", model: "m", pigeon: true },
@@ -645,7 +688,7 @@ describe("lift：没匹配上的一律进 unhandled", () => {
   });
 
   it("n>1 的多候选不静默丢", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [
         { index: 0, delta: { content: "a" }, finish_reason: null },
         { index: 1, delta: { content: "b" }, finish_reason: null },
@@ -661,7 +704,7 @@ describe("lift：没匹配上的一律进 unhandled", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("lift：流被截断绝不伪装成成功", () => {
   it("没有 finish_reason 就结束 → error，而不是「200 但空」", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "half a sen" }, finish_reason: null }] },
     ])));
     expect(events.some((event) => event.kind === "messageStop")).toBe(false);
@@ -678,12 +721,12 @@ describe("lift：流被截断绝不伪装成成功", () => {
   });
 
   it("[DONE] 单独收尾同样算截断", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([], { done: true })));
+    const events = await collect(outbox.readOutboxResponse(sse([], { done: true })));
     expect(events.filter((event) => event.kind === "error")).toHaveLength(1);
   });
 
   it("流里插一条 error 帧 → 终止且不再补 transport 错误", async () => {
-    const events = await collect(egress.readUpstreamResponse(sse([
+    const events = await collect(outbox.readOutboxResponse(sse([
       { object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "x" }, finish_reason: null }] },
       { error: { message: "This model's maximum context length is 128000 tokens", type: "invalid_request_error", code: "context_length_exceeded" } },
     ])));
@@ -714,7 +757,7 @@ describe("lift：非流式合成等价事件序列", () => {
       usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
     });
 
-    const events = await collect(egress.readUpstreamResponse(response));
+    const events = await collect(outbox.readOutboxResponse(response));
     expect(events[0]).toEqual({ kind: "messageStart", model: "deepseek-v4-flash" });
     const starts = events.filter(
       (event): event is Extract<IREvent, { kind: "partStart" }> => event.kind === "partStart");
@@ -732,7 +775,7 @@ describe("lift：非流式合成等价事件序列", () => {
   });
 
   it("200 但没有 choices → error，不是空成功", async () => {
-    const events = await collect(egress.readUpstreamResponse(Response.json({ id: "x", object: "chat.completion", choices: [] })));
+    const events = await collect(outbox.readOutboxResponse(Response.json({ id: "x", object: "chat.completion", choices: [] })));
     expect(events.some((event) => event.kind === "messageStop")).toBe(false);
     const error = events.find(
       (event): event is Extract<IREvent, { kind: "error" }> => event.kind === "error");
@@ -740,7 +783,7 @@ describe("lift：非流式合成等价事件序列", () => {
   });
 
   it("200 但 body 不是 JSON（网关错误页）→ transport error", async () => {
-    const events = await collect(egress.readUpstreamResponse(new Response("<html>502</html>", {
+    const events = await collect(outbox.readOutboxResponse(new Response("<html>502</html>", {
       status: 200, headers: { "content-type": "text/html" },
     })));
     expect(events).toHaveLength(1);
@@ -784,13 +827,13 @@ describe("lift：上游 4xx/5xx", () => {
     {
       status: 503,
       payload: { error: { message: "The server is overloaded", type: "server_error", code: null } },
-      kind: "upstreamUnavailable", retryable: true,
+      kind: "outboxUnavailable", retryable: true,
     },
   ];
 
   for (const testCase of cases) {
     it(`${testCase.status} → ${testCase.kind}（retryable=${testCase.retryable}）`, async () => {
-      const events = await collect(egress.readUpstreamResponse(Response.json(testCase.payload, { status: testCase.status })));
+      const events = await collect(outbox.readOutboxResponse(Response.json(testCase.payload, { status: testCase.status })));
       expect(events).toHaveLength(1);
       const event = events[0] as Extract<IREvent, { kind: "error" }>;
       expect(event.kind).toBe("error");
@@ -802,9 +845,9 @@ describe("lift：上游 4xx/5xx", () => {
   }
 
   it("错误 body 不是 JSON（nginx 502 页）也要有正确的 kind", async () => {
-    const events = await collect(egress.readUpstreamResponse(new Response("<html><body>502 Bad Gateway</body></html>", { status: 502 })));
+    const events = await collect(outbox.readOutboxResponse(new Response("<html><body>502 Bad Gateway</body></html>", { status: 502 })));
     const event = events[0] as Extract<IREvent, { kind: "error" }>;
-    expect(event.error.kind).toBe("upstreamUnavailable");
+    expect(event.error.kind).toBe("outboxUnavailable");
     expect(event.error.retryable).toBe(true);
   });
 });

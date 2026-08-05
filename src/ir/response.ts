@@ -11,7 +11,7 @@
  * 不必绕一圈 wire 再 decode 回来。请求与响应至此讲同一种语言。
  */
 import type {
-  IREvent, IRLoss, IRPart, IRResponsePart, IRStopReason, IRTurn, IRUpstreamError, IRUsage,
+  IREvent, IRLoss, IRPart, IRResponsePart, IRStopReason, IRTurn, IROutboxError, IRUsage,
 } from "./types.ts";
 
 export interface IRUnhandledEvent {
@@ -30,7 +30,7 @@ export interface IRResponse {
   /** 上游从未发出终止事件时为 null —— 调用方据此区分「说完了」与「连接断了」。 */
   readonly stopReason: IRStopReason | null;
   readonly usage: IRUsage | null;
-  readonly error: IRUpstreamError | null;
+  readonly error: IROutboxError | null;
   readonly losses: readonly IRLoss[];
   /** 未识别的上游事件。非空即上游协议漂移，不是可以忽略的噪音。 */
   readonly unhandled: readonly IRUnhandledEvent[];
@@ -42,31 +42,52 @@ interface PendingPart {
   toolInputBuffer: string;
 }
 
-function finalizePart(pending: PendingPart): IRResponsePart | null {
+interface FinalizedPart {
+  readonly part: IRResponsePart | null;
+  readonly loss: IRLoss | null;
+}
+
+function finalizePart(pending: PendingPart, index: number): FinalizedPart {
   const { part, toolInputBuffer } = pending;
   switch (part.kind) {
     case "text":
     case "thinking":
     case "redactedThinking":
-      return part;
+      return { part, loss: null };
     case "toolCall": {
-      if (toolInputBuffer.length === 0) return part;
-      // 分片 JSON 拼不回合法对象时保留原文当 freeform 入参，不猜也不丢。
+      if (toolInputBuffer.length === 0) return { part, loss: null };
       try {
         const parsed: unknown = JSON.parse(toolInputBuffer);
         if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return { ...part, call: { ...part.call, input: { kind: "json", value: parsed as Record<string, unknown> } } };
+          return {
+            part: { ...part, call: { ...part.call, input: { kind: "json", value: parsed as Record<string, unknown> } } },
+            loss: null,
+          };
         }
-      } catch { /* 落到下面的 freeform 分支 */ }
-      return { ...part, call: { ...part.call, input: { kind: "text", text: toolInputBuffer } } };
+        return {
+          part: { ...part, call: { ...part.call, input: { kind: "text", text: toolInputBuffer } } },
+          loss: {
+            stage: "outbox", outbox: null, path: `$.response.parts[${index}].call.input`, kind: "degraded",
+            detail: "tool input JSON parsed to a non-object; preserved raw fragments as freeform text",
+          },
+        };
+      } catch {
+        return {
+          part: { ...part, call: { ...part.call, input: { kind: "text", text: toolInputBuffer } } },
+          loss: {
+            stage: "outbox", outbox: null, path: `$.response.parts[${index}].call.input`, kind: "degraded",
+            detail: "tool input JSON could not be parsed; preserved raw fragments as freeform text",
+          },
+        };
+      }
     }
-    // image / document / toolResult / opaque 不属于模型的产出。走到这里说明某个 readUpstreamResponse
+    // image / document / toolResult / opaque 不属于模型的产出。走到这里说明某个 readOutboxResponse
     // 映射错了；在唯一的折叠点丢弃并留痕，好过让每个 encoder 各自 return null。
     case "image":
     case "document":
     case "toolResult":
     case "opaque":
-      return null;
+      return { part: null, loss: null };
   }
 }
 
@@ -84,7 +105,7 @@ export class IRResponseAccumulator {
   #model: string;
   #usage: IRUsage | null = null;
   #stopReason: IRStopReason | null = null;
-  #error: IRUpstreamError | null = null;
+  #error: IROutboxError | null = null;
 
   constructor(fallbackModel: string) {
     this.#model = fallbackModel;
@@ -162,18 +183,19 @@ export class IRResponseAccumulator {
     for (const index of this.#order) {
       const pending = this.#pendingByIndex.get(index);
       if (pending === undefined) continue;
-      const finalized = finalizePart(pending);
-      if (finalized === null) {
+      const finalized = finalizePart(pending, index);
+      if (finalized.loss !== null) this.#losses.push(finalized.loss);
+      if (finalized.part === null) {
         this.#losses.push({
-          stage: "lift",
-          provider: null,
+          stage: "outbox",
+          outbox: null,
           path: `$.response.parts[${index}]`,
           kind: "dropped",
           detail: `'${pending.part.kind}' is not a model output shape and cannot appear in a response`,
         });
         continue;
       }
-      parts.push(finalized);
+      parts.push(finalized.part);
     }
 
     return {

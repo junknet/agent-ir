@@ -9,7 +9,7 @@
 - 上游：<https://github.com/anomalyco/opencode>
 - 固定提交：`f0afb6750e63ee0a60b052914531bde0afb9bc2b`
 - 本地抽取位置：`docs/standards/opencode-openai/`
-- 代码基准：Chat 与 Responses adapter、选项映射及对应 provider tests
+- 代码基准：Chat 与 Responses adapter、选项映射及对应 outbox tests
 - 行为基准：Chat 的文本/工具循环流，以及 Responses 的文本/工具循环/图片工具结果/
   reasoning continuation 录制样本
 - 核心文件 SHA-256：

@@ -1,6 +1,6 @@
 /**
  * 长流容错。**协议中立**：它只操作 `IREvent`，因此一份实现同时覆盖全部出口 ——
- * 这正是把它放在 IR 层而不是每个 provider 各写一遍的理由。
+ * 这正是把它放在 IR 层而不是每个 outbox 各写一遍的理由。
  *
  * 设计来自两处成熟实现的互补，不是推演：
  *
@@ -114,7 +114,7 @@ export async function* superviseUpstreamStream(
         ? policy.heartbeatMs
         : Math.min(policy.heartbeatMs, idleBudget);
 
-      // 上游迭代器可能**抛**而不是 yield：TCP reset、body 读取失败、provider 内部异常。
+      // 上游迭代器可能**抛**而不是 yield：TCP reset、body 读取失败、outbox 内部异常。
       // 失败在这套契约里是**数据不是控制流** —— 异常穿透守卫会让下游在已经收到 200 和
       // 部分字节之后拿不到任何协议内的收尾事件，正是「200 但半截」。
       // 这里把它就地转成 error 事件；提交后尤其重要：那时状态码已经发出去，改不了了。

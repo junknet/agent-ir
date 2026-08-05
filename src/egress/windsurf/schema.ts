@@ -77,7 +77,7 @@ export class WindsurfSchema {
 
 /**
  * 588KB 的 FileDescriptorSet 过一遍 `createFileRegistry` 是重构造（实测数十毫秒）。
- * 每次 `createWindsurfUpstream` 重建一次会在网关热路径上白烧 CPU，
+ * 每次 `createWindsurfOutbox` 重建一次会在网关热路径上白烧 CPU，
  * 而 descriptor 是只读闭包，天然可共享。按路径缓存，不同 fds 各一份。
  */
 const sharedByPath = new Map<string, WindsurfSchema>();

@@ -18,8 +18,8 @@ export type EnvLookup = Readonly<Record<string, string | undefined>>;
  * 配置错误。与运行时错误分开一个类型，是为了让 server 的启动路径能只捕获它、
  * 打印一条干净的运维可读消息，而不是把栈喷到 stderr 上。
  */
-export class GatewayConfigError extends Error {
-  override readonly name = "GatewayConfigError";
+export class GatewaySettingsError extends Error {
+  override readonly name = "GatewaySettingsError";
   constructor(message: string) {
     super(message);
   }
@@ -40,7 +40,7 @@ export function readOptionalText(env: EnvLookup, name: string): string | undefin
 export function readRequiredText(env: EnvLookup, name: string): string {
   const value = lookup(env, name);
   if (value === undefined) {
-    throw new GatewayConfigError(`${name} is required but unset (or empty)`);
+    throw new GatewaySettingsError(`${name} is required but unset (or empty)`);
   }
   return value;
 }
@@ -58,13 +58,13 @@ export function readEnumeratedText<T extends string>(
   const raw = lookup(env, name);
   if (raw === undefined) {
     if (fallback !== null) return fallback;
-    throw new GatewayConfigError(
+    throw new GatewaySettingsError(
       `${name} is required but unset; expected one of: ${allowed.join(", ")}`,
     );
   }
   const found = allowed.find((candidate) => candidate === raw);
   if (found === undefined) {
-    throw new GatewayConfigError(
+    throw new GatewaySettingsError(
       `${name}='${raw}' is not recognised; expected one of: ${allowed.join(", ")}`,
     );
   }
@@ -92,12 +92,12 @@ export function readEnumeratedList<T extends string>(
   for (const item of items) {
     const found = allowed.find((candidate) => candidate === item);
     if (found === undefined) {
-      throw new GatewayConfigError(
+      throw new GatewaySettingsError(
         `${name} contains '${item}', which is not a known value; expected a comma-separated subset of: ${allowed.join(", ")}`,
       );
     }
     if (selected.includes(found)) {
-      throw new GatewayConfigError(`${name} lists '${item}' more than once`);
+      throw new GatewaySettingsError(`${name} lists '${item}' more than once`);
     }
     selected.push(found);
   }
@@ -109,7 +109,7 @@ export function readPositiveInteger(env: EnvLookup, name: string, fallback: numb
   if (raw === undefined) return fallback;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new GatewayConfigError(`${name}='${raw}' is not a positive integer`);
+    throw new GatewaySettingsError(`${name}='${raw}' is not a positive integer`);
   }
   return parsed;
 }
@@ -128,7 +128,7 @@ export function readOptionalDurationMs(
   if (raw === "none") return null;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new GatewayConfigError(`${name}='${raw}' is neither 'none' nor a positive integer of milliseconds`);
+    throw new GatewaySettingsError(`${name}='${raw}' is neither 'none' nor a positive integer of milliseconds`);
   }
   return parsed;
 }

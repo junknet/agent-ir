@@ -4,7 +4,7 @@ import type {
   IRBlob, IRCacheBreakpoint, IREffort, IRLoss, IRPart, IRProtocol, IRSessionIdentity,
   IRToolChoice, IRTurn,
 } from "../ir/types.ts";
-import type { CompleteIRResponseProcessor } from "../ir/ir_message_interception_extensions.ts";
+import type { CompleteIRResponseInterceptor } from "../ir/ir_message_interception_extensions.ts";
 
 /** 出站编码的共用参数。两个 encoder 都要，放这里避免它们互相 import。 */
 export interface EncodeOptions {
@@ -12,14 +12,14 @@ export interface EncodeOptions {
   /** 未识别的上游事件计数回调；网关据此发现协议漂移。 */
   readonly onUnhandled?: (rawType: string, raw: unknown) => void;
   /** 完整 IRResponse 已形成时调用；流式在协议 done/error 字节之前调用。 */
-  readonly processCompleteIRResponse?: CompleteIRResponseProcessor;
+  readonly runCompleteIRResponseInterception?: CompleteIRResponseInterceptor;
 }
 
 export class LossRecorder {
   readonly #losses: IRLoss[] = [];
 
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "ingress", provider: null, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "inbox", outbox: null, ...loss });
   }
 
   drain(): readonly IRLoss[] {
@@ -169,7 +169,7 @@ export function mergeAdjacentTurns(turns: readonly IRTurn[]): IRTurn[] {
  */
 export function normalizeTurns(turns: readonly IRTurn[]): IRTurn[] {
   // 只合并，不丢空。**丢空回合是策略不是解码事实** —— 它已剥离到 repair 层的
-  // `dropEmptyTurn`，由调用方显式选择；Core 把空回合原样交给 egress，
+  // `dropEmptyTurn`，由调用方显式选择；Core 把空回合原样交给 outbox，
   // 由各 wire 按自己的编译事实处置。
   //
   // 为什么不需要「丢空之后再合并一次」：合并的出参恒不含相邻同角色（每个回合

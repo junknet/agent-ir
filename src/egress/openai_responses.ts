@@ -21,18 +21,18 @@
  * 是独立 item，靠 call_id 关联。IR 本来就是这个形态，所以这里不需要 `arrangeToolTurns`
  * 那种位置重排，只需要核对「调用必须有对应输出」这一条上游硬约束。
  *
- * `writeUpstreamRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
- * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
+ * `writeOutboxRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
+ * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `OutboxRequestReport`。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
 import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable,
-  UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
-  IRRequest, IRStopReason, IRTool, IRUpstreamError, IRUsage,
+  IRBuildProblem, IRCapability, IREffort, IROutbox, IROutboxProfile, IREvent, IRLoss, IRMandatoryFieldTable,
+  OutboxRequestBuildResult, IRPart, IRReasoningDisplay,
+  IRRequest, IRStopReason, IRTool, IROutboxError, IRUsage,
 } from "../ir/types.ts";
 
-const PROVIDER = "openai_responses";
+const OUTBOX = "openai_responses";
 
 /**
  * 逐项都核对过真实报文或真实端点行为，没核对上的一律不进这个集合。
@@ -74,7 +74,7 @@ const LOSSY = [
 //                    客户端决定让模型看一句转述。占位是策略（`textualizeUnsupportedDocument`），
 //                    所以这条能力的诚实结论是：这条路线载不动。
 
-export interface ResponsesUpstreamOptions {
+export interface OpenAIResponsesOutboxOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   /** 出站模型名。IR 里的 model 是客户端说的，映射由调用方决定，出口不猜。 */
@@ -94,11 +94,11 @@ export interface ResponsesUpstreamOptions {
  *
  * 拒绝**收集齐再返回**，不短路：调用方一次看全才能一次修完。
  */
-class UpstreamRequestReport {
+class OutboxRequestReport {
   readonly #losses: IRLoss[] = [];
   readonly #problems: IRBuildProblem[] = [];
-  record(loss: Omit<IRLoss, "stage" | "provider">): void {
-    this.#losses.push({ stage: "egress", provider: PROVIDER, ...loss });
+  record(loss: Omit<IRLoss, "stage" | "outbox">): void {
+    this.#losses.push({ stage: "outbox", outbox: OUTBOX, ...loss });
   }
   reject(problem: IRBuildProblem): void {
     this.#problems.push(problem);
@@ -136,7 +136,7 @@ type CallKind = "function" | "custom";
  * `role` 参与判定：assistant 的 content 只接受 `output_text`，图片之类只能出现在输入侧。
  */
 function lowerContentPart(
-  part: IRPart, role: "user" | "assistant" | "developer", path: string, report: UpstreamRequestReport,
+  part: IRPart, role: "user" | "assistant" | "developer", path: string, report: OutboxRequestReport,
 ): WireItem | null {
   switch (part.kind) {
     case "text":
@@ -185,7 +185,7 @@ function lowerContentPart(
 
 /** 工具结果 parts → 输出 item 的 `output`。文本与图片都以 input 内容块原样承载。 */
 function lowerToolOutput(
-  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, report: UpstreamRequestReport,
+  parts: readonly IRPart[], status: "ok" | "error" | "missing", path: string, report: OutboxRequestReport,
 ): Array<WireItem> {
   const blocks: WireItem[] = [];
   parts.forEach((part, index) => {
@@ -223,7 +223,7 @@ function lowerToolOutput(
   return blocks;
 }
 
-function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, report: UpstreamRequestReport): WireItem {
+function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: string, report: OutboxRequestReport): WireItem {
   const { call } = part;
   if (call.input.kind === "text") {
     // freeform 的原生形态。实测 custom_tool_call 的键集是 {type,id,status,call_id,name,input}，
@@ -255,7 +255,7 @@ function lowerToolCallItem(part: Extract<IRPart, { kind: "toolCall" }>, path: st
  * summary-only 的形状从未在真实报文里出现过，赌它能过等于赌整条请求。跨协议进来的
  * Anthropic 签名思考正好落在这一支，丢弃并留痕（codex_provider 的做法也是整段不译）。
  */
-function lowerReasoningRun(run: readonly IRPart[], path: string, report: UpstreamRequestReport): WireItem | null {
+function lowerReasoningRun(run: readonly IRPart[], path: string, report: OutboxRequestReport): WireItem | null {
   const summary: WireItem[] = [];
   let encrypted: string | null = null;
   for (const part of run) {
@@ -286,7 +286,7 @@ interface LoweredConversation {
   readonly items: readonly WireItem[];
 }
 
-function lowerConversation(request: IRRequest, report: UpstreamRequestReport): LoweredConversation {
+function lowerConversation(request: IRRequest, report: OutboxRequestReport): LoweredConversation {
   const { conversation } = request;
   const items: WireItem[] = [];
   const callKinds = new Map<string, CallKind>();
@@ -399,7 +399,7 @@ function lowerConversation(request: IRRequest, report: UpstreamRequestReport): L
 function checkToolPairing(
   callSites: ReadonlyMap<string, string>,
   outputSites: ReadonlyMap<string, string>,
-  report: UpstreamRequestReport,
+  report: OutboxRequestReport,
 ): void {
   for (const [callId, path] of callSites) {
     if (outputSites.has(callId)) continue;
@@ -423,7 +423,7 @@ function checkToolPairing(
   }
 }
 
-function lowerTools(request: IRRequest, report: UpstreamRequestReport): WireItem[] {
+function lowerTools(request: IRRequest, report: OutboxRequestReport): WireItem[] {
   const { toolset } = request.conversation;
 
   const lowerOne = (tool: IRTool, index: number): WireItem => {
@@ -497,7 +497,7 @@ const SUMMARY_WIRE: Readonly<Record<IRReasoningDisplay, string | null>> = {
   hidden: null, summarized: "auto", full: "detailed",
 };
 
-function lowerReasoningConfig(request: IRRequest, report: UpstreamRequestReport): Record<string, unknown> | null {
+function lowerReasoningConfig(request: IRRequest, report: OutboxRequestReport): Record<string, unknown> | null {
   const reasoning = request.intent.reasoning.value;
   if (reasoning.mode === "disabled") {
     report.record({
@@ -557,9 +557,15 @@ function lowerReasoningConfig(request: IRRequest, report: UpstreamRequestReport)
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
 
-export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREgress {
-  const profile: IREgressProfile = {
-    provider: PROVIDER,
+/**
+ * 无已知危害。判据是**没有一条真实拒绝**是内容策略造成的：这家从未因系统提示词的
+ * 内容本身拒过请求（拒绝都来自 wire 层的字段问题，那是 `writeOutboxRequest` 的事）。
+ *
+ * `false` 是一次表态，不是缺省 —— 新增一种危害时编译器会回到这里逼人重新回答。
+ */
+
+export function createOpenAIResponsesOutbox(options: OpenAIResponsesOutboxOptions): IROutbox {
+  const profile: IROutboxProfile = {
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
     mandatory: MANDATORY,
@@ -568,8 +574,8 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
   return {
     profile,
 
-    async writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult> {
-      const report = new UpstreamRequestReport();
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult> {
+      const report = new OutboxRequestReport();
       const { conversation, intent } = request;
       const { instructions, items } = lowerConversation(request, report);
       const tools = lowerTools(request, report);
@@ -676,7 +682,7 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
       };
     },
 
-    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+    readOutboxResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
       return liftResponsesStream(response, readOptions);
     },
   };
@@ -686,7 +692,7 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
 // lift
 // ═══════════════════════════════════════════════════════════════════════════
 
-function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstreamError {
+function mapOutboxError(payload: unknown, httpStatus: number | null): IROutboxError {
   const holder = isRecord(payload) ? payload : {};
   const inner = isRecord(holder.error) ? holder.error : holder;
   const code = asString(inner.code) ?? "";
@@ -694,7 +700,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
   const message = asString(inner.message) ?? (typeof payload === "string" && payload.length > 0 ? payload : "upstream error");
   const tag = `${code} ${type}`.toLowerCase();
 
-  const kind: IRUpstreamError["kind"] =
+  const kind: IROutboxError["kind"] =
     // 一天 126 次的那条：context_length_exceeded 既可能带 4xx 回来，也可能作为流内事件到达。
     tag.includes("context_length_exceeded") || /context.{0,12}length|maximum context|too many tokens/iu.test(message)
       ? "contextLengthExceeded"
@@ -709,7 +715,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
       ? "permissionDenied"
     : tag.includes("server_error") || tag.includes("service_unavailable") || tag.includes("overloaded")
       || (httpStatus !== null && httpStatus >= 500)
-      ? "upstreamUnavailable"
+      ? "outboxUnavailable"
     : tag.includes("invalid_request") || tag.includes("invalid_prompt") || tag.includes("not_found")
       || (httpStatus !== null && httpStatus >= 400 && httpStatus < 500)
       ? "invalidRequest"
@@ -717,7 +723,7 @@ function mapUpstreamError(payload: unknown, httpStatus: number | null): IRUpstre
 
   return {
     kind, httpStatus, message,
-    retryable: kind === "rateLimited" || kind === "upstreamUnavailable",
+    retryable: kind === "rateLimited" || kind === "outboxUnavailable",
     raw: payload,
   };
 }
@@ -871,7 +877,7 @@ async function* liftResponsesStream(
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
-    yield { kind: "error", error: mapUpstreamError(tryParseJson(text) ?? text, response.status) };
+    yield { kind: "error", error: mapOutboxError(tryParseJson(text) ?? text, response.status) };
     return;
   }
 
@@ -886,7 +892,7 @@ async function* liftResponsesStream(
   let sawToolCall = false;
   let started = false;
 
-  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
+  for await (const frame of iterateSse(response, readOptions?.inspectCompleteSseFrame)) {
     const payload = tryParseJson<Record<string, unknown>>(frame.data);
     if (payload === null || !isRecord(payload)) {
       // data 段解析不出 JSON：上游换了编码，或流被截断在半个事件上。丢掉它就等于它从没存在过。
@@ -1066,14 +1072,14 @@ async function* liftResponsesStream(
         const envelope = isRecord(payload.response) ? payload.response : {};
         const usage = usageFrom(envelope.usage);
         if (usage !== null) yield { kind: "usage", usage };
-        yield { kind: "error", error: mapUpstreamError(envelope, null) };
+        yield { kind: "error", error: mapOutboxError(envelope, null) };
         break;
       }
 
       case "error":
         // 上游会在流中途拒绝而不是用 HTTP 状态码，最常见的就是 context_length_exceeded。
         sawTerminal = true;
-        yield { kind: "error", error: mapUpstreamError(payload, null) };
+        yield { kind: "error", error: mapOutboxError(payload, null) };
         break;
 
       // 确实不携带 IR 信息，丢掉是对的，但必须**显式**声明丢，否则和「上游加了新事件、
@@ -1113,17 +1119,17 @@ async function* liftResponsesJson(response: Response): AsyncGenerator<IREvent> {
   const text = await response.text();
   const payload = tryParseJson<Record<string, unknown>>(text);
   if (payload === null || !isRecord(payload)) {
-    yield { kind: "error", error: mapUpstreamError(text, response.status) };
+    yield { kind: "error", error: mapOutboxError(text, response.status) };
     return;
   }
   // 非流式的失败有两种形状：顶层 error 信封，或 status:'failed' + response.error。
   if (isRecord(payload.error)) {
-    yield { kind: "error", error: mapUpstreamError(payload, response.status) };
+    yield { kind: "error", error: mapOutboxError(payload, response.status) };
     return;
   }
   const envelope = isRecord(payload.response) ? payload.response : payload;
   if (asString(envelope.status) === "failed") {
-    yield { kind: "error", error: mapUpstreamError(envelope, response.status) };
+    yield { kind: "error", error: mapOutboxError(envelope, response.status) };
     return;
   }
 

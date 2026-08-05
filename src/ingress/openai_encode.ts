@@ -8,7 +8,7 @@
  */
 import { formatSse } from "../ir/sse.ts";
 import {
-  observeCompleteIRResponseBeforeStreamTermination, processCompleteIRResponse,
+  observeCompleteIRResponseBeforeStreamTermination, runCompleteIRResponseInterception,
 } from "../ir/ir_message_interception_extensions.ts";
 import { inputTokensIncludingCache } from "../ir/types.ts";
 import type {
@@ -32,7 +32,7 @@ function disclose(event: Extract<IREvent, { kind: "error" }>): Disclosure {
     case "quotaExhausted": return { type: "insufficient_quota", code: "insufficient_quota", message: "Upstream quota exhausted.", status: 429 };
     case "contextLengthExceeded": return { type: "invalid_request_error", code: "context_length_exceeded", message: "The conversation exceeds the model context window.", status: 400 };
     case "contentPolicy": return { type: "invalid_request_error", code: "content_policy_violation", message: "The request was rejected by an upstream content policy.", status: 400 };
-    case "upstreamUnavailable": return { type: "server_error", code: "server_error", message: "Upstream is temporarily unavailable.", status: 503 };
+    case "outboxUnavailable": return { type: "server_error", code: "server_error", message: "Upstream is temporarily unavailable.", status: 503 };
     case "transport": return { type: "server_error", code: "upstream_disconnected", message: "The upstream connection failed before completion.", status: 502 };
     case "unknown": return { type: "server_error", code: "server_error", message: "The upstream request failed.", status: 502 };
   }
@@ -185,8 +185,8 @@ export function writeChatCompletionsResponse(
 ): Response | Promise<Response> {
   return request.intent.stream.value
     ? encodeChatStream(
-      options.processCompleteIRResponse === undefined ? events
-        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      options.runCompleteIRResponseInterception === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.runCompleteIRResponseInterception),
       request,
       options,
     )
@@ -218,7 +218,7 @@ function encodeChatStream(events: AsyncIterable<IREvent>, request: IRRequest, op
               if (event.part.kind !== "toolCall") break;
               push({ tool_calls: [{
                 index: state.toolIndex(event.index) ?? 0, id: event.part.call.id, type: "function",
-                function: { name: event.part.call.toolRef.name, arguments: "" },
+                function: { name: chatToolName(event.part.call.toolRef), arguments: "" },
               }] }, null);
               break;
             case "partDelta": {
@@ -273,7 +273,7 @@ async function encodeChatAggregate(
 ): Promise<Response> {
   // 折叠只有一个实现（ir/response.ts）；这里只做 IRResponse → Chat wire 的映射。
   const assembled = await assembleResponse(events, request.model);
-  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
+  await runCompleteIRResponseInterception(assembled, options.runCompleteIRResponseInterception);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {
@@ -314,8 +314,8 @@ export function writeResponsesResponse(
 ): Response | Promise<Response> {
   return request.intent.stream.value
     ? writeClientResponsesStream(
-      options.processCompleteIRResponse === undefined ? events
-        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      options.runCompleteIRResponseInterception === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.runCompleteIRResponseInterception),
       request,
       options,
     )
@@ -450,7 +450,7 @@ async function writeClientResponsesAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
   const assembled = await assembleResponse(events, request.model);
-  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
+  await runCompleteIRResponseInterception(assembled, options.runCompleteIRResponseInterception);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {

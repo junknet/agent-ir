@@ -8,26 +8,28 @@
  * 关键在于**先裁决再发请求**：把表达不了的请求硬塞给上游，得到的是一个语义模糊的
  * 4xx/5xx，客户端无从知道是哪个字段的问题。这里返回的 unsupported 带着精确 IR 路径。
  */
-import type { IRCapabilityNeed, IREgressProfile, IRLoss, IRRequest } from "./types.ts";
+import type { IRCapabilityNeed, IROutboxProfile, IRLoss, IRRequest } from "./types.ts";
 
-export interface UpstreamSupportCheck {
+export interface OutboxSupportCheck {
   readonly admitted: boolean;
   readonly unsupported: readonly IRCapabilityNeed[];
   readonly losses: readonly IRLoss[];
 }
 
-export function checkUpstreamSupport(request: IRRequest, profile: IREgressProfile): UpstreamSupportCheck {
+export function checkOutboxSupport(
+  request: IRRequest, profile: IROutboxProfile, outbox: string | null = null,
+): OutboxSupportCheck {
   const unsupported: IRCapabilityNeed[] = [];
   const losses: IRLoss[] = [];
   for (const need of request.requires) {
     if (profile.supports.has(need.capability)) continue;
     if (profile.lossy.has(need.capability)) {
       losses.push({
-        stage: "egress",
-        provider: profile.provider,
+        stage: "outbox",
+        outbox,
         path: need.paths[0] ?? "$",
         kind: "degraded",
-        detail: `${profile.provider} carries '${need.capability}' only with loss of fidelity`,
+        detail: `selected outbox carries '${need.capability}' only with loss of fidelity`,
       });
       continue;
     }

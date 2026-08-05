@@ -6,12 +6,12 @@
  * Windsurf Connect 三个目标 independently lower。全程不发网络请求。
  */
 import { describe, expect, it } from "bun:test";
-import { createAnthropicUpstream } from "../src/egress/anthropic.ts";
-import { createResponsesUpstream } from "../src/egress/openai_responses.ts";
-import { createWindsurfUpstream } from "../src/egress/windsurf/index.ts";
-import { checkUpstreamSupport } from "../src/ir/admission.ts";
+import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
+import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
+import { createWindsurfOutbox } from "../src/egress/windsurf/index.ts";
+import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { INGRESS_CODECS } from "../src/protocols.ts";
-import { IR_PROTOCOLS, type IRProtocol, type IREgress } from "../src/ir/types.ts";
+import { IR_PROTOCOLS, type IRProtocol, type IROutbox } from "../src/ir/types.ts";
 
 const samples: Record<IRProtocol, unknown> = {
   anthropic_messages: {
@@ -31,29 +31,29 @@ const samples: Record<IRProtocol, unknown> = {
   },
 };
 
-const targets: Record<string, IREgress<string | Uint8Array>> = {
-  anthropic: createAnthropicUpstream({
+const targets: Record<string, IROutbox<string | Uint8Array>> = {
+  anthropic: createAnthropicOutbox({
     baseUrl: "http://127.0.0.1:1", apiKey: "test-key", model: "claude-test",
   }),
-  openai_responses: createResponsesUpstream({
+  openai_responses: createOpenAIResponsesOutbox({
     baseUrl: "http://127.0.0.1:1", apiKey: "test-key", model: "gpt-test",
   }),
-  windsurf: createWindsurfUpstream({
+  windsurf: createWindsurfOutbox({
     server: "http://127.0.0.1:1", apiKey: "test-key", model: "claude-test",
   }),
 };
 
 describe("三入口 × Anthropic / Responses / Windsurf 编译矩阵", () => {
   for (const protocol of IR_PROTOCOLS) {
-    for (const [targetName, egress] of Object.entries(targets)) {
+    for (const [targetName, outbox] of Object.entries(targets)) {
       it(`${protocol} -> ${targetName}`, async () => {
         const { request } = INGRESS_CODECS[protocol].readClientRequest(
           samples[protocol], `matrix-${protocol}-${targetName}`,
         );
-        const verdict = checkUpstreamSupport(request, egress.profile);
+        const verdict = checkOutboxSupport(request, outbox.profile);
         expect(verdict.admitted).toBe(true);
 
-        const lowered = await egress.writeUpstreamRequest(request);
+        const lowered = await outbox.writeOutboxRequest(request);
         expect(lowered.ok).toBe(true);
         if (!lowered.ok) return;
         expect(lowered.wire.method).toBe("POST");

@@ -110,7 +110,7 @@ function decodeBlock(block: unknown, path: string, losses: LossRecorder): IRPart
     }
 
     default:
-      // 不认识的块**不丢**：装箱后由 egress 显式处置。丢在这里等于让所有出口都失去选择权。
+      // 不认识的块**不丢**：装箱后由 outbox 显式处置。丢在这里等于让所有出口都失去选择权。
       losses.record({
         path, kind: "degraded",
         detail: `unmodelled Anthropic content block '${String(block.type)}' boxed as opaque`,
