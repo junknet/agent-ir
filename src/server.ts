@@ -232,7 +232,7 @@ export function createGatewayRequestResponder(
       outboxResponse = await fetch(lowered.wire.url, {
         method: lowered.wire.method,
         headers: lowered.wire.headers,
-        body: lowered.wire.body,
+        body: lowered.wire.body as unknown as BodyInit,
         signal: httpRequest.signal,
       });
     } catch (error) {

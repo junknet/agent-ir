@@ -114,6 +114,22 @@ flowchart TB
 
 因此 `IRWireRequest` 对 body 泛型：`IRWireRequest<TBody extends IRWireBody>`（`IRWireBody = string | Uint8Array`）。二进制 wire 保留原始字节，绝不 base64 化。
 
+### 3.1 两个**故意不是** `IROutbox` 的东西
+
+`IROutbox` 这个公共契约只描述「一条能被 fetch 发出去的 POST wire」。有两样真实存在、也确实
+在跑的东西不满足这个形状，它们各自住在自己的模块里，**没有**为了收编它们去松动公共契约：
+
+| | 源码 | 为什么不能是 `IROutbox` |
+|---|---|---|
+| **ChatGPT Codex 私有 Responses** | `src/egress/codex/` | 传输是 WebSocket `response.create` 帧，不是 POST；续轮靠 `previous_response_id`，工具定义放在 `input` 的 `additional_tools` item 里。收编它就得给 Core 加一层只服务它一家的运输抽象 |
+| **Windsurf 的 `web_search` 执行器** | `src/egress/windsurf/web_search.ts` | 它不是「把 IR 编译成 wire」，而是**执行一个工具**：`GetChatMessage` 只把 `web_search` 当普通 function tool 发下去，真实客户端在模型返回该调用后另行调 `GetWebSearchResults`，再把结果当普通 `IRToolResult` 回灌。这是宿主工具循环的事，不是协议翻译 |
+
+两者都复用已有件而不是复制语义：codex 把 WebSocket 文本消息里的 JSON payload 直接喂给既有的
+Responses event lifter；web_search 的产物是普通 `IRToolResult`，不新增任何 IR 概念。
+
+注意 `webfetch`：真实客户端把它和 `web_search` 一样声明成普通 function tool，但抓包里
+**没有它的执行报文**，所以本仓库不实现它 —— 没有证据的东西不写。
+
 两条踩过的坑：
 - **CloudCode 用 CRLF 分帧**。按 `indexOf("\n\n")` 找边界会把整条流攒成一个 block，症状不是报错是**内容凭空消失**。正确做法是逐行扫描 + 空行分帧（与官方 SDK 一致）。
 - **Windsurf 的应用错误在 Connect 尾帧里，没有 HTTP 状态码**。传输层是 200，`permission_denied` 落进资源重试会打遍账号池、伪装成 503。这条坑本身照旧成立（它说的是**错误往哪放**），但**别把它读成「为什么被拒」** —— 见下。
@@ -266,7 +282,10 @@ flowchart TB
 | SSE 分帧 | `src/ir/sse.ts` |
 | IRMessage 审计 interceptor chain | `src/ir/ir_message_interception_extensions.ts` |
 | 三个 Inbox codec | `src/ingress/**` |
-| 六个 Outbox | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
+| 六个 Outbox（`OUTBOX_REGISTRY`） | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
+| Codex WebSocket 适配（**不是** `IROutbox`，见 §3.1） | `src/egress/codex/` |
+| Windsurf `web_search` 执行器（**不是** `IROutbox`，见 §3.1） | `src/egress/windsurf/web_search.ts` |
+| Windsurf 真实报文夹具（12 条，全部 200） | `test/fixtures/windsurf_capture/` |
 | 出口选择（`OUTBOX_SELECTIONS`） | `src/gateway/outbox_selection.ts` |
 | 网关唯一装配点（`readGatewayRuntimeSettings`） | `src/gateway/config.ts` |
 | repair（可选层） | `src/repair/**` |

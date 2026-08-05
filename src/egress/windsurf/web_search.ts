@@ -145,7 +145,9 @@ export async function executeWindsurfWebSearch(
   fetchImplementation: typeof fetch = fetch,
 ): Promise<readonly WindsurfWebSearchDocument[]> {
   const wire = await createWindsurfWebSearchWireRequest(query, options);
-  const response = await fetchImplementation(wire.url, { method: "POST", headers: wire.headers, body: wire.body });
+  const response = await fetchImplementation(wire.url, {
+    method: "POST", headers: wire.headers, body: wire.body as unknown as BodyInit,
+  });
   if (!response.ok) throw new Error(`Windsurf web search returned HTTP ${response.status}`);
   return readWindsurfWebSearchDocuments(new Uint8Array(await response.arrayBuffer()), options);
 }
