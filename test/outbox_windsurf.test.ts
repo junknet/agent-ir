@@ -92,7 +92,7 @@ function simpleRequest(overrides: Partial<Parameters<typeof request>[0]> = {}): 
   });
 }
 
-function expectOk(result: OutboxRequestBuildResult<Uint8Array>): Extract<OutboxRequestBuildResult<Uint8Array>, { ok: true }> {
+function expectOk(result: OutboxRequestBuildResult<Uint8Array<ArrayBuffer>>): Extract<OutboxRequestBuildResult<Uint8Array<ArrayBuffer>>, { ok: true }> {
   if (!result.ok) {
     throw new Error(`expected ok build, got problems: ${JSON.stringify(result.problems)}`);
   }
@@ -100,7 +100,7 @@ function expectOk(result: OutboxRequestBuildResult<Uint8Array>): Extract<OutboxR
 }
 
 /** 解回出站的 GetChatMessageRequest —— 断言的是真字节，不是构造它的那个对象。 */
-function decodeWire(result: OutboxRequestBuildResult<Uint8Array>): Record<string, any> {
+function decodeWire(result: OutboxRequestBuildResult<Uint8Array<ArrayBuffer>>): Record<string, any> {
   const wire = expectOk(result).wire;
   expect(wire.body).toBeInstanceOf(Uint8Array);
   const framed = wire.body as Uint8Array;

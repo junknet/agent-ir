@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Protocol-neutral IR for multi-protocol LLM gateways: ingress decode -> IR -> egress lower/lift.",
+  "description": "Protocol-neutral IR for multi-protocol LLM gateways: read inbox request -> IR -> write outbox request.",
   "scripts": {
     "dev": "bun run src/main.ts",
     "test": "bun test",
@@ -16,8 +16,8 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./egress/windsurf": "./src/egress/windsurf/index.ts",
-    "./egress/windsurf/web-search": "./src/egress/windsurf/web_search.ts"
+    "./outbox/windsurf": "./src/outbox/windsurf/index.ts",
+    "./outbox/windsurf/web-search": "./src/outbox/windsurf/web_search.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.2.3",

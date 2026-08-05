@@ -11,7 +11,7 @@ import { createOpenAIResponsesOutbox } from "../src/outbox/openai_responses.ts";
 import { createWindsurfOutbox } from "../src/outbox/windsurf/index.ts";
 import { checkOutboxSupport } from "../src/ir/admission.ts";
 import { INBOX_CODECS } from "../src/protocols.ts";
-import { IR_PROTOCOLS, type IRProtocol, type IROutbox } from "../src/ir/types.ts";
+import { IR_PROTOCOLS, type IRProtocol, type IROutbox, type IRWireBody } from "../src/ir/types.ts";
 
 const samples: Record<IRProtocol, unknown> = {
   anthropic_messages: {
@@ -31,7 +31,7 @@ const samples: Record<IRProtocol, unknown> = {
   },
 };
 
-const targets: Record<string, IROutbox<string | Uint8Array>> = {
+const targets: Record<string, IROutbox<IRWireBody>> = {
   anthropic: createAnthropicOutbox({
     baseUrl: "http://127.0.0.1:1", apiKey: "test-key", model: "claude-test",
   }),

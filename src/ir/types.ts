@@ -472,7 +472,7 @@ export interface ClientRequestReadResult {
   readonly losses: readonly IRLoss[];
 }
 
-export type IRWireBody = string | Uint8Array;
+export type IRWireBody = string | Uint8Array<ArrayBuffer>;
 
 export interface IRWireRequest<TBody extends IRWireBody = string> {
   readonly url: string;

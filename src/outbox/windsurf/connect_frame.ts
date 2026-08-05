@@ -32,7 +32,8 @@ export const CONNECT_FLAG_END_STREAM = 0b10;
 export const CONNECT_FRAME_HEADER_BYTES = 5;
 
 /** 单条消息 → 一个 flag=0 的数据帧。请求侧只用得到这一种。 */
-export function enframe(message: Uint8Array): Uint8Array {
+/** 产物由 `new Uint8Array(len)` 构造，因此后端确定是 `ArrayBuffer`（`IRWireBody` 要求）。 */
+export function enframe(message: Uint8Array): Uint8Array<ArrayBuffer> {
   const framed = new Uint8Array(CONNECT_FRAME_HEADER_BYTES + message.length);
   const view = new DataView(framed.buffer);
   view.setUint8(0, 0);

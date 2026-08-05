@@ -816,7 +816,7 @@ function checkToolPairing(request: IRRequest, problems: OutboxRequestProblems): 
  */
 const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
 
-export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<Uint8Array> {
+export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<Uint8Array<ArrayBuffer>> {
   const profile: IROutboxProfile = {
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
@@ -836,7 +836,7 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
   return {
     profile,
 
-    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult<Uint8Array>> {
+    async writeOutboxRequest(request: IRRequest): Promise<OutboxRequestBuildResult<Uint8Array<ArrayBuffer>>> {
       const losses = new OutboxRequestLosses();
       const problems = new OutboxRequestProblems();
       const ctx: LowerContext = { losses, problems };

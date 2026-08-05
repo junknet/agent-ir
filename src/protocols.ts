@@ -105,7 +105,7 @@ const geminiCloudCodeOutbox: IROutboxDescriptor<GeminiCloudCodeOutboxOptions> = 
  * Windsurf/Devin 的统一模型网关。模型家族由 `chat_model_uid` 选择，wire 始终是
  * ConnectRPC + Protobuf，因此它是一个出口而不是新的客户端入口协议。
  */
-const windsurfOutbox: IROutboxDescriptor<WindsurfOutboxOptions, Uint8Array> = {
+const windsurfOutbox: IROutboxDescriptor<WindsurfOutboxOptions, Uint8Array<ArrayBuffer>> = {
   name: "windsurf",
   wire: "connectrpc_protobuf_stream",
   create: createWindsurfOutbox,

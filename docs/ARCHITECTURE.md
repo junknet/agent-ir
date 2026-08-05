@@ -322,7 +322,7 @@ type OutboxRequestBuildResult<TBody> =
 判别联合而不是抛异常：**失败是正常返回值之一，调用方必须表态。**
 两个分支都带 `losses` —— 拒绝之前已经攒下的留痕一并交出，不因为拒绝就丢掉。
 
-留痕本身也带方向：`IRLoss.stage` 的三个取值是 `inbox` / `outbox` / `lift`，
+留痕本身也带方向：`IRLoss.stage` 只有 `inbox` / `outbox` 两个取值，
 `IRLoss.outbox` 记下是哪一家出口产生的（inbox 阶段为 `null`）。
 
 划线判据 —— 遇到「目标承载不了」时怎么办：

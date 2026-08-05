@@ -48,7 +48,14 @@ export interface WindsurfWebSearchClientOptions {
 export interface WindsurfWebSearchWireRequest {
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
-  readonly body: Uint8Array;
+  /**
+   * 与 `IRWireBody` 同一约束：后端必须是 `ArrayBuffer`。
+   *
+   * 裸 `Uint8Array` 在 TS 5.7 之后默认是 `Uint8Array<ArrayBufferLike>`，而 DOM lib 的
+   * `BodyInit` 只收 `ArrayBuffer` 后端的视图 —— 宿主仓库若开了 `lib: ["DOM"]`，
+   * 裸类型会在 `fetch` 调用处编译失败。写死后端即可，产物本来就是 ArrayBuffer 背的。
+   */
+  readonly body: Uint8Array<ArrayBuffer>;
 }
 
 function resolveValueSource<T>(source: ValueSource<T>): T | Promise<T> {

@@ -173,7 +173,7 @@ describe("出口按配置选，选不中就不起", () => {
     const anthropicOptions: Equal<OutboxOptionsOf<"anthropic">, AnthropicOutboxOptions> = true;
     const windsurfOptions: Equal<OutboxOptionsOf<"windsurf">, WindsurfOutboxOptions> = true;
     // body 泛型没有被抹平成 string：windsurf 的 wire body 是字节。
-    const windsurfBody: Equal<OutboxBodyOf<"windsurf">, Uint8Array> = true;
+    const windsurfBody: Equal<OutboxBodyOf<"windsurf">, Uint8Array<ArrayBuffer>> = true;
     const anthropicBody: Equal<OutboxBodyOf<"anthropic">, string> = true;
     expect([anthropicOptions, windsurfOptions, windsurfBody, anthropicBody]).toEqual([true, true, true, true]);
   });
