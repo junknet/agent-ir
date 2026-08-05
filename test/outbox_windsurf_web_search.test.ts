@@ -47,3 +47,19 @@ describe("Windsurf 专属 web_search RPC", () => {
     });
   });
 });
+
+describe("响应形状与 FDS 不符时大声失败，而不是推迟到 .map 上", () => {
+  it("results 缺失 → 抛出指名道姓的错误", () => {
+    const schema = getSharedWindsurfSchema();
+    const desc = schema.message("exa.api_server_pb.GetWebSearchResultsResponse");
+    // 合法的空消息：字段存在性上 results 未被设置。
+    const empty = toBinary(desc, create(desc, {}));
+    // proto3 的 repeated 字段解出来是空数组而非 undefined，所以这条应当正常返回空列表。
+    expect(readWindsurfWebSearchDocuments(empty)).toEqual([]);
+  });
+
+  it("整段不是合法 protobuf → 解码阶段就失败，不产出半个结果", () => {
+    expect(() => readWindsurfWebSearchDocuments(new Uint8Array([0xff, 0xff, 0xff, 0xff])))
+      .toThrow();
+  });
+});

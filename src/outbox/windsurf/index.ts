@@ -429,13 +429,25 @@ function dropWindsurfBlockedSegments(
   prefixes: readonly string[],
 ): { readonly text: string; readonly dropped: readonly WindsurfDroppedSegment[] } {
   if (prefixes.length === 0 || systemText.length === 0) return { text: systemText, dropped: [] };
+  const segments = systemText.split("\n\n");
   const dropped: WindsurfDroppedSegment[] = [];
-  const kept = systemText.split("\n\n").filter((segment) => {
-    const hit = prefixes.find((prefix) => segment.trimStart().startsWith(prefix));
-    if (hit === undefined) return true;
+  const kept: string[] = [];
+  // 命中 `# 标题` 前缀时，丢弃整个 markdown 小节（直到下一个 `# ` 段），而不只是标题那一段。
+  // 段是按空行切的，而一个小节里有没有空行取决于它当下的写法：`# Environment` 眼下恰好没有，
+  // `# Scratchpad Directory` 就被切成了五段。只丢首段的话，小节里加一个空行就会漏掉后半截。
+  let draining: string | null = null;
+  for (const segment of segments) {
+    const head = segment.trimStart();
+    if (draining !== null) {
+      // 下一个一级标题结束这次丢弃；`# ` 之外的续段仍属于被丢的小节。
+      if (head.startsWith("# ")) draining = null;
+      else { dropped.push({ prefix: draining, characters: segment.length }); continue; }
+    }
+    const hit = prefixes.find((prefix) => head.startsWith(prefix));
+    if (hit === undefined) { kept.push(segment); continue; }
     dropped.push({ prefix: hit, characters: segment.length });
-    return false;
-  });
+    if (hit.startsWith("# ")) draining = hit;
+  }
   return { text: kept.join("\n\n"), dropped };
 }
 

@@ -112,6 +112,11 @@ export async function createWindsurfWebSearchWireRequest(
   };
 }
 
+/** 动态 schema 解出来的消息只能按 record 验形。 */
+function isWebSearchRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 /** 仅提升抓包实际返回的四个字段；不把未实证的 chunks/image/dom_tree 偷渡进通用 IR。 */
 export function readWindsurfWebSearchDocuments(
   body: Uint8Array,
@@ -119,12 +124,21 @@ export function readWindsurfWebSearchDocuments(
 ): readonly WindsurfWebSearchDocument[] {
   const responseDescriptor = getSharedWindsurfSchema(options.fdsPath)
     .message("exa.api_server_pb.GetWebSearchResultsResponse");
-  const response = fromBinary(responseDescriptor, body) as unknown as { results: readonly Record<string, unknown>[] };
-  return response.results.map((item) => ({
-    documentId: String(item.documentId ?? ""),
-    url: String(item.url ?? ""),
-    title: String(item.title ?? ""),
-    summary: String(item.summary ?? ""),
+  // schema 是运行时从 FDS 加载的，`fromBinary` 因此没有静态形状。落到 `unknown` 再显式验形，
+  // 不写 `as unknown as {…}`：那种断言零运行时检查，上游哪天不发 `results`，
+  // 报错会推迟到 `.map` 上变成一句无处可查的 TypeError。
+  const decoded: unknown = fromBinary(responseDescriptor, body);
+  const results = isWebSearchRecord(decoded) ? decoded["results"] : undefined;
+  if (!Array.isArray(results)) {
+    throw new Error(
+      "Windsurf GetWebSearchResultsResponse 缺少 results 数组 —— 上游响应形状与 FDS 不符",
+    );
+  }
+  return results.filter(isWebSearchRecord).map((item) => ({
+    documentId: String(item["documentId"] ?? ""),
+    url: String(item["url"] ?? ""),
+    title: String(item["title"] ?? ""),
+    summary: String(item["summary"] ?? ""),
   }));
 }
 

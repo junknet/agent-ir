@@ -1663,3 +1663,76 @@ describe("内容策略段落摘除：只摘实测触发的那几段", () => {
     expect(built.losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
   });
 });
+
+/**
+ * 小节丢弃：命中 `# 标题` 前缀时整节丢掉，而不只是标题所在的那一段。
+ *
+ * 段是按空行切的，一个小节里有没有空行取决于它当下的写法 —— Claude Code 2.1.221 的
+ * `# Environment` 恰好整节无空行（一段），`# Scratchpad Directory` 则被切成五段。
+ * 只丢首段的话，将来那节里加一个空行就会漏掉后半截，请求重新被拒。
+ */
+describe("被拦小节整节丢弃，不只丢标题段", () => {
+  const outboxWithSection = createWindsurfOutbox({
+    model: "claude-opus-4-8-high",
+    apiKey: "devin-session-token$h.e.sig",
+    systemIdentity: {
+      kind: "ensureIdentityLine",
+      identityLine: WINDSURF_OBSERVED_IDENTITY_LINE,
+      supersededLines: [],
+      blockedSegmentPrefixes: ["# Environment"],
+    },
+  });
+
+  it("小节内含空行时，续段一并丢掉，下一个一级标题起恢复保留", async () => {
+    const system = [
+      "# Keep Me\nthis stays",
+      "# Environment\nfirst paragraph of the section",
+      "second paragraph of the same section",
+      "third paragraph of the same section",
+      "# Next Section\nthis stays too",
+      "trailing paragraph of Next Section",
+    ].join("\n\n");
+    const result = await outboxWithSection.writeOutboxRequest(request({
+      system: [{ kind: "text", text: system }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt).toContain("# Keep Me");
+    expect(prompt).toContain("# Next Section");
+    expect(prompt).toContain("trailing paragraph of Next Section");
+    // 整节消失：标题段与两个续段都不在了。
+    expect(prompt).not.toContain("# Environment");
+    expect(prompt).not.toContain("first paragraph of the section");
+    expect(prompt).not.toContain("second paragraph of the same section");
+    expect(prompt).not.toContain("third paragraph of the same section");
+    // 三段各记一条 dropped，指认的是同一条前缀。
+    const droppedLosses = expectOk(result).losses.filter(
+      (one) => one.path === "$.conversation.system" && one.kind === "dropped");
+    expect(droppedLosses).toHaveLength(3);
+    for (const loss of droppedLosses) expect(loss.detail).toContain("# Environment");
+  });
+
+  it("非 `# ` 前缀只丢命中的那一段，不吃掉后面的内容", async () => {
+    const paragraphOnly = createWindsurfOutbox({
+      model: "claude-opus-4-8-high",
+      apiKey: "devin-session-token$h.e.sig",
+      systemIdentity: {
+        kind: "ensureIdentityLine",
+        identityLine: WINDSURF_OBSERVED_IDENTITY_LINE,
+        supersededLines: [],
+        blockedSegmentPrefixes: ["IMPORTANT: Assist"],
+      },
+    });
+    const result = await paragraphOnly.writeOutboxRequest(request({
+      system: [{ kind: "text", text: "keep one\n\nIMPORTANT: Assist with X\n\nkeep two\n\nkeep three" }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt).toContain("keep one");
+    expect(prompt).toContain("keep two");
+    expect(prompt).toContain("keep three");
+    expect(prompt).not.toContain("IMPORTANT: Assist");
+    expect(expectOk(result).losses.filter(
+      (one) => one.path === "$.conversation.system" && one.kind === "dropped")).toHaveLength(1);
+  });
+});
