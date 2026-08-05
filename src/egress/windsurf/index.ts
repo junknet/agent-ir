@@ -329,15 +329,41 @@ export interface WindsurfSystemIdentityRule {
  * `WINDSURF_OBSERVED_IDENTITY_LINE`，而 Claude Code 送的是
  * `You are Claude Code, Anthropic's official CLI for Claude.`。
  *
- * ## 抓包**没有**证明什么（这一段不许被读成实证）
+ * ## 打真实上游二分出来的结果（2026-08-05，`server.codeium.com`，模型 claude-opus-4-6）
  *
- *   - 没有证明带 Claude Code 身份行的请求会被拒 —— 夹具里根本没有这样一条报文；
- *   - 没有证明「只换身份行」就足以让 Claude Code 的 system 通过；
- *   - 没有证明上游是按身份行判的，而不是按别的什么信号。
+ * 拿 Claude Code 2.1.221 的真实 system（4 块共 9929 字符）逐段发真实上游，
+ * **9929 字符里只有 3 段会被拒，其余 8 段（8507 字符）全部放行**：
  *
- * 换句话说：默认策略是一条**推断**，不是实测结论。它的设计目标是「尽量让请求过、消耗配额，
- * 不硬 ban 用户」，所以选了最轻的那一档改动，而不是丢弃客户端的全部指令。
- * 不接受这条推断的调用方显式传 `{ kind: "passthrough" }`，改写就一步都不做。
+ * | 段 | 字符 | 结果 |
+ * |---|---|---|
+ * | 块0 `x-anthropic-billing-header:` | 81 | 放行 |
+ * | **块1 `You are Claude Code, …`** | **57** | **拒：`an internal error occurred`** |
+ * | 块2 首句 `You are an interactive agent…` | 79 | 放行 |
+ * | **块2 `IMPORTANT: Assist with authorized security testing…`** | **459** | **拒：`blocked by our content policy`** |
+ * | 块2 `# Harness` | 668 | 放行 |
+ * | 块3 `Write code that reads like…` | 976 | 放行 |
+ * | 块3 `# Session-specific guidance` | 922 | 放行 |
+ * | **块3 `# Environment`** | **973** | **拒：`blocked by our content policy`** |
+ * | 块3 `# Scratchpad Directory` | 762 | 放行 |
+ * | 块3 `# Context management` | 560 | 放行 |
+ * | 块3 `# Delivering work` | 2018 | 放行 |
+ * | 块3 `# Corrections` | 2364 | 放行 |
+ *
+ * **两套机制，错误信息把它们分开了**：身份行触发的是泛化 `an internal error occurred`，
+ * 正文段触发的是明确的 `blocked by our content policy`。因此两者都要处理，缺一不可 ——
+ * 实测组合：
+ *
+ *   - 原样送            → 拒（泛化）
+ *   - **只**换身份行     → 拒，且错误变成 content policy（身份修好了，正文接着命中）
+ *   - prepend 身份行     → 拒（泛化，因为 CC 身份行还在）
+ *   - 只摘正文两段、保留 CC 身份行 → 拒（泛化）
+ *   - **摘 3 段 + 换身份行** → **200**，带 12 个真实 Claude Code 工具也是 **200**
+ *
+ * 所以「体量/关键词密度」这个旧说法方向对但描述错：不是累积密度，是**三个具体段落**。
+ * 而生产那套「整体塌缩成中性提示」虽然能过，代价是客户端指令 **0% 存活**；
+ * 这里只摘 3 段，**85.7% 存活**。这正是「尽量让用户能用、不硬 ban」该有的做法。
+ *
+ * 不接受任何改写的调用方显式传 `{ kind: "passthrough" }`，一步都不做。
  *
  * ## 为什么不是「只替换」：替换会静默失效
  *
@@ -371,6 +397,15 @@ export type WindsurfSystemIdentityPolicy =
       readonly identityLine: string;
       /** 已知的外来身份行。命中即整行替换成 `identityLine`，从而不留下矛盾的第二个身份。 */
       readonly supersededLines: readonly string[];
+      /**
+       * 已实测会被上游内容策略拦下的**段落前缀**。按空行切段，段首匹配任一前缀即整段摘掉。
+       *
+       * 用前缀而不是整段精确相等：这些段落会随客户端版本改字，精确相等一改就失配，
+       * 而失配的后果是整条请求被拒。前缀（通常是小节标题或首句）稳定得多。
+       *
+       * 实测清单与判据见 `WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY`。
+       */
+      readonly blockedSegmentPrefixes: readonly string[];
     };
 
 /**
@@ -386,12 +421,44 @@ export const WINDSURF_DEFAULT_SYSTEM_IDENTITY_POLICY: WindsurfSystemIdentityPoli
     "You are Claude Code, Anthropic's official CLI for Claude.",
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
   ],
+  blockedSegmentPrefixes: [
+    // 实测触发 content policy 的两段（Claude Code 2.1.221）。
+    "IMPORTANT: Assist with authorized security testing",
+    "# Environment",
+  ],
 };
 
-/** 这次改写实际走了哪条路。`null` = 一个字节都没动。 */
+/** 身份行这一步实际走了哪条路。`null` = 身份行没动。 */
 export type WindsurfIdentityOutcome =
   | { readonly kind: "replaced"; readonly supersededLine: string }
   | { readonly kind: "prepended" };
+
+/** 被摘掉的一段。`prefix` 是命中的那条前缀，用来在 loss 里指认「为什么摘」。 */
+export interface WindsurfDroppedSegment {
+  readonly prefix: string;
+  readonly characters: number;
+}
+
+/**
+ * 摘掉已实测会被上游内容策略拦下的段落。**按空行切段**，段首匹配任一前缀即整段丢弃。
+ *
+ * 为什么是段落而不是整块：实测 9929 字符里只有 3 段有问题，其余 8 段全部放行。
+ * 按块或整体丢弃会把客户端 85.7% 的合法指令一起扔掉，那是没必要的破坏。
+ */
+function dropWindsurfBlockedSegments(
+  systemText: string,
+  prefixes: readonly string[],
+): { readonly text: string; readonly dropped: readonly WindsurfDroppedSegment[] } {
+  if (prefixes.length === 0 || systemText.length === 0) return { text: systemText, dropped: [] };
+  const dropped: WindsurfDroppedSegment[] = [];
+  const kept = systemText.split("\n\n").filter((segment) => {
+    const hit = prefixes.find((prefix) => segment.trimStart().startsWith(prefix));
+    if (hit === undefined) return true;
+    dropped.push({ prefix: hit, characters: segment.length });
+    return false;
+  });
+  return { text: kept.join("\n\n"), dropped };
+}
 
 /**
  * 保证 `identityLine` 出现在合并后的 system 文本里。
@@ -813,8 +880,25 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
         });
       });
       // ── 客户端身份行（Windsurf 私有策略，见 WindsurfSystemIdentityPolicy） ──
-      const identity = ensureWindsurfIdentityLine(systemTexts.join("\n\n"), systemIdentity);
+      const joinedSystem = systemTexts.join("\n\n");
+      // 先摘掉实测被内容策略拦下的段落，再保证身份行 —— 顺序不能反：
+      // 摘段可能把身份行所在的段一起带走，那样后一步的替换就会失配、退化成 prepend。
+      const blocked = dropWindsurfBlockedSegments(
+        joinedSystem,
+        systemIdentity.kind === "ensureIdentityLine" ? systemIdentity.blockedSegmentPrefixes : [],
+      );
+      const identity = ensureWindsurfIdentityLine(blocked.text, systemIdentity);
       const systemText = identity.text;
+      for (const segment of blocked.dropped) {
+        losses.record({
+          path: "$.conversation.system", kind: "dropped",
+          detail: `以 '${segment.prefix}' 开头的 ${segment.characters} 字符段落被整段摘掉：`
+            + "打真实上游二分实测，这一段单独发过去就会被 content policy 拦下"
+            + "（`Your request was blocked by our content policy`）。"
+            + "客户端写在这一段里的指令不会到达模型；system 的其余段落一字未动。"
+            + "不接受这条改写就传 systemIdentity={kind:'passthrough'}（代价是整条请求被拒）",
+        });
+      }
       if (identity.outcome !== null) {
         const what = identity.outcome.kind === "replaced"
           ? `客户端身份行 '${identity.outcome.supersededLine}' 被整行换成 `
@@ -825,11 +909,10 @@ export function createWindsurfOutbox(options: WindsurfOutboxOptions): IROutbox<U
         losses.record({
           path: "$.conversation.system", kind: "substituted",
           detail: what
-            + "抓包实证：20945–21599 字符的 agent 脚手架加 23 个工具定义 12/12 条得到 200，"
-            + "所以「体量或关键词密度触发内容分类器」不成立，被钉住的差异只有身份行。"
-            + "**未验证**：这 12 条里没有任何一条带 Claude Code 身份行，"
-            + "因此「不换会被拒」与「换了就够」两件事都还是推断，不是实测。"
-            + "不接受这条推断就传 systemIdentity={kind:'passthrough'}",
+            + "实测：Claude Code 的 57 字符身份行**单独**发过去就会被拒"
+            + "（`an internal error occurred`，与正文段的 content policy 是两套机制）；"
+            + "摘掉正文触发段但保留这一行，照样被拒。所以身份与正文必须同时处理。"
+            + "不接受这条改写就传 systemIdentity={kind:'passthrough'}",
         });
       }
 

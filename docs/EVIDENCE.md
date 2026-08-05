@@ -298,9 +298,14 @@ run_subagent · skill · todo_write · web_search · webfetch · write · write_
 **→ IR 影响（两条）**：
 
 1. **`web_search` / `webfetch` 在这里是普通声明工具，不是上游内建工具。** 它们和 `exec`
-   一样只有 `name`/`description`/`jsonSchemaString`，由客户端自己执行（同一次抓包里另有
-   2 条 `GetWebSearchResults` RPC 就是执行体）。所以 windsurf 出口把 `IRTool` 的
-   `builtin` 一律判为不可承载是对的 —— 这条 wire 上根本没有「内建」这个概念。
+   一样只有 `name`/`description`/`jsonSchemaString`。同一次抓包中，`web_search` 有两条实际的
+   `GetWebSearchResults` RPC（裸 `application/proto`，请求 `limit=8`，各返回 8 条
+   `document_id/url/title/summary`）；因此它的专属执行器可在 Windsurf Outbox 模块实现，再把结果
+   按 `tool_call_id` 回灌为普通 `IRToolResult`。另一次最小 WebFetch 实验已证实 `webfetch` 的
+   执行链是 `GetChatMessage → GetChatMessage → GET target URL → GetChatMessage`：它没有 Codeium
+   专属 RPC，而是**宿主**向目标 URL 发标准 HTTP GET 后再回灌。因此 HTTP 抓取及其 SSRF、重定向、
+   大小限制等安全策略属于宿主工具执行层，不属于 Windsurf Outbox 或通用 IR。 所以 windsurf 出口把
+   `IRTool` 的 `builtin` 一律判为不可承载是对的 —— 这条 wire 上根本没有「内建」这个概念。
 2. **MCP 不靠 `serverName` 分组。** 真实客户端用 `mcp_call_tool` / `mcp_list_tools` /
    `mcp_list_servers` / `mcp_read_resource` 四个元工具把整个 MCP 收进四个普通函数，
    `serverName` 字段一次都没用。IR 的 `IRToolRef.group` 在这个出口没有承载位，

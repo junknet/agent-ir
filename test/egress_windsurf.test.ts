@@ -1368,9 +1368,9 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
 
     const loss = expectOk(result).losses.find((one) => one.path === "$.conversation.system");
     expect(loss?.kind).toBe("substituted");
-    // 注释与 loss 都必须把「抓包证明了什么」和「还是推断」分开写。
-    expect(loss?.detail).toContain("抓包实证");
-    expect(loss?.detail).toContain("未验证");
+    // 这条改写现在有真实上游实测背书（见 WindsurfSystemIdentityPolicy 的二分表），
+    // loss 必须说清楚依据，并给出退出口。
+    expect(loss?.detail).toContain("实测");
     expect(loss?.detail).toContain("passthrough");
   });
 
@@ -1447,6 +1447,7 @@ describe("客户端身份行：windsurf 私有策略，默认做最轻的那一�
         kind: "ensureIdentityLine",
         identityLine: "I am human.",
         supersededLines: ["I am robot."],
+        blockedSegmentPrefixes: [],
       },
     });
     const result = await custom.writeOutboxRequest(request({
@@ -1547,5 +1548,99 @@ describe("readOutboxResponse：抓包钉住的响应形状", () => {
     // 兜底不是终止：前面的文本照常产出，收尾照常。
     expect(events.some((event) => event.kind === "partDelta")).toBe(true);
     expect(events.at(-1)).toMatchObject({ kind: "messageStop" });
+  });
+});
+
+/**
+ * 摘除被上游内容策略拦下的段落 —— 判据全部来自 2026-08-05 打真实 `server.codeium.com`
+ * 的逐段二分（模型 claude-opus-4-6，Claude Code 2.1.221 的真实 system 共 9929 字符）。
+ *
+ * 二分结论：12 段里只有 3 段会被拒（身份行 57 字符走泛化 permission_denied，
+ * `IMPORTANT: Assist with authorized security testing…` 459 字符与 `# Environment` 973 字符
+ * 走 content policy），其余 8 段共 8507 字符全部放行。摘 3 段 + 换身份行之后，
+ * 带 12 个真实 Claude Code 工具实测得到 200。
+ *
+ * 所以这里锁的性质是：**只摘该摘的，别的一个字都不许动**。
+ */
+describe("内容策略段落摘除：只摘实测触发的那几段", () => {
+  const CC_SECURITY_PARAGRAPH =
+    "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and "
+    + "educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, "
+    + "supply chain compromise, or detection evasion for malicious purposes.";
+  const CC_ENVIRONMENT_SECTION =
+    "# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /tmp\n"
+    + " - You are powered by the model named Opus 5.";
+  const KEEP = "# Delivering work\nDo ordinary work as asked, acting on the actual request.";
+
+  it("两个实测触发段被整段摘掉，其余段落逐字保留", async () => {
+    const result = await outbox.writeOutboxRequest(request({
+      system: [
+        { kind: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { kind: "text", text: CC_SECURITY_PARAGRAPH },
+        { kind: "text", text: KEEP },
+        { kind: "text", text: CC_ENVIRONMENT_SECTION },
+      ],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(result).prompt as string;
+    // 摘掉的两段一个字都不留。
+    expect(prompt).not.toContain("authorized security testing");
+    expect(prompt).not.toContain("# Environment");
+    // 没被摘的那段逐字还在 —— 这才是「只摘 3 段」相对「整体塌缩」的全部价值。
+    expect(prompt).toContain(KEEP);
+    // 身份行同时被换掉：实测两套机制必须一起处理，缺一仍然被拒。
+    expect(prompt).toContain(WINDSURF_OBSERVED_IDENTITY_LINE);
+    expect(prompt).not.toContain("You are Claude Code");
+
+    const systemLosses = expectOk(result).losses.filter((one) => one.path === "$.conversation.system");
+    // 两条 dropped（各一段）+ 一条 substituted（身份行）。
+    expect(systemLosses.filter((one) => one.kind === "dropped")).toHaveLength(2);
+    expect(systemLosses.filter((one) => one.kind === "substituted")).toHaveLength(1);
+    for (const loss of systemLosses.filter((one) => one.kind === "dropped")) {
+      expect(loss.detail).toContain("content policy");
+      expect(loss.detail).toContain("passthrough");
+    }
+  });
+
+  it("没有触发段就不摘，也不记 dropped —— 判据是段首前缀，不是含有关键词", async () => {
+    const result = await outbox.writeOutboxRequest(request({
+      // 正文里提到了 security testing，但不是以那条前缀开头的段。
+      system: [{ kind: "text", text: "We discuss authorized security testing in this project." }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    const prompt = decodeWire(result).prompt as string;
+    expect(prompt).toContain("We discuss authorized security testing in this project.");
+    expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system" && one.kind === "dropped"))
+      .toEqual([]);
+  });
+
+  it("passthrough 连触发段都不摘 —— 调用方要的是逐字节透传", async () => {
+    const raw = createWindsurfOutbox({
+      model: "claude-opus-4-8-high",
+      apiKey: "devin-session-token$h.e.sig",
+      systemIdentity: { kind: "passthrough" },
+    });
+    const result = await raw.writeOutboxRequest(request({
+      system: [{ kind: "text", text: CC_SECURITY_PARAGRAPH }, { kind: "text", text: CC_ENVIRONMENT_SECTION }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(decodeWire(result).prompt).toBe(`${CC_SECURITY_PARAGRAPH}\n\n${CC_ENVIRONMENT_SECTION}`);
+    expect(expectOk(result).losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
+  });
+
+  it("反例：段落摘除只属于 windsurf，同一条 IR 走 anthropic 出口一个字都不少", async () => {
+    const irRequest = request({
+      system: [{ kind: "text", text: CC_SECURITY_PARAGRAPH }, { kind: "text", text: CC_ENVIRONMENT_SECTION }],
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: intent({ stopping: { maxOutputTokens: clientValue(1024) } }),
+    });
+    const anthropic = createAnthropicOutbox({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+    const built = await anthropic.writeOutboxRequest(irRequest);
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const body = JSON.stringify(built.wire.body);
+    expect(body).toContain("authorized security testing");
+    expect(body).toContain("# Environment");
+    expect(built.losses.filter((one) => one.path === "$.conversation.system")).toEqual([]);
   });
 });

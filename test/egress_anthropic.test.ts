@@ -12,6 +12,7 @@ import { createAnthropicOutbox } from "../src/egress/anthropic.ts";
 import { createOpenAIChatOutbox } from "../src/egress/openai_chat_completions.ts";
 import { createOpenAIResponsesOutbox } from "../src/egress/openai_responses.ts";
 import { readAnthropicMessagesRequest, readChatCompletionsRequest } from "../src/ingress/index.ts";
+import { assembleResponse } from "../src/ir/response.ts";
 import type { IRBuildProblem, IRRequest, OutboxRequestBuildResult } from "../src/ir/types.ts";
 
 const TRACE = "tr-anthropic";
@@ -165,6 +166,76 @@ describe("lower：编译成功的形状", () => {
     // 两个独立 decode 出来的等价 IR 也必须编译成同一份字节，构造过程不许夹带任何外部状态。
     const third = ok(await outbox.writeOutboxRequest(fullRequest()));
     expect(third.body).toBe(first.body);
+  });
+
+  it("抓包组合形态：图片与两轮并行工具调用/结果在同一请求中全部保留", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "claude", max_tokens: 512, stream: true,
+      tools: [
+        { name: "Read", description: "read", input_schema: { type: "object" } },
+        { name: "Search", description: "search", input_schema: { type: "object" } },
+      ],
+      messages: [
+        { role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+          { type: "text", text: "inspect this image" },
+        ] },
+        { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_read", name: "Read", input: { path: "first.txt" } },
+          { type: "tool_use", id: "toolu_search", name: "Search", input: { query: "image" } },
+        ] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_search", content: "search result" },
+          { type: "tool_result", tool_use_id: "toolu_read", content: "file content" },
+        ] },
+        { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_read_second", name: "Read", input: { path: "second.txt" } },
+          { type: "tool_use", id: "toolu_search_second", name: "Search", input: { query: "follow up" } },
+        ] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_search_second", content: "second search" },
+          { type: "tool_result", tool_use_id: "toolu_read_second", content: "second file" },
+        ] },
+      ],
+    }, TRACE);
+    const messages = messagesOf(await outbox.writeOutboxRequest(request));
+
+    expect(contentOf(messages[0])[0]).toEqual({
+      type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+    });
+    expect(contentOf(messages[2]).map((part) => part.tool_use_id)).toEqual(["toolu_read", "toolu_search"]);
+    expect(contentOf(messages[4]).map((part) => part.tool_use_id))
+      .toEqual(["toolu_read_second", "toolu_search_second"]);
+  });
+});
+
+describe("抓包组合形态：Anthropic SSE 工具输入增量", () => {
+  it("跨任意字节分片组装 tool_use JSON，并以 toolUse 收尾", async () => {
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-test"}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_stream","name":"Read","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"fi"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"le.txt\\",\\"line\\":2}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const encoded = new TextEncoder().encode(sse);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const byte of encoded) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      },
+    });
+    const response = await assembleResponse(
+      outbox.readOutboxResponse(new Response(stream, { headers: { "content-type": "text/event-stream" } })),
+      "fallback",
+    );
+    expect(response).toMatchObject({ model: "claude-test", stopReason: "toolUse", error: null, unhandled: [] });
+    expect(response.turn.parts).toEqual([{
+      kind: "toolCall",
+      call: { id: "toolu_stream", toolRef: { group: null, name: "Read" }, input: { kind: "json", value: { path: "file.txt", line: 2 } } },
+    }]);
   });
 });
 
