@@ -56,11 +56,25 @@ function streamed(payload: Uint8Array, chunkSize: number): ReadableStream<Uint8A
   });
 }
 
-/** 传输层故障：可选地先吐一段合法字节，然后连接被 reset。 */
+/**
+ * 传输层故障：可选地先**送达**一段合法字节，然后连接被 reset。
+ *
+ * 「送达」是这个夹具的全部难点。`controller.error()` 按 WHATWG 规范会 **ResetQueue** ——
+ * 同一个 `start` 里刚 enqueue 的 chunk 连同队列一起被丢掉，读端一个字节都收不到，
+ * 直接拿到异常。那模拟的是「连接在任何字节落地前就断」，不是「发了一半才断」，
+ * 用它去断言「提交之后断连」永远测不到提交点。
+ *
+ * 所以分两拍：`start` 里 enqueue，`pull`（消费者已经取走那一块之后才会被调用）里 error。
+ * 这才是 ECONNRESET 的真实形状 —— 前半段字节已经在下游手里了。
+ */
 function severed(prefix: Uint8Array | null): ReadableStream<Uint8Array> {
+  let delivered = prefix === null || prefix.length === 0;
   return new ReadableStream<Uint8Array>({
     start(controller) {
       if (prefix !== null && prefix.length > 0) controller.enqueue(prefix);
+    },
+    pull(controller) {
+      if (!delivered) { delivered = true; return; }
       controller.error(new Error("ECONNRESET"));
     },
   });
@@ -530,8 +544,8 @@ describe("事件乱序：partDelta 先于 partStart", () => {
  *   提交前 —— 还没有任何字节下发，换号重试是安全的；
  *   提交后 —— 字节已经在客户端手里，只能在 200 流里补一个协议内的 error 收尾。
  *
- * 这里断言的是红线（不许假成功）。至于「断连应该变成 error 事件还是异常」，
- * 见文件末尾那组暴露缺陷的用例。
+ * 这里断言的是红线（不许假成功）。至于「断连变成 error 事件而不是异常」，
+ * 见文件末尾那组守卫用例。
  */
 describe("传输层断连", () => {
   for (const provider of PROVIDERS) {
@@ -581,24 +595,26 @@ describe("红线：任何故障流都不许折出「没内容也没错误」的�
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 已知缺陷 —— 断言的是应有行为，当前实现做不到，故意保留失败
+// 传输层断连
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * `readUpstreamResponse` 的契约是 `AsyncIterable<IREvent>`，而 `IREvent` 里有 `error`
  * 这一态；`response.ts` 写得很明白：「上游的失败是数据（error），不是控制流」。
  *
- * 但**传输层**的失败（TCP reset、TLS 中断、上游进程被杀）目前是从迭代器里抛出来的，
- * 五个出口都一样，而且 `superviseUpstreamStream` 也不把它转成事件 —— 守卫只在
- * 「静默超时」这一种情形下 yield error。
- *
+ * **传输层**的失败（TCP reset、TLS 中断、上游进程被杀）也必须落在这条契约里：
+ * `superviseUpstreamStream` 把上游迭代器抛出来的异常就地转成 error 事件。
  * 为什么这不只是「调用方 try/catch 一下」：**提交之后**下游已经收到 200 与部分字节，
  * 此时唯一正确的收尾是往同一条流里补一个协议内的 error 事件（stream_guard 的文件头
  * 就是这么写的）。异常穿过守卫意味着守卫维护的提交点状态在最需要它的那一刻失效，
  * 每个调用方都得自己重新实现一遍「我提交了没有」。
+ *
+ * 这两条曾经挂在「已知缺陷」下失败，但失败的是**夹具**不是实现：
+ * `controller.error()` 会连同队列一起丢掉刚 enqueue 的前缀（见 `severed` 的注释），
+ * 于是「提交后断连」这个场景根本没被构造出来 —— 读端在收到任何字节之前就拿到了异常。
  */
-describe("[暴露缺陷] 传输层断连应当变成 error 事件，而不是异常", () => {
-  it("DEFECT-6 提交后断连：守卫应补一条协议内的 error 事件收尾", async () => {
+describe("传输层断连变成 error 事件，而不是异常", () => {
+  it("DEFECT-6 提交后断连：守卫补一条协议内的 error 事件收尾", async () => {
     const provider = PROVIDERS[0]!;
     const prefix = sseLf(anthropicOk.slice(0, 4));
     const response = new Response(severed(prefix), {

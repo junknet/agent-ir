@@ -278,3 +278,94 @@ describe("全空会话", () => {
     }));
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 声明与投影必须一致：声明支持却不发，是不变量 3 的反面
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("会话身份：wire 有承载位就发", () => {
+  /** 语料里 365/611 条 anthropic_messages 请求的原始形态。 */
+  const CLIENT_METADATA = {
+    user_id: JSON.stringify({
+      device_id: "5378180456032bae90ae4ca4c77928756c9f3285caa54abbf81064f108a09818",
+      account_uuid: "",
+      session_id: "c508c824-8120-43b6-bec1-a569bf91d5d6",
+    }),
+  };
+
+  it("metadata.user_id 原样往返 —— ingress 解出来的三段身份，egress 逐字装回去", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 16, metadata: CLIENT_METADATA,
+      messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    // account_uuid 是空串，ingress 按「有但为空 = 没有」处理，所以 IR 里只剩两段。
+    expect(request.intent.identity).toEqual({
+      deviceId: "5378180456032bae90ae4ca4c77928756c9f3285caa54abbf81064f108a09818",
+      sessionId: "c508c824-8120-43b6-bec1-a569bf91d5d6",
+    });
+
+    const body = bodyOf(await egress.writeUpstreamRequest(request));
+    const metadata = body.metadata as { user_id: string };
+    expect(JSON.parse(metadata.user_id)).toEqual({
+      device_id: "5378180456032bae90ae4ca4c77928756c9f3285caa54abbf81064f108a09818",
+      session_id: "c508c824-8120-43b6-bec1-a569bf91d5d6",
+    });
+    // 再解一次必须还是同一个 IR 身份：这条 wire 上身份是无损的。
+    const roundTripped = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 16, metadata: body.metadata as Record<string, unknown>,
+      messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    expect(roundTripped.request.intent.identity).toEqual(request.intent.identity);
+  });
+
+  it("客户端没给身份就整个字段不发，不补空壳", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    expect(Object.hasOwn(bodyOf(await egress.writeUpstreamRequest(request)), "metadata")).toBe(false);
+  });
+});
+
+describe("服务档位：wire 没有这个取值就不发，并留痕", () => {
+  it("serviceTier 归 lossy 而不是 supports —— 声明支持却不发才是最糟的那一种", () => {
+    expect(egress.profile.supports.has("serviceTier")).toBe(false);
+    expect(egress.profile.lossy.has("serviceTier")).toBe(true);
+  });
+
+  it("客户端要 priority：body 里不写 service_tier，但必须有一条指到它的 loss", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 16, service_tier: "priority",
+      messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    expect(request.intent.serviceTier).toEqual({ value: "priority", source: "client" });
+
+    const built = await egress.writeUpstreamRequest(request);
+    // wire 的 service_tier 只收 auto / standard_only；发一个 auto 只是把缺省又写一遍。
+    expect(Object.hasOwn(bodyOf(built), "service_tier")).toBe(false);
+    expect(built.losses).toContainEqual(expect.objectContaining({
+      stage: "egress", provider: "anthropic", path: "$.intent.serviceTier", kind: "dropped",
+    }));
+  });
+
+  it("客户端没提档位（gateway-default standard）：一条 loss 都不该有", async () => {
+    const { request } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    const built = await egress.writeUpstreamRequest(request);
+    expect(built.losses.filter((loss) => loss.path === "$.intent.serviceTier")).toEqual([]);
+  });
+});
+
+describe("必填字段维度", () => {
+  it("Anthropic 强制要求 max_tokens —— 声明与那条 requiredFieldMissing 拒绝是同一个事实", async () => {
+    expect(egress.profile.mandatory.maxOutputTokens).toBe(true);
+    const { request } = readChatCompletionsRequest({
+      model: "m", messages: [{ role: "user", content: "hi" }],
+    }, TRACE);
+    expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
+    expect(rejected(await egress.writeUpstreamRequest(request))).toContainEqual(expect.objectContaining({
+      kind: "requiredFieldMissing",
+      path: "$.intent.stopping.maxOutputTokens",
+    }));
+  });
+});

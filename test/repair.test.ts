@@ -14,7 +14,8 @@ import { checkUpstreamSupport } from "../src/ir/admission.ts";
 import { deriveCapabilityNeeds } from "../src/ir/capabilities.ts";
 import {
   IR_CAPABILITIES, clientValue, defaultValue,
-  type IRCapability, type IRConversation, type IREgressProfile, type IRIntent, type IROutputFormat,
+  type IRCapability, type IRConversation, type IREgressProfile, type IRIntent,
+  type IRMandatoryFieldTable, type IROutputFormat,
   type IRPart, type IRReasoning, type IRRequest, type IRToolChoice, type IRTurn,
 } from "../src/ir/types.ts";
 import {
@@ -77,11 +78,16 @@ const toolResult = (callId: string, ...parts: readonly IRPart[]): IRPart => ({
 });
 
 const profileOf = (
-  supports: readonly IRCapability[], lossy: readonly IRCapability[] = [],
-): IREgressProfile => ({ provider: "test", supports: new Set(supports), lossy: new Set(lossy) });
+  supports: readonly IRCapability[],
+  lossy: readonly IRCapability[] = [],
+  mandatory: IRMandatoryFieldTable = { maxOutputTokens: false },
+): IREgressProfile => ({ provider: "test", supports: new Set(supports), lossy: new Set(lossy), mandatory });
 
+/** 认识全部能力，但**什么都不强制要求** —— 「认识」与「要求」是两个维度。 */
 const EVERYTHING = profileOf(IR_CAPABILITIES);
 const NOTHING = profileOf([]);
+/** 强制要求 max_tokens 的目标（Anthropic / Copilot 的形状）。 */
+const DEMANDS_MAX_TOKENS = profileOf(IR_CAPABILITIES, [], { maxOutputTokens: true });
 
 function deepFreeze<T>(value: T): T {
   if (typeof value !== "object" || value === null) return value;
@@ -194,12 +200,40 @@ const CASES: { readonly [K in IRRepairKind]: RepairCase } = {
 
   defaultMaxOutputTokens: {
     policy: { defaultMaxOutputTokens: {} },
-    triggering: { request: irRequest({}), profile: EVERYTHING },
+    triggering: { request: irRequest({}), profile: DEMANDS_MAX_TOKENS },
     inert: [
       // 客户端自己给了上限 → 不许覆盖
-      { request: irRequest({ intent: { stopping: { maxOutputTokens: clientValue(64) } } }), profile: EVERYTHING },
+      {
+        request: irRequest({ intent: { stopping: { maxOutputTokens: clientValue(64) } } }),
+        profile: DEMANDS_MAX_TOKENS,
+      },
       // 目标根本不认识这个参数 → 填了只会凭空造出一条准入过不去的需求
       { request: irRequest({}), profile: NOTHING },
+      // DEFECT-10：目标**认识**它但**不要求**它 → 也不许填。认识 ≠ 要求。
+      { request: irRequest({}), profile: EVERYTHING },
+    ],
+  },
+
+  raiseMaxOutputTokens: {
+    policy: { raiseMaxOutputTokens: {} },
+    triggering: {
+      request: irRequest({ intent: { stopping: { maxOutputTokens: clientValue(1024) } } }),
+      profile: EVERYTHING,
+    },
+    inert: [
+      // 客户端说的已经够高 → 不动。这条修复只补下限，不统一上限。
+      {
+        request: irRequest({ intent: { stopping: { maxOutputTokens: clientValue(65_536) } } }),
+        profile: EVERYTHING,
+      },
+      // 客户端没说过 → 那是 defaultMaxOutputTokens 的地盘，两条修复不许重叠
+      { request: irRequest({}), profile: EVERYTHING },
+      // 网关自己填的默认值不是「客户端的原话」，抬它就没有「推翻原话」这层代价可言，
+      // 但也不该由这条修复负责：它的判据是 source === 'client'
+      {
+        request: irRequest({ intent: { stopping: { maxOutputTokens: defaultValue(64) } } }),
+        profile: EVERYTHING,
+      },
     ],
   },
 };
@@ -475,16 +509,87 @@ describe("mergeAdjacentTurns", () => {
 
 describe("defaultMaxOutputTokens", () => {
   it("marks the value as a gateway default, not a client statement", () => {
-    const { request: repaired, applied } = repairIRRequest(irRequest({}), EVERYTHING, { defaultMaxOutputTokens: {} });
+    const { request: repaired, applied } =
+      repairIRRequest(irRequest({}), DEMANDS_MAX_TOKENS, { defaultMaxOutputTokens: {} });
     expect(repaired.intent.stopping.maxOutputTokens).toEqual({ value: 4096, source: "gateway-default" });
     expect(applied[0]?.detail).toContain("4096");
   });
 
   it("takes the caller's ceiling", () => {
-    const { request: repaired } = repairIRRequest(irRequest({}), EVERYTHING, {
+    const { request: repaired } = repairIRRequest(irRequest({}), DEMANDS_MAX_TOKENS, {
       defaultMaxOutputTokens: { tokens: 8192 },
     });
     expect(repaired.intent.stopping.maxOutputTokens?.value).toBe(8192);
+  });
+
+  /**
+   * DEFECT-10 的单元级守卫：闸门问的是「目标**要求**这个字段吗」。
+   * 只是**认识**它的目标（gemini 就是）一个 token 都不许被填。
+   */
+  it("does not fill a target that merely accepts the field", () => {
+    const { request: repaired, applied } =
+      repairIRRequest(irRequest({}), EVERYTHING, { defaultMaxOutputTokens: {} });
+    expect(applied).toEqual([]);
+    expect(repaired.intent.stopping.maxOutputTokens).toBeUndefined();
+  });
+});
+
+describe("raiseMaxOutputTokens", () => {
+  it("raises the client's own ceiling and says so: what was asked, what it became, and why", () => {
+    const request = irRequest({ intent: { stopping: { maxOutputTokens: clientValue(1024) } } });
+    const { request: repaired, applied } = repairIRRequest(request, EVERYTHING, { raiseMaxOutputTokens: {} });
+    expect(repaired.intent.stopping.maxOutputTokens).toEqual({ value: 16_384, source: "gateway-default" });
+    const detail = applied[0]?.detail ?? "";
+    expect(detail).toContain("1024");
+    expect(detail).toContain("16384");
+    expect(detail).toContain("thinking budget");
+    // source 从 client 变成 gateway-default：下游据此知道这个数字已经不是客户端的原话。
+    expect(applied[0]?.kind).toBe("raiseMaxOutputTokens");
+  });
+
+  it("takes the caller's floor", () => {
+    const request = irRequest({ intent: { stopping: { maxOutputTokens: clientValue(1024) } } });
+    const { request: repaired } = repairIRRequest(request, EVERYTHING, {
+      raiseMaxOutputTokens: { minimumTokens: 40_000 },
+    });
+    expect(repaired.intent.stopping.maxOutputTokens?.value).toBe(40_000);
+  });
+
+  /**
+   * 客户端自己说了思考预算时「够用」是算得出来的，不必落回兜底值：一个 20000 预算配
+   * 16384 上限，在任何把思考算进上限的目标上仍然无解（Anthropic 的
+   * `budget_tokens < max_tokens` 是硬校验）。抬到 budget + 可见正文额度才算真的修好。
+   */
+  it("客户端说了预算就按预算算，而不是落回兜底值", () => {
+    const request = irRequest({
+      intent: {
+        reasoning: clientValue({ mode: "enabled", display: "summarized", budgetTokens: 20_000 }),
+        stopping: { maxOutputTokens: clientValue(16_384) },
+      },
+    });
+    const { request: repaired, applied } = repairIRRequest(request, EVERYTHING, { raiseMaxOutputTokens: {} });
+    expect(repaired.intent.stopping.maxOutputTokens?.value).toBe(24_096); // 20000 + 4096
+    expect(applied[0]?.detail).toContain("24096");
+  });
+
+  it("预算算出来的下限低于兜底值时，兜底值胜出", () => {
+    const request = irRequest({
+      intent: {
+        reasoning: clientValue({ mode: "enabled", display: "summarized", budgetTokens: 1024 }),
+        stopping: { maxOutputTokens: clientValue(256) },
+      },
+    });
+    const { request: repaired } = repairIRRequest(request, EVERYTHING, { raiseMaxOutputTokens: {} });
+    expect(repaired.intent.stopping.maxOutputTokens?.value).toBe(16_384);
+  });
+
+  it("is off unless the caller asks for it —— 推翻客户端原话不许是默认行为", () => {
+    const request = irRequest({ intent: { stopping: { maxOutputTokens: clientValue(32) } } });
+    const untouched = repairIRRequest(request, EVERYTHING, IR_REPAIR_POLICY_NONE);
+    expect(untouched.request).toBe(request);
+    // 「开着别的修复」也不会顺带把它打开
+    const others = repairIRRequest(request, EVERYTHING, { dropEmptyTurn: {}, defaultMaxOutputTokens: {} });
+    expect(others.request.intent.stopping.maxOutputTokens?.value).toBe(32);
   });
 });
 

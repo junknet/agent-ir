@@ -16,7 +16,7 @@
  * 新增一种修复的完整动作：在 `IR_REPAIR_KINDS` 里登记一个名字，然后跟着编译错误走完
  * `IRRepairOptionsByKind`（它的选项形状）与 `IR_REPAIR_SPECS`（它的规格与实现）。
  */
-import type { IRCapability, IREgressProfile, IRLoss, IRRequest } from "../ir/types.ts";
+import type { IRCapability, IREgressProfile, IRLoss, IRMandatoryField, IRRequest } from "../ir/types.ts";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 种类 —— 唯一授权定义
@@ -46,8 +46,14 @@ export const IR_REPAIR_KINDS = [
   "dropEmptyTurn",
   /** 相邻同角色回合：合并成一条（OpenAI 侧并行工具结果的常态形状）。 */
   "mergeAdjacentTurns",
-  /** 客户端没给 `maxOutputTokens`，而目标必须/可以承载它：替客户端填一个默认值。 */
+  /** 客户端没给 `maxOutputTokens`，而目标**强制要求**它：替客户端填一个默认值。 */
   "defaultMaxOutputTokens",
+  /**
+   * 客户端**明说**的 `maxOutputTokens` 装不下目标的组合约束（思考预算算在这个上限里）：
+   * 抬高它。**比补默认值重一级** —— 补默认是填一个客户端没说过的空位，抬高是推翻它
+   * 明确写下的成本上限，所以它排在最后，也最该被调用方单独掂量。
+   */
+  "raiseMaxOutputTokens",
 ] as const;
 
 export type IRRepairKind = (typeof IR_REPAIR_KINDS)[number];
@@ -122,6 +128,20 @@ export interface IRRepairOptionsByKind {
     /** 替客户端填进 `$.intent.stopping.maxOutputTokens` 的值，`source` 恒为 gateway-default。 */
     readonly tokens?: number;
   };
+  readonly raiseMaxOutputTokens: {
+    /**
+     * 网关愿意替客户端承担的最低上限。客户端说的值低于它才抬，抬到它为止；
+     * 高于它的一律不动 —— 这条修复只补齐下限，不统一上限。
+     */
+    readonly minimumTokens?: number;
+    /**
+     * 客户端**明确说了**思考预算时，在这个预算之上再留给可见正文的额度。
+     *
+     * 与 `minimumTokens` 不是二选一，取两者较大值：预算是客户端说的（能算准），
+     * 而只给了 effort 的客户端没说过任何数字，只能落回 `minimumTokens` 这个兜底。
+     */
+    readonly visibleOutputTokens?: number;
+  };
 }
 
 /**
@@ -144,14 +164,20 @@ export const IR_REPAIR_POLICY_NONE: IRRepairPolicy = Object.freeze({});
  * 通过之后具体改哪些 part 仍由实现按站点判断（如 tool result 里的图片看 `toolResultImage`，
  * 顶层图片看 `image`）。
  *
- * 写成判别联合而不是 `capabilities: IRCapability[]`，是因为两个方向都真实存在：
- * 模态降级是「目标**没有**这个能力才修」，而补 max_tokens 恰好相反 ——
- * 目标连 `maxOutputTokens` 都不认时替它填一个，只会凭空造出一条准入过不去的需求。
+ * 写成判别联合而不是 `capabilities: IRCapability[]`，是因为三个方向都真实存在：
+ * 模态降级是「目标**没有**这个能力才修」；补必填字段问的却是另一个维度上的另一个问题
+ * ——「目标**要求**这个字段吗」。
+ *
+ * 这两个问题曾经被同一个 `capabilities` 回答（「目标认识 `maxOutputTokens` 就填」），
+ * 那正是 DEFECT-10 的根因：Gemini 认识它但不要求它，替它填一个默认值反而撞上
+ * 「thinkingBudget 算在 maxOutputTokens 里」的组合约束，把 18/807 条真实请求变成 422。
+ * 「认识」与「要求」是两个维度，闸门必须问对那一个。
  */
 export type IRRepairCapabilityGate =
   | { readonly kind: "targetIndependent" }
   | { readonly kind: "repairWhenMissing"; readonly capabilities: readonly IRCapability[] }
-  | { readonly kind: "repairWhenPresent"; readonly capabilities: readonly IRCapability[] };
+  /** 目标**强制要求**这些字段才修。判据是 `IREgressProfile.mandatory`，不是 supports。 */
+  | { readonly kind: "repairWhenMandatory"; readonly fields: readonly IRMandatoryField[] };
 
 export interface IRRepairInput<K extends IRRepairKind> {
   readonly request: IRRequest;

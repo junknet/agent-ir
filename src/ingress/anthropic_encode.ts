@@ -5,6 +5,9 @@
  * 「非流式」不是另一套解析，只是同一个流的收敛 —— 这样两条路径不会长出两种行为。
  */
 import { formatSse } from "../ir/sse.ts";
+import {
+  observeCompleteIRResponseBeforeStreamTermination, processCompleteIRResponse,
+} from "../ir/ir_message_interception_extensions.ts";
 import type { IREvent, IRRequest, IRResponsePart, IRStopReason, IRUsage } from "../ir/types.ts";
 import { asResponsePart, assembleResponse } from "../ir/response.ts";
 import type { EncodeOptions } from "./shared.ts";
@@ -60,7 +63,12 @@ export function writeAnthropicResponse(
   options: EncodeOptions,
 ): Response | Promise<Response> {
   return request.intent.stream.value
-    ? encodeStream(events, request, options)
+    ? encodeStream(
+      options.processCompleteIRResponse === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      request,
+      options,
+    )
     : encodeAggregate(events, request, options);
 }
 
@@ -187,6 +195,7 @@ async function encodeAggregate(
   // 折叠只有一个实现（ir/response.ts）。此处只做 IRResponse → Anthropic wire 的映射，
   // 不再自己维护一份累积状态 —— 那样两个协议会各折各的，且都落不到 IR 上。
   const assembled = await assembleResponse(events, request.model);
+  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {

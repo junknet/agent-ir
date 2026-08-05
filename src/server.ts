@@ -8,12 +8,17 @@
  *
  * 一次请求的裁决链（每一步都在 debug 级别留一条结构化记录，同一个 trace 串起来就是全链）：
  *   ingress_received → ingress_decoded → model_routed → repair_applied → admission_decided
- *   → egress_lowered → upstream_responded → egress_lifted(unhandled 计数) → response_encoded
+ *   → egress_lowered → outbox_responded → egress_lifted(unhandled 计数) → inbox_response_encoded
  * 排查协议问题不需要客户端配合带任何 debug 头 —— 真实客户端注入不了自定义头，
  * 这是上一轮踩过的坑。
  */
 import { randomUUID } from "node:crypto";
 import { describeUnsupportedCapabilities } from "./ir/admission.ts";
+import { deriveCapabilityNeeds } from "./ir/capabilities.ts";
+import {
+  createIRMessageInterceptionExtensions, IRRequestInterceptionRejected,
+  type IRMessageInterceptionExtensions, type MutableIRRequest,
+} from "./ir/ir_message_interception_extensions.ts";
 import { superviseUpstreamStream } from "./ir/stream_guard.ts";
 import { configureLogging, getLogger, type Logger } from "./obs/log.ts";
 import { readClientRequestForProtocol } from "./ingress/index.ts";
@@ -86,7 +91,11 @@ function errorResponse(type: string, message: string, status: number): Response 
 
 // ── 请求处理 ────────────────────────────────────────────────────────────────
 
-export function createRequestHandler(config: GatewayConfig, log: Logger): (request: Request) => Promise<Response> {
+export function createRequestHandler(
+  config: GatewayConfig,
+  log: Logger,
+  irMessageInterceptionExtensions: IRMessageInterceptionExtensions = createIRMessageInterceptionExtensions(),
+): (request: Request) => Promise<Response> {
   // 启用了哪几条修复，拒绝信息里要据此只建议**还没开的**那几条。
   const enabledRepairs = new Set(config.repairKinds);
 
@@ -125,7 +134,18 @@ export function createRequestHandler(config: GatewayConfig, log: Logger): (reque
       log.warn({ event: "ingress_decode_failed", trace: traceId, protocol, error });
       return errorResponse("invalid_request_error", "request could not be decoded", 400);
     }
-    const clientRequest = decoded.request;
+    const clientRequest = decoded.request as MutableIRRequest;
+    try {
+      await irMessageInterceptionExtensions.inboxRequestInterceptorChain.executeInterceptors(clientRequest, { traceId, protocol });
+    } catch (error) {
+      if (error instanceof IRRequestInterceptionRejected) {
+        log.warn({ event: "request_interceptor_rejected", trace: traceId, protocol, code: error.code });
+        return errorResponse(error.code, error.message, error.status);
+      }
+      throw error;
+    }
+    // `requires` 是 conversation/intent 的函数，不允许 inbox interceptor 改了内容却沿用解码前的能力集。
+    clientRequest.requires = deriveCapabilityNeeds(clientRequest) as MutableIRRequest["requires"];
     logLosses(log, traceId, "ingress", decoded.losses);
     log.debug({ event: "ingress_decoded", trace: traceId, protocol, ...summarizeRequest(clientRequest) });
 
@@ -218,7 +238,7 @@ export function createRequestHandler(config: GatewayConfig, log: Logger): (reque
       return errorResponse("api_error", "The upstream connection failed.", 502);
     }
     log.debug({
-      event: "upstream_responded", trace: traceId, status: upstream.status,
+      event: "outbox_responded", trace: traceId, status: upstream.status,
       content_type: upstream.headers.get("content-type"),
       elapsed_ms: Math.round(performance.now() - started),
     });
@@ -236,7 +256,14 @@ export function createRequestHandler(config: GatewayConfig, log: Logger): (reque
     //   - 它在 encoder 之下，所以注入的 `committed` / `heartbeat` 会被各协议的 encoder
     //     渲染成自己的保活帧（Anthropic 的 ping、OpenAI 的 SSE 注释）。
     // 策略从配置来，默认值原样是 `DEFAULT_STREAM_POLICY`（生产标定值）。
-    const guarded = superviseUpstreamStream(egress.readUpstreamResponse(upstream), config.streamPolicy);
+    const guarded = superviseUpstreamStream(
+      egress.readUpstreamResponse(upstream, {
+        processCompleteSseFrame: (frame) => irMessageInterceptionExtensions.outboxSseFrameInterceptorChain.executeInterceptors(frame, {
+          traceId, protocol, provider: egress.profile.provider, stream: clientRequest.intent.stream.value,
+        }),
+      }),
+      config.streamPolicy,
+    );
 
     async function* observed(): AsyncGenerator<IREvent> {
       for await (const event of guarded) {
@@ -259,7 +286,13 @@ export function createRequestHandler(config: GatewayConfig, log: Logger): (reque
     //
     // 交给 encoder 的是**客户端那份请求**而不是修复后的：响应是写给客户端看的，
     // 里面回显的 model 必须是他自己说的那个名字。
-    const encodeOptions = { messageId: `msg_${traceId}`, onUnhandled };
+    const encodeOptions = {
+      messageId: `msg_${traceId}`, onUnhandled,
+      processCompleteIRResponse: (response: Parameters<IRMessageInterceptionExtensions["inboxCompletedResponseInterceptorChain"]["executeInterceptors"]>[0]) =>
+        irMessageInterceptionExtensions.inboxCompletedResponseInterceptorChain.executeInterceptors(response, {
+          traceId, protocol, provider: egress.profile.provider, stream: clientRequest.intent.stream.value,
+        }),
+    };
     const response = await INGRESS_CODECS[protocol].writeClientResponse(observed(), clientRequest, encodeOptions);
     log.info({
       event: "request_completed", trace: traceId, protocol, status: response.status,
@@ -271,26 +304,35 @@ export function createRequestHandler(config: GatewayConfig, log: Logger): (reque
 
 // ── 启动 ────────────────────────────────────────────────────────────────────
 
-const config = loadConfigOrExit(process.env);
-configureLogging(config.logging);
-const log = getLogger("gateway");
-const handle = createRequestHandler(config, log);
+/**
+ * 可嵌入的默认网关启动器。把启动挪到 `main.ts` 后，库用户可安全 import
+ * `createRequestHandler` / `createIRMessageInterceptionExtensions`，并把 interceptor 注册在真实请求路径上。
+ */
+export function startGateway(
+  env: EnvLookup = process.env,
+  irMessageInterceptionExtensions: IRMessageInterceptionExtensions = createIRMessageInterceptionExtensions(),
+): ReturnType<typeof Bun.serve> {
+  const config = loadConfigOrExit(env);
+  configureLogging(config.logging);
+  const log = getLogger("gateway");
+  const handle = createRequestHandler(config, log, irMessageInterceptionExtensions);
+  const server = Bun.serve({
+    port: config.port,
+    idleTimeout: 240,
+    fetch: (request) => handle(request).catch((error: unknown) => {
+      log.error({ event: "gateway_unhandled_exception", error });
+      return errorResponse("api_error", "internal gateway error", 500);
+    }),
+  });
 
-Bun.serve({
-  port: config.port,
-  idleTimeout: 240,
-  fetch: (request) => handle(request).catch((error: unknown) => {
-    log.error({ event: "gateway_unhandled_exception", error });
-    return errorResponse("api_error", "internal gateway error", 500);
-  }),
-});
-
-log.info({
-  event: "gateway_started", port: config.port,
-  egress: config.egress.name, wire: config.egress.wire,
-  models: Object.fromEntries(config.models.routes),
-  model_fallback: config.models.fallback.kind,
-  repair_kinds: config.repairKinds,
-  stream_policy: config.streamPolicy,
-  endpoints: Object.keys(INGRESS_PATHS),
-});
+  log.info({
+    event: "gateway_started", port: config.port,
+    egress: config.egress.name, wire: config.egress.wire,
+    models: Object.fromEntries(config.models.routes),
+    model_fallback: config.models.fallback.kind,
+    repair_kinds: config.repairKinds,
+    stream_policy: config.streamPolicy,
+    endpoints: Object.keys(INGRESS_PATHS),
+  });
+  return server;
+}

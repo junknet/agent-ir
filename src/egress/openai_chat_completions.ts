@@ -20,8 +20,9 @@
  * 续帧带的是 `id:""` / `function.name:""` 而不是省略这两个键。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
+import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss,
+  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable,
   UpstreamRequestBuildResult, IRPart,
   IRRequest, IRStopReason, IRToolResult, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
@@ -449,11 +450,18 @@ function effortFromBudget(budgetTokens: number): string {
   return budgetTokens <= 1024 ? "low" : budgetTokens <= 4096 ? "medium" : "high";
 }
 
+/**
+ * Chat Completions **不要求** max_tokens：不给就由上游按模型上限自行截断，本文件没有、
+ * 也不该有一条「缺 max_tokens 就拒绝」的逻辑。语料 116 条 chat 请求里大量不带它。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
+
 export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
+    mandatory: MANDATORY,
   };
 
   return {
@@ -654,8 +662,8 @@ export function createChatCompletionsUpstream(options: ChatCompletionsUpstreamOp
       };
     },
 
-    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
-      return liftOpenAIChatStream(response);
+    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+      return liftOpenAIChatStream(response, readOptions);
     },
   };
 }
@@ -810,7 +818,9 @@ function classifyChunk(payload: Record<string, unknown>, hasUsage: boolean): Chu
   return "unknown";
 }
 
-async function* liftOpenAIChatStream(response: Response): AsyncGenerator<IREvent> {
+async function* liftOpenAIChatStream(
+  response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
+): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
@@ -829,7 +839,7 @@ async function* liftOpenAIChatStream(response: Response): AsyncGenerator<IREvent
   let sawTerminal = false;
   let announced = false;
 
-  for await (const frame of iterateSse(response)) {
+  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
     const data = frame.data.trim();
     // [DONE] 是哨兵，不是终止事件：它证明连接正常收尾，不证明这一轮完成了。
     if (data === "[DONE]") continue;

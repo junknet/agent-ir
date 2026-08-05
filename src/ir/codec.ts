@@ -27,8 +27,8 @@ export type ClientResponseWriter = (
 ) => Response | Promise<Response>;
 
 /**
- * 一个客户端协议的两个方向。世界上的 agent 客户端协议就这三种，因此这是封闭集：
- * 补齐一次之后，新增上游再也不需要碰它。
+ * 一个客户端协议的两个方向。本库支持的主流 Agent 对话入口固定为三种，因此这是封闭集：
+ * 补齐后，新增上游再也不需要碰它。
  */
 export interface IRIngressCodec {
   readonly protocol: IRProtocol;

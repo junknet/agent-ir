@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Protocol-neutral IR for multi-protocol LLM gateways: ingress decode -> IR -> egress lower/lift.",
   "scripts": {
-    "dev": "bun run src/server.ts",
+    "dev": "bun run src/main.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

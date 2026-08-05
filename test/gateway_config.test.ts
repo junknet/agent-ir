@@ -358,7 +358,16 @@ describe("problem kind → repair kind 映射是穷举的", () => {
     expect(exhausted).not.toContain(`${REPAIR_KINDS_VARIABLE}=`);
 
     // 三、一条候选都没有：老实说没有，别让人白开一轮。
-    const uncovered = describeProblemWithRepairAdvice(problem("unsatisfiableValue"), new Set());
+    // 现在每种 problem kind 都至少有一条修复（`unsatisfiableValue` 由
+    // `raiseMaxOutputTokens` 兜住），所以这一支只能靠注入一份空候选表来验 ——
+    // 它必须继续可用：下一种 problem kind 登记进来时 `[]` 仍是合法取值。
+    const uncovered = describeProblemWithRepairAdvice(
+      problem("unsatisfiableValue"), new Set(),
+      { ...REPAIRS_FOR_PROBLEM_KIND, unsatisfiableValue: [] });
     expect(uncovered).toContain("no repair kind covers this problem");
+
+    // 而真实那张表上，`unsatisfiableValue` 现在是有解的。
+    const raisable = describeProblemWithRepairAdvice(problem("unsatisfiableValue"), new Set());
+    expect(raisable).toContain(`${REPAIR_KINDS_VARIABLE}=raiseMaxOutputTokens`);
   });
 });

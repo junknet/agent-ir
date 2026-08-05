@@ -249,6 +249,48 @@ describe("能力声明", () => {
   });
 });
 
+describe("会话身份：没有承载位就必须留痕", () => {
+  it("客户端身份整段丢弃并记一条 loss —— request.sessionId 是网关侧会话，不是客户端身份", async () => {
+    clearThoughtSignatureCache();
+    const built = await egress.writeUpstreamRequest(request({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: intent({ identity: { sessionId: "s-client", deviceId: "d1", accountUuid: "a1" } }),
+    }));
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+
+    expect(built.losses).toContainEqual(expect.objectContaining({
+      stage: "egress", path: "$.intent.identity", kind: "dropped",
+    }));
+    // 客户端的三段身份一个字都不许出现在 wire 上（塞进 sessionId 会污染上游会话归属）。
+    expect(built.wire.body).not.toContain("s-client");
+    expect(built.wire.body).not.toContain("d1");
+    expect(built.wire.body).not.toContain("a1");
+  });
+
+  it("客户端没给身份：没有这条 loss", async () => {
+    clearThoughtSignatureCache();
+    const built = await egress.writeUpstreamRequest(request({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(built.losses.filter((loss) => loss.path === "$.intent.identity")).toEqual([]);
+  });
+});
+
+describe("必填字段维度", () => {
+  it("CloudCode 不要求 maxOutputTokens：客户端没给就整个字段不发，也不拒绝", async () => {
+    expect(egress.profile.mandatory.maxOutputTokens).toBe(false);
+    clearThoughtSignatureCache();
+    const built = await egress.writeUpstreamRequest(request({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+    }));
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const body = JSON.parse(built.wire.body as string) as { request: { generationConfig: Record<string, unknown> } };
+    expect(Object.hasOwn(body.request.generationConfig, "maxOutputTokens")).toBe(false);
+  });
+});
+
 // ── lower ───────────────────────────────────────────────────────────────────
 
 describe("lower：IR → v1internal wire", () => {

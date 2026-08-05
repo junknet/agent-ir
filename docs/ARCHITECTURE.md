@@ -46,15 +46,16 @@ flowchart TB
     I3["openai_chat_completions"]
   end
   IR(["IR"])
-  subgraph OUTBOX["outbox — 开放集，当前 5 个"]
+  subgraph OUTBOX["outbox — 开放集，当前 6 个"]
     O1["anthropic"]
     O2["openai_chat"]
     O3["openai_responses"]
     O4["gemini_cloudcode"]
     O5["windsurf<br/>protobuf"]
+    O6["copilot"]
   end
 
-  I1 & I2 & I3 --> IR --> O1 & O2 & O3 & O4 & O5
+  I1 & I2 & I3 --> IR --> O1 & O2 & O3 & O4 & O5 & O6
 ```
 
 **两条轴独立，不是不相交。** `anthropic` 与 `openai_responses` 恰好两边都在（它们既是客户端协议又是上游 API），但 `gemini_cloudcode` 与 `windsurf` **根本不是任何客户端协议** —— 这就是出口必须以供应商名为键、而不是以 `IRProtocol` 为键的实证。
@@ -64,11 +65,11 @@ flowchart TB
 | inbox | 封闭，3 个 | `readClientRequest` + `writeClientResponse` | 写完永不再长 |
 | outbox | 开放，3+n | `writeUpstreamRequest` + `readUpstreamResponse` | 每加一家付 2 个，换 3 条路由 |
 
-当前路由数 = 3 × 5 = **15**。
+当前路由数 = 3 × 6 = **18**。
 
 ---
 
-## 3. 五个上游的真实传输形态
+## 3. 六个上游的真实传输形态
 
 **只有 Windsurf 是二进制。** Gemini CloudCode 常被误认为 protobuf，它其实是 JSON SSE。
 
@@ -79,6 +80,7 @@ flowchart TB
 | `openai_responses` | `/v1/responses` | JSON | SSE(JSON) |
 | `gemini_cloudcode` | `v1internal:streamGenerateContent?alt=sse` | JSON | SSE(**CRLF 分帧**) |
 | `windsurf` | `/exa.api_server_pb.ApiServerService/GetChatMessage` | **protobuf** | **Connect 二进制帧** |
+| `copilot` | `/v1/messages` | JSON | SSE(JSON) |
 
 因此 `IRWireRequest` 对 body 泛型：`IRWireRequest<TBody extends string | Uint8Array>`。二进制 wire 保留原始字节，绝不 base64 化。
 
@@ -160,8 +162,9 @@ flowchart LR
 | 响应折叠 | `src/ir/response.ts` |
 | 流守卫（提交点/保活/退避） | `src/ir/stream_guard.ts` |
 | SSE 分帧 | `src/ir/sse.ts` |
+| IRMessage 审计 interceptor chain | `src/ir/ir_message_interception_extensions.ts` |
 | 三个入口 codec | `src/ingress/**` |
-| 五个出口 | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
+| 六个出口 | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
 | repair（可选层） | `src/repair/**` |
 | 公共入口 | `src/index.ts` |
 

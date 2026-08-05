@@ -4,12 +4,15 @@ import type {
   IRBlob, IRCacheBreakpoint, IREffort, IRLoss, IRPart, IRProtocol, IRSessionIdentity,
   IRToolChoice, IRTurn,
 } from "../ir/types.ts";
+import type { CompleteIRResponseProcessor } from "../ir/ir_message_interception_extensions.ts";
 
 /** 出站编码的共用参数。两个 encoder 都要，放这里避免它们互相 import。 */
 export interface EncodeOptions {
   readonly messageId: string;
   /** 未识别的上游事件计数回调；网关据此发现协议漂移。 */
   readonly onUnhandled?: (rawType: string, raw: unknown) => void;
+  /** 完整 IRResponse 已形成时调用；流式在协议 done/error 字节之前调用。 */
+  readonly processCompleteIRResponse?: CompleteIRResponseProcessor;
 }
 
 export class LossRecorder {
@@ -174,4 +177,3 @@ export function normalizeTurns(turns: readonly IRTurn[]): IRTurn[] {
   // 原先那第二次合并只为修复丢空造成的新相邻，不丢空就没有可修的东西。
   return mergeAdjacentTurns(turns);
 }
-

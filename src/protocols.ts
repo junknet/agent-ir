@@ -1,7 +1,7 @@
 /**
  * 两张注册表 —— 这套架构的全部对外面。
  *
- * `INGRESS_CODECS` 是**封闭**的：世界上的 agent 客户端协议就这三种，补齐一次之后
+ * `INGRESS_CODECS` 是**封闭**的：本网关支持的主流 Agent 对话协议固定为三种，补齐后
  * 新增上游再也不需要碰它。
  *
  * `EGRESS_PROVIDERS` 是**开放**的：接 Gemini CloudCode、Windsurf Connect、Bedrock

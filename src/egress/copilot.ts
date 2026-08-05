@@ -31,7 +31,7 @@ import {
 } from "./anthropic.ts";
 import type { ValueSource } from "./gemini_cloudcode.ts";
 import type {
-  IRBuildProblem, IRCapability, IREgress, IRLoss, IRRequest,
+  IRBuildProblem, IRCapability, IREgress, IRLoss, IRMandatoryFieldTable, IRRequest,
 } from "../ir/types.ts";
 
 const PROVIDER = "copilot";
@@ -157,13 +157,21 @@ const LOSSY = [
   // 语料里 147/606 条带它（全部是 clear_thinking_20251015）—— 不删就是四分之一的真实流量必死。
   // 删字段是**编译事实**（目标 wire 真的没有这个位置），不是策略：换一个调用方也不会想要 400。
   "contextEdit",
-  // 0 条带 service_tier。而且共享投影本来就不写 service_tier 这个字段（原生也一样），
-  // 所以它在这条 wire 上是「进来了但没出去」——放行并留痕，不假装承载。
+  // 0 条带 service_tier。共享投影也不写这个字段：Anthropic wire 的 service_tier 只收
+  // `auto`/`standard_only`，根本没有 `priority` 取值（判据见 anthropic.ts 的 LOSSY 注释）。
+  // 「进来了但没出去」——放行并留痕，不假装承载。
   "serviceTier",
   // 各 0 条。字段在 Anthropic wire 上有位置、共享投影会原样发出去，
   // 但 Copilot 侧一次真实调用都没有 —— 结构实证，进 lossy。
   "topP", "topK",
 ] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
+
+/**
+ * 跑的是 Anthropic Messages wire，`max_tokens` 同样是**强制**的（606/606 条真实 Copilot
+ * 请求全部带它，共享投影缺它就带 `requiredFieldMissing` 拒绝）。表态单独写在这里而不是
+ * 从原生 Anthropic 继承：能力声明的判据对 Copilot 单独成立，必填与否也一样。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: true };
 
 // ── 凭据与 options ──────────────────────────────────────────────────────────
 
@@ -315,6 +323,7 @@ export function createCopilotUpstream(options: CopilotUpstreamOptions): IREgress
     model: options.model,
     supports: SUPPORTED,
     lossy: LOSSY,
+    mandatory: MANDATORY,
     resolveTarget,
     review: reviewCopilotBody,
   });

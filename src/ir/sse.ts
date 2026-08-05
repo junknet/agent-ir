@@ -1,8 +1,9 @@
 /** SSE 原语。解析与生成各一处，三个协议共用。 */
+import type { CompleteOutboxSseFrameProcessor } from "./ir_message_interception_extensions.ts";
 
 export interface SseEvent {
-  readonly event: string | null;
-  readonly data: string;
+  event: string | null;
+  data: string;
 }
 
 /**
@@ -12,7 +13,9 @@ export interface SseEvent {
  * 两三个 chunk。按 chunk 独立解析会静默丢掉半个事件 —— 这类丢帧在流式里表现为
  * 「回答少了一段」，最难查。
  */
-export async function* iterateSse(response: Response): AsyncGenerator<SseEvent> {
+export async function* iterateSse(
+  response: Response, processCompleteSseFrame?: CompleteOutboxSseFrameProcessor,
+): AsyncGenerator<SseEvent> {
   const body = response.body;
   if (body === null) return;
   const decoder = new TextDecoder();
@@ -39,7 +42,10 @@ export async function* iterateSse(response: Response): AsyncGenerator<SseEvent> 
       if (line.length > 0) { pending.push(line); continue; }
       const parsed = parseSseLines(pending);
       pending = [];
-      if (parsed !== null) yield parsed;
+      if (parsed !== null) {
+        await processCompleteSseFrame?.(parsed);
+        yield parsed;
+      }
     }
   }
 
@@ -48,12 +54,18 @@ export async function* iterateSse(response: Response): AsyncGenerator<SseEvent> 
     if (line.length > 0) { pending.push(line); continue; }
     const parsed = parseSseLines(pending);
     pending = [];
-    if (parsed !== null) yield parsed;
+    if (parsed !== null) {
+      await processCompleteSseFrame?.(parsed);
+      yield parsed;
+    }
   }
   if (buffer.length > 0) pending.push(buffer);
   // 上游没有以空行收尾时，残留的最后一个事件仍然要发出去，不能因为「格式不完美」丢内容。
   const tail = parseSseLines(pending);
-  if (tail !== null) yield tail;
+  if (tail !== null) {
+    await processCompleteSseFrame?.(tail);
+    yield tail;
+  }
 }
 
 function parseSseLines(lines: readonly string[]): SseEvent | null {

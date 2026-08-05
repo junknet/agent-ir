@@ -35,7 +35,7 @@ import {
 import { mapConnectError, mapHttpError, readConnectError } from "./errors.ts";
 import { getSharedWindsurfSchema, WINDSURF_TYPES, type WindsurfSchema } from "./schema.ts";
 import type {
-  IRBuildProblem, IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, IRPart, IRRequest,
+  IRBuildProblem, IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable, IRPart, IRRequest,
   IRStopReason, IRToolResult, IRUsage, UpstreamRequestBuildResult,
 } from "../../ir/types.ts";
 
@@ -537,11 +537,19 @@ function checkToolPairing(request: IRRequest, problems: UpstreamRequestProblems)
 
 // ── 出口 ────────────────────────────────────────────────────────────────────
 
+/**
+ * Windsurf **不要求** max_tokens：`CompletionConfiguration.max_tokens` 是 proto3 隐式存在性
+ * 的字段，不发就是「服务端自己定」。本出口的两条 `requiredFieldMissing` 说的是回合与
+ * system prompt，与它无关。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
+
 export function createWindsurfUpstream(options: WindsurfEgressOptions): IREgress<Uint8Array> {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
+    mandatory: MANDATORY,
   };
   const clientProfile = options.profile ?? CHISEL_PROFILE;
   const server = options.server ?? DEFAULT_SERVER;

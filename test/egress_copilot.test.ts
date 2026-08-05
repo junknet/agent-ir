@@ -364,6 +364,50 @@ describe("方言复核：两条有实证的差别", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+describe("会话身份与服务档位：共享投影的两条结论在这里也成立", () => {
+  /**
+   * 语料里那 365 条带 `metadata.user_id` 的请求 **accountType 全是 copilot** ——
+   * 也就是说这条 wire 上真正跑过、被 Copilot 上游受理过的，正是这个字段。
+   * 它必须发出去；不发就是不变量 3 的反面（客户端说了、上游收得下、网关吞了）。
+   */
+  it("metadata.user_id 由共享投影发出，两家逐字节一致", async () => {
+    const withIdentity = readAnthropicMessagesRequest({
+      model: "claude-opus-4-8", max_tokens: 64,
+      metadata: { user_id: JSON.stringify({ device_id: "d1", account_uuid: "a1", session_id: "s1" }) },
+      messages: [{ role: "user", content: "hi" }],
+    }, TRACE).request;
+
+    const body = bodyOf(await egress.writeUpstreamRequest(withIdentity));
+    expect(body.metadata).toEqual({
+      user_id: JSON.stringify({ device_id: "d1", account_uuid: "a1", session_id: "s1" }),
+    });
+
+    const native = createAnthropicUpstream({
+      baseUrl: API_BASE, apiKey: "k", model: "claude-opus-5-copilot",
+    });
+    expect(ok(await egress.writeUpstreamRequest(withIdentity)).body)
+      .toBe(ok(await native.writeUpstreamRequest(withIdentity)).body);
+  });
+
+  it("service_tier 一个字段都不写，priority 意图记一条 loss（provider 是 copilot）", async () => {
+    const priority = readAnthropicMessagesRequest({
+      model: "claude-opus-4-8", max_tokens: 64, service_tier: "priority",
+      messages: [{ role: "user", content: "hi" }],
+    }, TRACE).request;
+
+    const built = await egress.writeUpstreamRequest(priority);
+    expect(Object.hasOwn(bodyOf(built), "service_tier")).toBe(false);
+    expect(built.losses).toContainEqual(expect.objectContaining({
+      provider: "copilot", path: "$.intent.serviceTier", kind: "dropped",
+    }));
+  });
+
+  it("必填字段：Copilot 与原生同一条 wire，max_tokens 同样是强制的", () => {
+    expect(egress.profile.mandatory.maxOutputTokens).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 describe("能力声明", () => {
   it("supports 与 lossy 不相交，且合起来不多不少覆盖每一个 IRCapability", () => {
     const { supports, lossy } = egress.profile;
@@ -387,10 +431,11 @@ describe("能力声明", () => {
       "contextEdit",
       // 0 条 thinking:{type:'enabled',budget_tokens}。
       "reasoningBudget",
-      // 0 条 service_tier（共享投影本来也不写这个字段）。
-      "serviceTier",
       // 各 0 条。
       "topK", "topP",
+      // serviceTier **不在**这张清单上：原生 Anthropic 也把它归了 lossy —— wire 上的
+      // service_tier 只收 auto/standard_only，根本没有 priority 取值（见 anthropic.ts）。
+      // 两家在这一条上是同一个结论，不构成「Copilot 比原生差」的差异。
     ];
     expect(downgraded).toEqual(expected.sort());
     // 反过来没有：Copilot 不会比原生多支持任何东西。
@@ -491,8 +536,12 @@ describe("readUpstreamResponse：与 Anthropic 同一条 wire", () => {
     const error = await errorOf(new Response("<html>502 Bad Gateway</html>", { status: 502 }));
     expect(error.httpStatus).toBe(502);
     expect(error.raw).toBe("<html>502 Bad Gateway</html>");
-    // 判别位取不到就是 unknown —— 不猜、也不静默成功。
-    expect(error.kind).toBe("unknown");
+    // 正文里没有判别位时**状态码就是判据**：5xx 一律 upstreamUnavailable + 可重试。
+    // 这条曾经断言 unknown/不可重试，那是 DEFECT-7 修好之前的旧行为 —— nginx/Cloudflare
+    // 插进来的 502 是瞬时故障，判成 unknown 会让本该退避重试的请求直接失败
+    // （同一条断言在 egress_error_classification.test.ts 的 DEFECT-7e 里对五个出口都成立）。
+    expect(error.kind).toBe("upstreamUnavailable");
+    expect(error.retryable).toBe(true);
   });
 
   it("非流式：一次性 Message JSON 折成等价事件序列", async () => {

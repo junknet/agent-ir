@@ -13,9 +13,10 @@
  * 投影本身**只有这一份** —— 复制一份出去就是 silent mirror：改了一边另一边不会失败，只会一起沉默。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
+import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, UpstreamRequestBuildResult,
-  IRBuildProblem, IRPart, IRRequest,
+  IRCapability, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable, UpstreamRequestBuildResult,
+  IRBuildProblem, IRPart, IRRequest, IRSessionIdentity,
   IRStopReason, IRTurn, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
 
@@ -24,18 +25,30 @@ const SUPPORTED = [
   "thinking", "thinkingSignature", "reasoningEffort", "reasoningBudget",
   "toolFunction", "toolBuiltin", "toolParallel", "toolChoiceSpecific",
   "toolResultImage", "toolResultError", "structuredOutput", "cacheBreakpoint",
-  "contextEdit", "maxOutputTokens", "stopSequences", "temperature", "topP", "topK", "serviceTier",
+  "contextEdit", "maxOutputTokens", "stopSequences", "temperature", "topP", "topK",
 ] as const satisfies readonly IRCapability[];
 
 // toolFreeform：Anthropic 没有自由文本入参工具，只能包成单字段 JSON schema。
 // toolGroup：没有 namespace 概念，只能把分组拍进名字。
-// 两者都能承载，但都有损 —— 归 lossy，放行且强制留痕。
+// serviceTier：wire 上**有** `service_tier`，但取值集只有 `auto`（默认）与 `standard_only`
+//   （官方 Messages 参考 + service-tiers 页）—— **没有 `priority` 这个取值**。IR 的
+//   `priority` 在这条 wire 上表达不出来：能发的只有 `auto`，而 `auto` 本来就是缺省，
+//   语义是「有 Priority 容量就用，没有就退回标准」，不是客户端要的「走优先通道」。
+//   语料 0/807 条带 service_tier（也 0 条带 `speed`），所以连结构实证之上的行为实证都没有
+//   —— 按 ARCHITECTURE §7，只能进 lossy。放行并留痕，不假装承载。
 //
 // 元素类型是 `Exclude<IRCapability, 已 supports 的>`：两个集合必须不相交。重叠时准入会
 // 先命中 supports 直接放行，这条注释承诺的「强制留痕」就静默失效了 —— 那正是不变量 3 的反面。
 const LOSSY = [
-  "toolFreeform", "toolGroup",
+  "toolFreeform", "toolGroup", "serviceTier",
 ] as const satisfies readonly Exclude<IRCapability, (typeof SUPPORTED)[number]>[];
+
+/**
+ * Anthropic Messages **强制**要求 `max_tokens`：不给就编不出合法 body，本文件下面那条
+ * `requiredFieldMissing` 拒绝就是它的执行体。语料 611/611 条 anthropic_messages 请求
+ * 全部带 max_tokens，与 wire 契约一致。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: true };
 
 export interface AnthropicUpstreamOptions {
   readonly baseUrl: string;
@@ -64,6 +77,8 @@ export interface AnthropicMessagesDialect {
   readonly model: string;
   readonly supports: readonly IRCapability[];
   readonly lossy: readonly IRCapability[];
+  /** 目标强制要求的 IR 字段。两家跑同一条 wire，但表态各自给出，不许一家替另一家决定。 */
+  readonly mandatory: IRMandatoryFieldTable;
   resolveTarget(request: IRRequest): Promise<AnthropicMessagesTarget>;
   review?(body: Record<string, unknown>, request: IRRequest): AnthropicMessagesDialectReview;
 }
@@ -96,6 +111,23 @@ class UpstreamRequestReport {
   get rejected(): boolean { return this.#problems.length > 0; }
   drain(): readonly IRLoss[] { return [...this.#losses]; }
   drainProblems(): readonly IRBuildProblem[] { return [...this.#problems]; }
+}
+
+/**
+ * `IRSessionIdentity` → `metadata.user_id` 的字符串形态。空身份返回 null（字段整个不发）。
+ *
+ * 键名与键序都取自真实上行流量（`{"device_id","account_uuid","session_id"}`），不是自造：
+ * 同一条 IR 两次构造必须得到同一串字节（determinism），而字面量的键序是稳定的。
+ * 只写有值的键 —— 补一个空串会让下游把「没有」与「有但为空」混为一谈。
+ */
+function writeSessionIdentity(identity: IRSessionIdentity): string | null {
+  const { deviceId, accountUuid, sessionId } = identity;
+  if (deviceId === undefined && accountUuid === undefined && sessionId === undefined) return null;
+  return JSON.stringify({
+    ...(deviceId === undefined ? {} : { device_id: deviceId }),
+    ...(accountUuid === undefined ? {} : { account_uuid: accountUuid }),
+    ...(sessionId === undefined ? {} : { session_id: sessionId }),
+  });
 }
 
 /** 分组名拍进工具名。这是有损的（分组结构没了），调用方靠 loss 知道。 */
@@ -264,6 +296,7 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
     provider: dialect.provider,
     supports: new Set(dialect.supports),
     lossy: new Set(dialect.lossy),
+    mandatory: dialect.mandatory,
   };
 
   return {
@@ -347,6 +380,19 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
       // Anthropic 强制要求 max_tokens。客户端没给（Chat Completions 客户端普遍不带）时，
       // 补 4096 是「我替你决定」—— 拒绝，把位置指到 intent 上。要兜底就显式 compose
       // repair（对 Chat→Anthropic 转发，那里有 entry 的 maxOutputTokens 可作真默认值）。
+      // 服务档位。wire 上的 `service_tier` 只收 `auto`（缺省）/ `standard_only`，
+      // **没有 `priority`**：客户端要的「走优先通道」在这条 wire 上没有取值可表达，
+      // 发一个 `auto` 等于把缺省值又写一遍，并不会让这条请求排到优先队列。
+      // 于是这里既不发也不假装 —— 带精确路径记一条 dropped（能力表里它也在 lossy）。
+      if (intent.serviceTier.source === "client" && intent.serviceTier.value === "priority") {
+        report.record({
+          path: "$.intent.serviceTier", kind: "dropped",
+          detail: "Anthropic Messages service_tier only accepts 'auto' (the default) and 'standard_only'; "
+            + "there is no per-request value that means 'priority', so the client's priority intent is not "
+            + "forwarded (priority capacity is an organisation-level commitment, not a request parameter)",
+        });
+      }
+
       const maxTokens = intent.stopping.maxOutputTokens?.value;
       if (maxTokens === undefined) {
         report.reject({
@@ -357,11 +403,21 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
         });
       }
 
+      // 会话身份。Anthropic Messages wire **有**承载位：`metadata.user_id`（官方参考：
+      // 「An external identifier for the user who is associated with the request. This should be
+      // a uuid, hash value, or other opaque identifier.」）。它就是 Claude Code 的原始形态 ——
+      // 语料 365/611 条 anthropic_messages 请求带 `metadata.user_id`，且 365/365 是
+      // `{"device_id","account_uuid","session_id"}` 的 JSON 串（accountType 全是 copilot，
+      // 也就是说这条 wire 上两家上游都真实受理过它）。ingress 的 `parseSessionIdentity` 解的
+      // 正是这个串，这里是它的逆 —— 有位置就发，不发才是不变量 3 的反面。
+      const metadataUserId = writeSessionIdentity(intent.identity);
+
       const body: Record<string, unknown> = {
         model: dialect.model,
         messages,
         max_tokens: maxTokens,
         stream: intent.stream.value,
+        ...(metadataUserId === null ? {} : { metadata: { user_id: metadataUserId } }),
         ...(system.length === 0 ? {} : { system }),
         ...(tools.length === 0 ? {} : { tools }),
         ...(tools.length === 0 || conversation.toolset.choice.source !== "client" ? {} : { tool_choice: toolChoice }),
@@ -399,8 +455,8 @@ export function createAnthropicMessagesUpstream(dialect: AnthropicMessagesDialec
       };
     },
 
-    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
-      return liftAnthropicStream(response);
+    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+      return liftAnthropicStream(response, readOptions);
     },
   };
 }
@@ -412,6 +468,7 @@ export function createAnthropicUpstream(options: AnthropicUpstreamOptions): IREg
     model: options.model,
     supports: SUPPORTED,
     lossy: LOSSY,
+    mandatory: MANDATORY,
     resolveTarget: () => Promise.resolve({
       url: `${options.baseUrl.replace(/\/$/u, "")}/v1/messages`,
       headers: {
@@ -529,7 +586,9 @@ function usageFrom(raw: unknown): IRUsage | null {
   };
 }
 
-async function* liftAnthropicStream(response: Response): AsyncGenerator<IREvent> {
+async function* liftAnthropicStream(
+  response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
+): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
@@ -569,7 +628,7 @@ async function* liftAnthropicStream(response: Response): AsyncGenerator<IREvent>
   const toolInputBuffers = new Map<number, string>();
   let sawTerminal = false;
 
-  for await (const frame of iterateSse(response)) {
+  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
     const payload = tryParseJson<Record<string, unknown>>(frame.data);
     if (payload === null) {
       yield { kind: "unhandled", rawType: frame.event ?? "<no-event>", raw: frame.data };

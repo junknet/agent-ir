@@ -32,9 +32,11 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { tryParseJson } from "../ir/sse.ts";
+import { iterateSse, tryParseJson } from "../ir/sse.ts";
+import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
   IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRJsonSchema, IRLoss,
+  IRMandatoryFieldTable,
   UpstreamRequestBuildResult, IRPart,
   IRReasoning, IRRequest, IRStopReason, IRToolResult, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
@@ -610,11 +612,21 @@ function resolveThinking(
   return { config, budget };
 }
 
+/**
+ * CloudCode **不要求** maxOutputTokens：客户端没给就整个字段不发，额度由服务端按模型自己
+ * 分配（判据是下面 `requestedMax === undefined` 那条分支 —— 它既不补默认值也不拒绝）。
+ *
+ * 这条 `false` 正是 DEFECT-10 的解药：认识 ≠ 要求。给这个上游补一个它没要求的上限，
+ * 会撞上「thinkingBudget 算在 maxOutputTokens 里」的组合约束，把本来能编的请求变成 422。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
+
 export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
+    mandatory: MANDATORY,
   };
   const host = options.host ?? DEFAULT_HOST;
   const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
@@ -817,6 +829,17 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
           detail: "cloudcode 私有面没有服务档位概念",
         });
       }
+      if (intent.identity.sessionId !== undefined || intent.identity.deviceId !== undefined
+        || intent.identity.accountUuid !== undefined) {
+        // inner.sessionId 看着像承载位，其实不是：它是**本网关这一侧的会话**（由 options
+        // 注入、缺省是时间戳），上游按它归并 trajectory。把客户端的 session/device/account
+        // 塞进去会让上游把两个不同概念当成一个，污染会话归属 —— 与 windsurf 同一判据。
+        report.record({
+          path: "$.intent.identity", kind: "dropped",
+          detail: "CloudCode 的 request.sessionId 描述的是网关侧会话（options 注入），"
+            + "不是客户端会话身份；v1internal 没有别的身份承载位，客户端身份整段不下发",
+        });
+      }
       if (!intent.stream.value) {
         // **编译事实**：上游只有流式端点，非流式在 wire 上不存在。客户端要的整段响应仍
         // 由入口侧折叠后如实给出，Core 没有改写任何内容，改的只是取回方式。
@@ -879,8 +902,8 @@ export function createGeminiCloudCodeUpstream(options: GeminiCloudCodeEgressOpti
       };
     },
 
-    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
-      return liftGeminiStream(response, options.model);
+    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+      return liftGeminiStream(response, options.model, readOptions);
     },
   };
 }
@@ -1032,66 +1055,6 @@ function usageFrom(raw: unknown): IRUsage | null {
   };
 }
 
-/**
- * ⚠ **本地 SSE 切帧，不是重复造轮子 —— `src/ir/sse.ts` 的 `iterateSse` 在这里会全军覆没。**
- *
- * 实测（2026-08-04 真实打通 cloudcode-pa）：CloudCode 的帧分隔符是 **CRLF**
- * `\r\n\r\n`，而 `iterateSse` 只找 `"\n\n"`（`parseSseBlock` 逐行剥了行尾的 `\r`，
- * 但帧边界那一步没有）。于是 `indexOf("\n\n")` 一次都不命中，整条流被攒成**一个** block，
- * 多个 JSON 首尾相接 → `tryParseJson` 失败 → 一条 `unhandled` + 一条「没等到 finishReason」
- * 的 error。症状不是报错，是**整轮内容凭空消失**。
- *
- * 这是共享原语的缺陷（HTML SSE 规范里 `\r\n\r\n` / `\n\n` / `\r\r` 都是合法的事件分隔），
- * 修它要动 `src/ir/**`，不属于本次改动范围 —— 所以这里先本地兜住，并在报告里点名。
- * `iterateSse` 修好之后，这个函数可以整个删掉换回去。
- */
-async function* iterateGeminiSse(response: Response): AsyncGenerator<{ data: string; event: string | null }> {
-  const body = response.body;
-  if (body === null) return;
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const drain = function* (final: boolean): Generator<{ data: string; event: string | null }> {
-    for (;;) {
-      // 三种合法分隔符都要认，取最早出现的那个。
-      const candidates = ["\r\n\r\n", "\n\n", "\r\r"]
-        .map((separator) => ({ separator, at: buffer.indexOf(separator) }))
-        .filter((hit) => hit.at !== -1)
-        .sort((a, b) => a.at - b.at);
-      const hit = candidates[0];
-      if (hit === undefined) break;
-      const raw = buffer.slice(0, hit.at);
-      buffer = buffer.slice(hit.at + hit.separator.length);
-      const parsed = parseFrame(raw);
-      if (parsed !== null) yield parsed;
-    }
-    // 上游没有以空行收尾时，残留的最后一帧仍然要发出去。
-    if (!final) return;
-    const tail = parseFrame(buffer);
-    if (tail !== null) yield tail;
-  };
-  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    yield* drain(false);
-  }
-  buffer += decoder.decode();
-  yield* drain(true);
-}
-
-function parseFrame(raw: string): { data: string; event: string | null } | null {
-  const data: string[] = [];
-  let event: string | null = null;
-  for (const line of raw.split(/\r\n|\n|\r/u)) {
-    if (line.length === 0 || line.startsWith(":")) continue;
-    const colon = line.indexOf(":");
-    const field = colon === -1 ? line : line.slice(0, colon);
-    const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /u, "");
-    if (field === "data") data.push(value);
-    else if (field === "event") event = value;
-  }
-  if (data.length === 0 && event === null) return null;
-  return { data: data.join("\n"), event };
-}
-
 type CursorKind = "text" | "thinking";
 
 /**
@@ -1133,7 +1096,9 @@ class PartCursor {
   }
 }
 
-async function* liftGeminiStream(response: Response, fallbackModel: string): AsyncGenerator<IREvent> {
+async function* liftGeminiStream(
+  response: Response, fallbackModel: string, readOptions?: OutboxResponseReadInterceptionOptions,
+): AsyncGenerator<IREvent> {
   if (!response.ok) {
     const text = await response.text();
     yield { kind: "error", error: mapUpstreamError(tryParseJson(text) ?? text, response.status) };
@@ -1155,7 +1120,7 @@ async function* liftGeminiStream(response: Response, fallbackModel: string): Asy
   const chunks: AsyncIterable<{ payload: unknown; rawText: string; event: string | null }> =
     contentType.includes("text/event-stream")
       ? (async function* () {
-          for await (const frame of iterateGeminiSse(response)) {
+          for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
             yield { payload: tryParseJson<unknown>(frame.data), rawText: frame.data, event: frame.event };
           }
         })()

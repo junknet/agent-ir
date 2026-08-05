@@ -45,11 +45,11 @@ export const REPAIRS_FOR_PROBLEM_KIND: Readonly<Record<IRBuildProblemKind, reado
   /**
    * 值在、只是装不下（CloudCode 的 `maxOutputTokens` 要容得下 thinkingBudget + 可见正文）。
    *
-   * **当前一条修复都没有**，这是事实不是遗漏：`defaultMaxOutputTokens` 只在客户端**没给**
-   * 的时候补一个值，它不会去抬高客户端明确说出口的上限 —— 抬高等于替客户端改掉他的原话，
-   * 那是另一条还没有人登记过的修复。留空，让拒绝信息老实说「没有能修它的」。
+   * `raiseMaxOutputTokens` 是唯一能修它的一条，而且**只有它**：`defaultMaxOutputTokens`
+   * 只在客户端没给时补空位，碰都不碰客户端说出口的上限。两条不能互换 ——
+   * 建议错了，调用方会开一条修复、重跑、拿到一模一样的 422。
    */
-  unsatisfiableValue: [],
+  unsatisfiableValue: ["raiseMaxOutputTokens"],
   /** 有 tool_use 没有对应结果。 */
   danglingToolCall: ["fillDanglingToolCall"],
   /** 有 tool_result 找不到对应调用。 */
@@ -68,9 +68,16 @@ export const REPAIRS_FOR_PROBLEM_KIND: Readonly<Record<IRBuildProblemKind, reado
  *   一条候选都没有 → 说清楚「repair 层没有能修它的」，别让人白开一轮。
  */
 export function describeProblemWithRepairAdvice(
-  problem: IRBuildProblem, enabledRepairs: ReadonlySet<IRRepairKind>,
+  problem: IRBuildProblem,
+  enabledRepairs: ReadonlySet<IRRepairKind>,
+  /**
+   * 候选表。默认就是上面那份唯一授权定义；显式传入只为让**空候选**这一支可测 ——
+   * 现在每种 problem kind 都至少有一条修复，那一支在生产数据上不可达，
+   * 但它必须继续存在：下一种 problem kind 登记进来时，`[]` 仍是合法且有信息量的取值。
+   */
+  candidatesForProblemKind: Readonly<Record<IRBuildProblemKind, readonly IRRepairKind[]>> = REPAIRS_FOR_PROBLEM_KIND,
 ): string {
-  const known = REPAIRS_FOR_PROBLEM_KIND[problem.kind];
+  const known = candidatesForProblemKind[problem.kind];
   const candidates = known.filter((kind) => !enabledRepairs.has(kind));
   const advice = candidates.length > 0
     ? `enable ${REPAIR_KINDS_VARIABLE}=${candidates.join(",")} to let the gateway repair it`

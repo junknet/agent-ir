@@ -7,6 +7,9 @@
  * response.failed），否则调用方无法区分「模型没话说」与「上游拒绝了」，只能盲重试。
  */
 import { formatSse } from "../ir/sse.ts";
+import {
+  observeCompleteIRResponseBeforeStreamTermination, processCompleteIRResponse,
+} from "../ir/ir_message_interception_extensions.ts";
 import { inputTokensIncludingCache } from "../ir/types.ts";
 import type {
   IREvent, IRPart, IRRequest, IRResponsePart, IRStopReason, IRToolInput, IRUsage,
@@ -181,7 +184,12 @@ export function writeChatCompletionsResponse(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Response | Promise<Response> {
   return request.intent.stream.value
-    ? encodeChatStream(events, request, options)
+    ? encodeChatStream(
+      options.processCompleteIRResponse === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      request,
+      options,
+    )
     : encodeChatAggregate(events, request, options);
 }
 
@@ -265,6 +273,7 @@ async function encodeChatAggregate(
 ): Promise<Response> {
   // 折叠只有一个实现（ir/response.ts）；这里只做 IRResponse → Chat wire 的映射。
   const assembled = await assembleResponse(events, request.model);
+  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {
@@ -304,7 +313,12 @@ export function writeResponsesResponse(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Response | Promise<Response> {
   return request.intent.stream.value
-    ? writeClientResponsesStream(events, request, options)
+    ? writeClientResponsesStream(
+      options.processCompleteIRResponse === undefined ? events
+        : observeCompleteIRResponseBeforeStreamTermination(events, request.model, options.processCompleteIRResponse),
+      request,
+      options,
+    )
     : writeClientResponsesAggregate(events, request, options);
 }
 
@@ -436,6 +450,7 @@ async function writeClientResponsesAggregate(
   events: AsyncIterable<IREvent>, request: IRRequest, options: EncodeOptions,
 ): Promise<Response> {
   const assembled = await assembleResponse(events, request.model);
+  await processCompleteIRResponse(assembled, options.processCompleteIRResponse);
   for (const event of assembled.unhandled) options.onUnhandled?.(event.rawType, event.raw);
 
   if (assembled.error !== null) {

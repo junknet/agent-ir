@@ -369,9 +369,10 @@ export function mergeAdjacentTurns(request: IRRequest): IRRepairResult {
 // ── defaultMaxOutputTokens ──────────────────────────────────────────────────
 
 /**
- * 客户端没给上限时替它填一个。**只在目标认识 `maxOutputTokens` 时才该调用**
- * （由规格表的 `repairWhenPresent` 闸门保证）—— 给一个连这个参数都没有的上游填值，
- * 只会凭空造出一条准入过不去的需求。
+ * 客户端没给上限时替它填一个。**只在目标强制要求 `maxOutputTokens` 时才该调用**
+ * （由规格表的 `repairWhenMandatory` 闸门保证）—— 给一个只是**接受**这个参数的上游填值，
+ * 是凭空造出一条它本来没有的约束：实测 CloudCode 把 thinkingBudget 算进 maxOutputTokens，
+ * 补一个 4096 会让 18/807 条真实请求从「能编译」变成 422（DEFECT-10）。
  *
  * `source` 是 `gateway-default`：下游看到 client 与 gateway 的区别，冲突时才知道该听谁的。
  */
@@ -390,5 +391,59 @@ export function fillDefaultMaxOutputTokens(
     detail:
       `gateway picked an output ceiling of ${options.tokens} tokens because the client stated none; ` +
       `a longer answer than this will come back truncated with stopReason=maxTokens`,
+  }]);
+}
+
+// ── raiseMaxOutputTokens ────────────────────────────────────────────────────
+
+/**
+ * 抬高客户端**明确说出口**的输出上限。
+ *
+ * 与 `defaultMaxOutputTokens` 的分界只有一句话：那条填的是**客户端没说过的空位**，
+ * 这条改的是**客户端说过的话**。后者重得多 —— 上限是成本约束，抬高它等于替客户端多花钱，
+ * 所以它默认关闭（与本层所有修复一样，键缺席即不修），且 detail 必须把「客户端说了 N、
+ * 网关抬到 M、为什么」三件事写全，否则调用方在账单上看到的就是一个无从解释的数字。
+ *
+ * 为什么它是 `targetIndependent`：把思考预算算进输出上限**不是某一家的怪癖**。
+ * CloudCode 实测 `maxOutputTokens` 含 thinkingBudget（低于 budget + 可见正文下限时上游
+ * 回 200 空正文）；Anthropic 的 extended thinking 同样要求 `budget_tokens < max_tokens`，
+ * 否则直接 400。一个低于自己思考预算的上限在任何这类目标上都是无解的组合。
+ *
+ * **它不保证修好**：目标要求的下限可能高于 `minimumTokens`（例如客户端只给了 effort，
+ * 由出口按自己的档位表折算出更高的预算）。修不动就仍然拒绝 —— 这一层不去复刻出口的档位表，
+ * 复刻出来的就是第二份会漂移的认知。
+ */
+export function raiseMaxOutputTokens(
+  request: IRRequest, options: OptionsOf<"raiseMaxOutputTokens">,
+): IRRepairResult {
+  const { intent } = request;
+  const stated = intent.stopping.maxOutputTokens;
+  // 只动客户端明说的值。没说的那种是 defaultMaxOutputTokens 的地盘，两条修复不许重叠。
+  if (stated === undefined || stated.source !== "client") return { request, applied: [] };
+
+  // 客户端自己说了思考预算时，「够用」是算得出来的：预算 + 可见正文额度。
+  // 只给了 effort 的客户端一个数字都没说过，那条路上只有 minimumTokens 这个兜底。
+  const budget = intent.reasoning.value.budgetTokens;
+  const raised = Math.max(
+    options.minimumTokens,
+    budget === undefined ? 0 : budget + options.visibleOutputTokens,
+  );
+  if (stated.value >= raised) return { request, applied: [] };
+
+  const next: IRRequest = {
+    ...request,
+    intent: {
+      ...intent,
+      stopping: { ...intent.stopping, maxOutputTokens: defaultValue(raised) },
+    },
+  };
+  return repaired(request, next, [{
+    kind: "raiseMaxOutputTokens",
+    path: "$.intent.stopping.maxOutputTokens",
+    detail:
+      `the client asked for a ceiling of ${stated.value} tokens and the gateway raised it to ` +
+      `${raised} because the target counts the thinking budget inside this same ceiling; ` +
+      `at ${stated.value} the request either compiles to nothing usable or comes back with an empty body, ` +
+      `but the client's stated cost ceiling has been overridden and the answer may cost more than it asked for`,
   }]);
 }

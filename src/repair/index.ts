@@ -40,7 +40,8 @@ export { IR_REPAIR_SPECS } from "./specs.ts";
 /** 单条修复也是公开契约：调用方可以只用其中一条，拿到的 IR 同样自洽（`requires` 已重推）。 */
 export {
   dropEmptyTurns, dropOrphanToolResults, fillDanglingToolCalls, fillDefaultMaxOutputTokens,
-  fillEmptyToolResults, mergeAdjacentTurns, textualizeUnsupportedDocuments, textualizeUnsupportedImages,
+  fillEmptyToolResults, mergeAdjacentTurns, raiseMaxOutputTokens,
+  textualizeUnsupportedDocuments, textualizeUnsupportedImages,
 } from "./repairs.ts";
 
 /**
@@ -49,6 +50,9 @@ export {
  * `repairWhenMissing` 取「不在 supports」这个最宽的判据（lossy 也算缺），
  * 是否真的对 lossy 动手由每条修复自己的 `trigger` 选项收窄 —— 闸门不能比实现更严，
  * 否则会出现「选项开了却没生效」。
+ *
+ * `repairWhenMandatory` 读的是 `profile.mandatory` 而不是 supports：问的是「目标**要求**
+ * 这个字段吗」，不是「目标认识它吗」。两者混用会让修复替不要求它的上游凭空造出约束。
  */
 function isGateSatisfied(gate: IRRepairCapabilityGate, profile: IREgressProfile): boolean {
   switch (gate.kind) {
@@ -56,9 +60,8 @@ function isGateSatisfied(gate: IRRepairCapabilityGate, profile: IREgressProfile)
       return true;
     case "repairWhenMissing":
       return gate.capabilities.some((capability) => !profile.supports.has(capability));
-    case "repairWhenPresent":
-      return gate.capabilities.every(
-        (capability) => profile.supports.has(capability) || profile.lossy.has(capability));
+    case "repairWhenMandatory":
+      return gate.fields.every((field) => profile.mandatory[field]);
   }
 }
 

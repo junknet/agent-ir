@@ -1,3 +1,5 @@
+import type { OutboxResponseReadInterceptionOptions } from "./ir_message_interception_extensions.ts";
+
 /**
  * L0/L1/L2 —— IR 的全部类型契约。
  *
@@ -18,7 +20,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * 入口协议 —— **定值封闭集**，世界上的 agent 客户端协议就这三种。
+ * 入口协议 —— **定值封闭集**，本库默认支持的主流 Agent 对话入口只有这三种。
  *
  * 常量数组是唯一授权定义，类型从它派生（与下面的 `IR_CAPABILITIES` 同构）。手写联合做不到
  * 运行时枚举，于是每个需要「全部协议」的地方都会自己抄一份：路由表、注册表、测试各抄一遍，
@@ -314,11 +316,41 @@ export interface IRCapabilityNeed {
   readonly paths: readonly string[];
 }
 
+/**
+ * 目标 wire **强制要求**的 IR 字段 —— 可登记的封闭集。
+ *
+ * 与 `IR_CAPABILITIES` 是**两个正交问题**，混用其中一个回答另一个正是 DEFECT-10 的根因：
+ *
+ *   supports  —— 目标**认识**这个字段吗？（认识 → 可以发）
+ *   mandatory —— 目标**要求**这个字段吗？（要求 → 不发就编不出合法 body）
+ *
+ * 「认识」不蕴含「要求」：Anthropic 强制 `max_tokens`，Gemini 只是接受。给一个只是接受它
+ * 的上游补一个默认值，等于凭空造出一条它本来没有的约束 —— 实测代价是 18/807 条真实
+ * gemini 请求从「能编译」变成 422（CloudCode 把 thinkingBudget 算进 maxOutputTokens）。
+ *
+ * 只登记**有拒绝逻辑为证**的字段：一个成员进这张表的门槛是「某个出口在缺它时会抛
+ * `requiredFieldMissing`」。没有拒绝逻辑的字段不是「必填」，只是「可选」。
+ */
+export const IR_MANDATORY_FIELDS = ["maxOutputTokens"] as const;
+
+export type IRMandatoryField = (typeof IR_MANDATORY_FIELDS)[number];
+
+/**
+ * 每个出口对每个必填字段的表态。**映射类型而不是集合**：集合漏了一项没人会报错，
+ * 映射类型让「新增一个必填字段」当场点亮全部六个出口的声明，逼每家逐个表态。
+ */
+export type IRMandatoryFieldTable = Readonly<Record<IRMandatoryField, boolean>>;
+
 export interface IREgressProfile {
   readonly provider: string;
   readonly supports: ReadonlySet<IRCapability>;
   /** 能承载但有损（如 toolGroup 靠拍平实现）。放行，但强制记 loss。 */
   readonly lossy: ReadonlySet<IRCapability>;
+  /**
+   * 目标**强制要求**哪些 IR 字段。判据是 wire 事实，不是偏好：
+   * 缺了这个字段，`writeUpstreamRequest` 会带 `requiredFieldMissing` 拒绝。
+   */
+  readonly mandatory: IRMandatoryFieldTable;
 }
 
 /** 损失的四种形态。语料回放要在运行时枚举它们核对，所以是常量数组而非手写联合。 */
@@ -509,5 +541,5 @@ export type UpstreamRequestBuildResult<TBody extends IRWireBody = string> =
 export interface IREgress<TBody extends IRWireBody = string> {
   readonly profile: IREgressProfile;
   writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult<TBody>>;
-  readUpstreamResponse(response: Response): AsyncIterable<IREvent>;
+  readUpstreamResponse(response: Response, options?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent>;
 }

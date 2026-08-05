@@ -25,8 +25,9 @@
  * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `UpstreamRequestReport`。
  */
 import { iterateSse, tryParseJson } from "../ir/sse.ts";
+import type { OutboxResponseReadInterceptionOptions } from "../ir/ir_message_interception_extensions.ts";
 import type {
-  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss,
+  IRBuildProblem, IRCapability, IREffort, IREgress, IREgressProfile, IREvent, IRLoss, IRMandatoryFieldTable,
   UpstreamRequestBuildResult, IRPart, IRReasoningDisplay,
   IRRequest, IRStopReason, IRTool, IRUpstreamError, IRUsage,
 } from "../ir/types.ts";
@@ -550,11 +551,18 @@ function lowerReasoningConfig(request: IRRequest, report: UpstreamRequestReport)
   return Object.keys(config).length === 0 ? null : config;
 }
 
+/**
+ * `/v1/responses` **不要求** max_output_tokens —— 恰恰相反：私有 codex 端点对它直接 400
+ * （见文件头），所以这里连「可以发」都是有条件的，更谈不上必填。
+ */
+const MANDATORY: IRMandatoryFieldTable = { maxOutputTokens: false };
+
 export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREgress {
   const profile: IREgressProfile = {
     provider: PROVIDER,
     supports: new Set(SUPPORTED),
     lossy: new Set(LOSSY),
+    mandatory: MANDATORY,
   };
 
   return {
@@ -609,6 +617,17 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
         };
       }
 
+      // 会话身份**部分**承载：`prompt_cache_key` 实测就是会话 uuid，sessionId 无损送达；
+      // device_id / account_uuid 在这条 wire 上没有位置 —— `user` 的语义是滥用检测标识，
+      // 把设备/账号 id 塞进去会改变上游对该字段的用法。丢的那两项各记一条，不静默。
+      if (intent.identity.deviceId !== undefined || intent.identity.accountUuid !== undefined) {
+        report.record({
+          path: "$.intent.identity", kind: "dropped",
+          detail: "/v1/responses carries the session id as prompt_cache_key but has no slot for the client's "
+            + "device id or account uuid; its only identity field (`user`) means something else upstream",
+        });
+      }
+
       // 拒绝时**不构造 body**：半个非法请求体连序列化出来的机会都不该有。
       if (report.rejected) {
         return { ok: false, problems: report.drainProblems(), losses: report.drain() };
@@ -634,7 +653,9 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
         ...(intent.sampling.topP === undefined ? {} : { top_p: intent.sampling.topP.value }),
         ...(intent.serviceTier.source === "client" && intent.serviceTier.value === "priority"
           ? { service_tier: "priority" } : {}),
-        // 实测 prompt_cache_key == 会话 uuid，是这个端点唯一的缓存抓手。
+        // 实测 prompt_cache_key == 会话 uuid，是这个端点唯一的身份/缓存抓手。
+        // device_id / account_uuid 没有对应位（`user` 的语义是滥用检测标识，不是会话身份），
+        // 它们的丢弃在上面记了一条 loss。
         ...(intent.identity.sessionId === undefined ? {} : { prompt_cache_key: intent.identity.sessionId }),
       };
 
@@ -655,8 +676,8 @@ export function createResponsesUpstream(options: ResponsesUpstreamOptions): IREg
       };
     },
 
-    readUpstreamResponse(response: Response): AsyncIterable<IREvent> {
-      return liftResponsesStream(response);
+    readUpstreamResponse(response: Response, readOptions?: OutboxResponseReadInterceptionOptions): AsyncIterable<IREvent> {
+      return liftResponsesStream(response, readOptions);
     },
   };
 }
@@ -844,7 +865,9 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-async function* liftResponsesStream(response: Response): AsyncGenerator<IREvent> {
+async function* liftResponsesStream(
+  response: Response, readOptions?: OutboxResponseReadInterceptionOptions,
+): AsyncGenerator<IREvent> {
   // 非 2xx：整体读出来当一次性错误，不进 SSE 解析。
   if (!response.ok) {
     const text = await response.text();
@@ -863,7 +886,7 @@ async function* liftResponsesStream(response: Response): AsyncGenerator<IREvent>
   let sawToolCall = false;
   let started = false;
 
-  for await (const frame of iterateSse(response)) {
+  for await (const frame of iterateSse(response, readOptions?.processCompleteSseFrame)) {
     const payload = tryParseJson<Record<string, unknown>>(frame.data);
     if (payload === null || !isRecord(payload)) {
       // data 段解析不出 JSON：上游换了编码，或流被截断在半个事件上。丢掉它就等于它从没存在过。

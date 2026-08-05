@@ -405,7 +405,8 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 已知缺陷 —— 断言的是应有行为，当前实现做不到，故意保留失败
+// 回归守卫 —— 以下三组曾是真实缺陷（DEFECT-7/8/9），已修复。用例原样保留：
+// 它们断言的是**应有行为**，改动分类链时谁破坏了它，谁就是让老故障复发。
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -419,10 +420,10 @@ describe("错误体不是 JSON（nginx 502 页 / Cloudflare 纯文本）", () =>
  * `retryable` 落到 `false`。调用方于是**不会退避重试一个纯粹的瞬时故障**。
  *
  * 另外四个出口都拿 `httpStatus` 兜底（`httpStatusKind` / `classifyError` /
- * `code === 500` 分支），只有这一家没有。修法是在 kind 的推导链末尾加一段
- * 「type/message 都没命中时按 httpStatus 归档」。
+ * `code === 500` 分支），只有这一家没有。**已修**：kind 的推导链末尾加了一段
+ * 「type/message 都没命中时按 httpStatus 归档」（`kindFromHttpStatus`）。
  */
-describe("[暴露缺陷] anthropic 出口的错误分类完全忽略 HTTP 状态码", () => {
+describe("[守卫] anthropic 出口的错误分类必须把 HTTP 状态码算进去", () => {
   const CLOUDFLARE_524 = "error code: 524";
   const NGINX_502 = "<html><head><title>502 Bad Gateway</title></head></html>";
 
@@ -475,9 +476,9 @@ describe("[暴露缺陷] anthropic 出口的错误分类完全忽略 HTTP 状态
  * 完全相反（前者压缩上下文后重发，后者重发多少次都没用）。这正是 `types.ts` 里
  * 「一天 126 次静默 context_length_exceeded」那条注释描述的故障，只是换了个位置复发。
  *
- * 修法：把 message 正则**前置**到 type 判断之前，或在 invalidRequest 分支内再判一次。
+ * **已修**：message 正则前置到 type 判断之前，`contextLengthExceeded` 因此可达。
  */
-describe("[暴露缺陷] anthropic 出口的 contextLengthExceeded 是不可达分支", () => {
+describe("[守卫] anthropic 出口的 contextLengthExceeded 必须可达", () => {
   const REAL_TOO_LONG = JSON.stringify({
     type: "error",
     error: { type: "invalid_request_error", message: "prompt is too long: 214253 tokens > 200000 maximum" },
@@ -516,7 +517,7 @@ describe("[暴露缺陷] anthropic 出口的 contextLengthExceeded 是不可达�
  * 或隧道的部署都会撞上它，而撞上的后果是**不退避、不重试**，直接把一个瞬时故障
  * 报成永久失败。
  */
-describe("[暴露缺陷] 5xx 应当整段可重试，而不是只认几个特定码", () => {
+describe("[守卫] 5xx 必须整段可重试，而不是只认几个特定码", () => {
   for (const status of [520, 522, 524, 529]) {
     it(`DEFECT-8 HTTP ${status}：五个出口都应当是可重试的 upstreamUnavailable`, async () => {
       for (const [name, egress] of Object.entries(EGRESSES)) {

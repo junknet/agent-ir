@@ -335,6 +335,7 @@ const MAXIMAL_POLICY: IRRepairPolicy = {
   dropEmptyTurn: {},
   mergeAdjacentTurns: {},
   defaultMaxOutputTokens: {},
+  raiseMaxOutputTokens: {},
 };
 
 /**
@@ -443,6 +444,37 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
     expect(improved).toBeGreaterThan(0);
   }, 180_000);
 
+  /**
+   * `unsatisfiableValue` 曾经是**一条修复都覆盖不到**的 problem kind：422 里那句
+   * 「no repair kind covers this problem」是当时唯一诚实的回答。`raiseMaxOutputTokens`
+   * 就是给它的答案，这条测的是它在真实语料上真的有用 —— 建议一条修不动的修复，
+   * 比不给建议更贵。
+   */
+  it.skipIf(corpus.length === 0)("raiseMaxOutputTokens 真的救得回 unsatisfiableValue", async () => {
+    const gemini = EGRESSES.gemini_cloudcode;
+    if (gemini === undefined) throw new Error("gemini egress missing");
+    let rejectedByCombination = 0;
+    let rescued = 0;
+    for (const entry of corpus) {
+      const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      clearThoughtSignatureCache();
+      const before = await gemini.writeUpstreamRequest(request);
+      if (before.ok || !before.problems.some((problem) => problem.kind === "unsatisfiableValue")) continue;
+      rejectedByCombination += 1;
+
+      const repaired = repairForAdmission(request, gemini.profile, { raiseMaxOutputTokens: {} });
+      clearThoughtSignatureCache();
+      if ((await gemini.writeUpstreamRequest(repaired.request)).ok) rescued += 1;
+    }
+    console.log(`raiseMaxOutputTokens rescued ${rescued} of ${rejectedByCombination} unsatisfiableValue rejections`);
+    expect(rejectedByCombination).toBeGreaterThan(0);
+    expect(rescued).toBeGreaterThan(0);
+    // 默认值救不回全部，这是**已知边界**不是遗漏：剩下的那些客户端只给了 effort，
+    // 由出口按自己的档位表折出更高的预算（max 档 32768）。修复层不复刻那张表 ——
+    // 复刻出来就是第二份会漂移的认知；调用方按自己的档位调高 minimumTokens 即可。
+    expect(rescued).toBeLessThanOrEqual(rejectedByCombination);
+  }, 180_000);
+
   it("修复种类与 problem 种类都是封闭集，测试里引用的名字必须还在册", () => {
     for (const kind of EXPLAINABLE_PROBLEMS) expect(IR_BUILD_PROBLEM_KINDS).toContain(kind);
     for (const capability of EXPLAINABLE_UNSUPPORTED) expect(IR_CAPABILITIES).toContain(capability);
@@ -457,25 +489,22 @@ describe("语料属性测试：每条真实请求 × 每个出口", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * 修复层的价值判据只有一条，`src/repair/index.ts` 的文件头亲自写着：
- * **「原本被拒的请求变得可通过」**。反过来的方向没有被任何东西挡住 ——
- * 而它真的会发生。
+ * **单调性**：修复只会让更多请求通过，绝不会让本来能编的请求编不出来。
  *
- * 机制：`defaultMaxOutputTokens` 的闸门是 `repairWhenPresent: ["maxOutputTokens"]`，
- * 意思是「目标**认识**这个参数就填」。gemini_cloudcode 认识它，于是闸门放行，
- * 填进 4096（这个数字是照着 Anthropic 的强制要求定的）。但 CloudCode 把
- * `thinkingBudget` **算在** `maxOutputTokens` 里面：客户端要 effort:'high'
- * （budget 10000）时，4096 连可见正文的下限都不够，于是构造阶段抛
- * `unsatisfiableValue`。
+ * 这是修复层的核心不变量，`src/repair/index.ts` 的文件头写的「原本被拒的请求变得可通过」
+ * 说的只是它的正方向；反方向一样是约束，而且曾经真的被打破过（DEFECT-10）：
  *
- * 而**不修**的时候，gemini 出口用自己的 65536 上限，同一条请求编得好好的。
- * 换句话说：调用方为了让 Chat→Anthropic 那条路能走而打开这条修复，
- * 会顺带把 Gemini 路由上 2.2% 的真实流量从「能用」变成「422」。
+ *   `defaultMaxOutputTokens` 的闸门曾是 `repairWhenPresent: ["maxOutputTokens"]`，
+ *   问的是「目标**认识**这个参数吗」。gemini_cloudcode 认识它，于是闸门放行、填进 4096。
+ *   但 CloudCode 把 `thinkingBudget` **算在** `maxOutputTokens` 里面：客户端要
+ *   effort:'high'（budget 10000）时 4096 连可见正文的下限都不够，构造阶段抛
+ *   `unsatisfiableValue` —— 而**不修**的时候同一条请求编得好好的（出口用自己的 65536）。
+ *   语料实测 18/807 条真实 gemini 请求因此从「能用」变成 422。
  *
- * 修法有两条，都不在 Core：让闸门收窄成「目标**必须**要这个字段才填」，
- * 或让默认值随出口走（`repairWhenPresent` 里带一个每家自己的值）。
+ * 根因是契约缺了一个维度：闸门只能问 supports（认识），问不出 mandatory（要求）。
+ * 补上 `IREgressProfile.mandatory` 之后闸门改问后者，下面两条就是它的守卫。
  */
-describe("[暴露缺陷] 修复不是单调的：开一条修复会把本来能编译的请求弄成不能", () => {
+describe("单调性：开一条修复不许把本来能编译的请求弄成不能", () => {
   const geminiEgress = createGeminiCloudCodeUpstream({
     model: "gemini-test", accessToken: "t", project: "p", requestIdFactory: () => "r",
   });
@@ -491,7 +520,7 @@ describe("[暴露缺陷] 修复不是单调的：开一条修复会把本来能�
     return request;
   }
 
-  it("DEFECT-10a 最小复现：不修能编译，开 defaultMaxOutputTokens 反而编不出来", async () => {
+  it("DEFECT-10a 最小复现：目标只是「认识」max_tokens，就不许替它填", async () => {
     const request = highEffortWithoutCeiling();
     expect(request.intent.stopping.maxOutputTokens).toBeUndefined();
 
@@ -500,14 +529,31 @@ describe("[暴露缺陷] 修复不是单调的：开一条修复会把本来能�
     expect(before.ok).toBe(true);
 
     const repaired = repairForAdmission(request, geminiEgress.profile, { defaultMaxOutputTokens: {} });
-    expect(repaired.applied.map((record) => record.kind)).toEqual(["defaultMaxOutputTokens"]);
+    // 闸门问的是 mandatory：CloudCode 不要求这个字段 → 一个字段都不动，请求原样通过。
+    expect(geminiEgress.profile.mandatory.maxOutputTokens).toBe(false);
+    expect(repaired.applied).toEqual([]);
+    expect(repaired.request).toBe(request);
     clearThoughtSignatureCache();
     const after = await geminiEgress.writeUpstreamRequest(repaired.request);
-    // ↓ 应有行为：修复只会加分。实际：unsatisfiableValue。
     expect(after.ok).toBe(true);
   });
 
-  it.skipIf(corpus.length === 0)("DEFECT-10b 语料上的规模：一条修复让多少真实请求从能编译变成不能", async () => {
+  it("对照：强制要求 max_tokens 的目标照填不误 —— 闸门收窄不等于把这条修复废掉", async () => {
+    const request = highEffortWithoutCeiling();
+    const anthropicEgress = createAnthropicUpstream({ baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" });
+    expect(anthropicEgress.profile.mandatory.maxOutputTokens).toBe(true);
+
+    const before = await anthropicEgress.writeUpstreamRequest(request);
+    expect(before.ok).toBe(false);
+    if (!before.ok) expect(before.problems.map((p) => p.kind)).toContain("requiredFieldMissing");
+
+    const repaired = repairForAdmission(request, anthropicEgress.profile, { defaultMaxOutputTokens: {} });
+    expect(repaired.applied.map((record) => record.kind)).toEqual(["defaultMaxOutputTokens"]);
+    const after = await anthropicEgress.writeUpstreamRequest(repaired.request);
+    expect(after.ok).toBe(true);
+  });
+
+  it.skipIf(corpus.length === 0)("DEFECT-10b 语料规模：全开策略下一条都不许回退", async () => {
     const regressed: string[] = [];
     for (const entry of corpus) {
       const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
@@ -531,4 +577,51 @@ describe("[暴露缺陷] 修复不是单调的：开一条修复会把本来能�
     console.log(`repairs regressed ${regressed.length} (request, egress) pairs; first few:`, regressed.slice(0, 3));
     expect(regressed.length).toBe(0);
   }, 180_000);
+
+  /**
+   * 全开策略只测了「八条一起开」这一个点。单调性是**每一条各自**的性质：
+   * 一条修复单独打开时也不许让任何 ok:true 变成 ok:false —— 组合起来不回退，
+   * 不蕴含逐条不回退（两条修复的效果可能互相抵消，把真正的回退盖住）。
+   *
+   * 逐条跑，用的是每条修复的**默认选项**（`{}`）：默认值是调用方最可能拿到的那份行为，
+   * 也是唯一一份写在规格表里的值。
+   */
+  it.skipIf(corpus.length === 0)("逐条：任意一条默认修复单独打开，都不许让 ok:true 变成 ok:false", async () => {
+    interface Baseline { readonly name: string; readonly egress: IREgress<IRWireBody>; readonly request: IRRequest; }
+    const compilable: Baseline[] = [];
+    for (const entry of corpus) {
+      const { request } = readClientRequestForProtocol(entry.protocol, JSON.parse(entry.body), entry.traceId);
+      for (const [name, egress] of Object.entries(EGRESSES)) {
+        if (!checkUpstreamSupport(request, egress.profile).admitted) continue;
+        clearThoughtSignatureCache();
+        const before = await egress.writeUpstreamRequest(request);
+        if (before.ok) compilable.push({ name, egress, request });
+      }
+    }
+    expect(compilable.length).toBeGreaterThan(0);
+
+    const regressions: string[] = [];
+    for (const kind of IR_REPAIR_KINDS) {
+      const policy = { [kind]: {} } as IRRepairPolicy;
+      let broken = 0;
+      for (const { name, egress, request } of compilable) {
+        const repaired = repairForAdmission(request, egress.profile, policy);
+        // 没动过就一定不会回退，省掉一次构造。
+        if (repaired.request === request) continue;
+        if (!repaired.admission.admitted) { broken += 1; continue; }
+        clearThoughtSignatureCache();
+        const after = await egress.writeUpstreamRequest(repaired.request);
+        if (!after.ok) {
+          broken += 1;
+          if (regressions.length < 5) {
+            regressions.push(`${kind} @ ${name}/${request.traceId}: ${after.problems.map((p) => p.kind).join(",")}`);
+          }
+        }
+      }
+      if (broken > 0) regressions.push(`${kind} broke ${broken} of ${compilable.length} compilable pairs`);
+    }
+    console.log(`per-repair monotonicity over ${compilable.length} compilable (request, egress) pairs:`,
+      regressions.length === 0 ? "clean" : regressions);
+    expect(regressions).toEqual([]);
+  }, 300_000);
 });

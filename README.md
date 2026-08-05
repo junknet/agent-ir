@@ -1,6 +1,6 @@
 # agent-ir
 
-多协议 LLM 网关的协议中立 IR。**三个入口协议 → 一个 IR → 五个上游**。
+多协议 Agent 网关的协议中立 IR。默认内置三个行业主流对话入口：**三个 Inbox → 一个 IR → 开放 Outbox**。
 
 完整架构图（总览 / 请求时序 / 事件流 / 源码映射）见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。
 
@@ -54,6 +54,73 @@ L2  Capability     能力声明 + 损失记账   src/ir/admission.ts
 need ∈ supports          → 放行
 need ∈ lossy             → 放行 + 强制记一条 IRLoss
 need ∉ supports ∪ lossy  → 该出口不可用（多出口换一家，单出口 422 并带精确 IR 路径）
+```
+
+## 默认 Inbox：三个可直接使用的端点
+
+这是 Agent 对话/工具循环的主流兼容组合，而非宣称存在一个跨厂商的正式统一标准。入口是封闭集，
+出站供应商 wire 是开放集；新增 Outbox 不会增加新的客户端端点。
+
+| HTTP endpoint | IR protocol | 面向的客户端生态 |
+|---|---|---|
+| `POST /v1/messages` | `anthropic_messages` | Anthropic Messages / Claude |
+| `POST /v1/responses` | `openai_responses` | OpenAI Responses（agent-native） |
+| `POST /v1/chat/completions` | `openai_chat_completions` | **OpenAI-compatible / Chat Completions** |
+
+第三项固定称为 **OpenAI-compatible**，不称 “OpenAI-compact”。三条路径都由
+`INGRESS_PATH_BY_PROTOCOL` 单一注册表派生并已在服务器默认启用。
+
+## IRMessage 审计 interceptor chain（内置）
+
+`createIRMessageInterceptionExtensions()` 提供三条 OkHttp 风格、注册顺序确定的强类型 interceptor
+chain。每环拿到
+同一 IR/SSE 对象的可变引用（不是 JSON 副本）和一次性的 `chain.proceed(value)`；下行按注册顺序、
+上行按相反顺序返回。request 修改返回后会重算 `requires`。
+
+| 点位 | 时机 | 用途 |
+|---|---|---|
+| `inboxRequestInterceptorChain` | decode 后、路由/repair/outbox 前 | 修改或以 `IRRequestInterceptionRejected` 阻断 IR 请求 |
+| `outboxSseFrameInterceptorChain` | TCP buffer 积累到完整 SSE 帧后、outbox lift 前 | 实时审计/修改尚未解析的 SSE `event` / `data` |
+| `inboxCompletedResponseInterceptorChain` | 完整 `IRResponse` 形成时 | 流式在 inbox done/error 字节前；非流式在 inbox JSON 编码前 |
+
+SSE 不按网络 chunk 或任意换行回调。共享 `iterateSse` 会跨 chunk 缓冲，逐行识别 CRLF/LF/CR，
+只在**空行结束一个 SSE frame**时执行 `outboxSseFrameInterceptorChain`。已经发送给客户端的流式
+delta 无法追回；要改实时正文必须使用该链，`inboxCompletedResponseInterceptorChain` 适合最终文档和
+终止状态的审计。
+
+宿主注册后启动即可把三点接进真实网关路径：
+
+```ts
+import {
+  createIRMessageInterceptionExtensions,
+  IRRequestInterceptionRejected,
+  startGateway,
+} from "agent-ir";
+
+const irMessageInterceptionExtensions = createIRMessageInterceptionExtensions();
+irMessageInterceptionExtensions.inboxRequestInterceptorChain.addInterceptor({
+  interceptorId: "security-audit",
+  async intercept(request, context, chain) {
+    // 原地审计/修改 request；不调用 proceed 可短路剩余审计环。
+    // 要拒绝 HTTP 请求则 throw new IRRequestInterceptionRejected(403, "policy_denied", "...")。
+    return chain.proceed(request);
+  },
+});
+irMessageInterceptionExtensions.outboxSseFrameInterceptorChain.addInterceptor({
+  interceptorId: "sse-security-audit",
+  async intercept(frame, context, chain) {
+    // frame.data 已在空行处完整缓冲；原地修改后再继续 outbox lift。
+    return chain.proceed(frame);
+  },
+});
+irMessageInterceptionExtensions.inboxCompletedResponseInterceptorChain.addInterceptor({
+  interceptorId: "completed-response-audit",
+  async intercept(response, context, chain) {
+    // 流式和非流式共用这个完整 IRResponse 点位。
+    return chain.proceed(response);
+  },
+});
+startGateway(process.env, irMessageInterceptionExtensions);
 ```
 
 ## 语料与证据
@@ -116,8 +183,8 @@ bun run typecheck
 | `/v1/responses` | codex 0.146.0 | 228KB 请求、247 工具、14 个 namespace 分组 |
 | `/v1/chat/completions` | jcode | 219KB 请求、230 工具 |
 
-出口侧已接五家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode` · `windsurf`，
-因此当前可用路由是 3 入口 × 5 出口 = 15 条。Windsurf 使用统一的
+出口侧已接六家：`anthropic` · `openai_chat` · `openai_responses` · `gemini_cloudcode` · `windsurf` · `copilot`，
+因此当前可用路由是 3 入口 × 6 出口 = 18 条。Windsurf 使用统一的
 ConnectRPC/Protobuf `GetChatMessage` outbox；模型家族只由 `chat_model_uid` 选择，不另拆出口。
 
 codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍进名字，
@@ -131,8 +198,8 @@ codex 那条同时验证了 L2：namespace 分组在 Anthropic 出口只能拍�
 ```ts
 interface IREgress {
   readonly profile: IREgressProfile;              // supports / lossy 静态声明
-  lower(request: IRRequest): Promise<IRLowerResult>;   // IR → wire + losses
-  readUpstreamResponse(response): AsyncIterable<IREvent>;              // 上游响应 → IR 事件流
+  writeUpstreamRequest(request: IRRequest): Promise<UpstreamRequestBuildResult>; // IR → wire + losses
+  readUpstreamResponse(response, options?): AsyncIterable<IREvent>;              // 上游响应 → IR 事件流
 }
 ```
 

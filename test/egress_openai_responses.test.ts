@@ -346,6 +346,33 @@ describe("lower：会话 → 扁平 item 序列", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+describe("会话身份：承载得了的发，承载不了的留痕", () => {
+  it("sessionId → prompt_cache_key（实测这就是会话 uuid），没有多余的 loss", async () => {
+    const { body, losses } = await lowerBody(makeRequest({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: { identity: { sessionId: "sess-42" } },
+    }));
+    expect(body.prompt_cache_key).toBe("sess-42");
+    expect(losses.filter((loss) => loss.path === "$.intent.identity")).toEqual([]);
+  });
+
+  it("device_id / account_uuid 没有位置：不塞进 `user`，各记一条 loss", async () => {
+    const { body, losses } = await lowerBody(makeRequest({
+      turns: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      intent: { identity: { sessionId: "sess-42", deviceId: "dev-1", accountUuid: "acct-1" } },
+    }));
+    expect(body.prompt_cache_key).toBe("sess-42");
+    expect(Object.hasOwn(body, "user")).toBe(false);
+    expect(losses).toContainEqual(expect.objectContaining({ path: "$.intent.identity", kind: "dropped" }));
+    expect(JSON.stringify(body)).not.toContain("dev-1");
+    expect(JSON.stringify(body)).not.toContain("acct-1");
+  });
+
+  it("必填字段：/v1/responses 不要求 max_output_tokens", () => {
+    expect(egress.profile.mandatory.maxOutputTokens).toBe(false);
+  });
+});
+
 describe("lower：损失必须留痕", () => {
   // 旧行为：悬空调用补一条占位 output、孤儿结果直接丢，各记一条 loss。两者都是
   // 「网关替客户端决定」，已剥离到 src/repair —— Core 现在只拒绝，并且一次收齐。

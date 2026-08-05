@@ -76,35 +76,36 @@ function finalizePart(pending: PendingPart): IRResponsePart | null {
  * 不抛异常：上游的失败是数据（`error`），不是控制流。调用方永远拿得到一个 IRResponse，
  * 靠 `error` / `stopReason === null` 判定结局。
  */
-export async function assembleResponse(
-  events: AsyncIterable<IREvent>,
-  fallbackModel: string,
-): Promise<IRResponse> {
-  const pendingByIndex = new Map<number, PendingPart>();
-  const order: number[] = [];
-  const losses: IRLoss[] = [];
-  const unhandled: IRUnhandledEvent[] = [];
-  let model = fallbackModel;
-  let usage: IRUsage | null = null;
-  let stopReason: IRStopReason | null = null;
-  let error: IRUpstreamError | null = null;
+export class IRResponseAccumulator {
+  readonly #pendingByIndex = new Map<number, PendingPart>();
+  readonly #order: number[] = [];
+  readonly #losses: IRLoss[] = [];
+  readonly #unhandled: IRUnhandledEvent[] = [];
+  #model: string;
+  #usage: IRUsage | null = null;
+  #stopReason: IRStopReason | null = null;
+  #error: IRUpstreamError | null = null;
 
-  for await (const event of events) {
+  constructor(fallbackModel: string) {
+    this.#model = fallbackModel;
+  }
+
+  accept(event: IREvent): void {
     switch (event.kind) {
       case "messageStart":
-        if (event.model.length > 0) model = event.model;
+        if (event.model.length > 0) this.#model = event.model;
         break;
 
       case "partStart":
-        if (!pendingByIndex.has(event.index)) order.push(event.index);
-        pendingByIndex.set(event.index, { part: event.part, toolInputBuffer: "" });
+        if (!this.#pendingByIndex.has(event.index)) this.#order.push(event.index);
+        this.#pendingByIndex.set(event.index, { part: event.part, toolInputBuffer: "" });
         break;
 
       case "partDelta": {
-        const pending = pendingByIndex.get(event.index);
+        const pending = this.#pendingByIndex.get(event.index);
         if (pending === undefined) {
           // 没有 partStart 就来 delta：上游帧序坏了，记下来而不是静默丢内容。
-          unhandled.push({ rawType: "partDelta-without-partStart", raw: event });
+          this.#unhandled.push({ rawType: "partDelta-without-partStart", raw: event });
           break;
         }
         const { part } = pending;
@@ -120,7 +121,7 @@ export async function assembleResponse(
         } else if (delta.kind === "toolInputText") {
           pending.toolInputBuffer += delta.text;
         } else {
-          unhandled.push({ rawType: `partDelta:${delta.kind}-on-${part.kind}`, raw: event });
+          this.#unhandled.push({ rawType: `partDelta:${delta.kind}-on-${part.kind}`, raw: event });
         }
         break;
       }
@@ -129,23 +130,23 @@ export async function assembleResponse(
         break;
 
       case "usage":
-        usage = event.usage;
+        this.#usage = event.usage;
         break;
 
       case "messageStop":
-        stopReason = event.reason;
+        this.#stopReason = event.reason;
         break;
 
       case "error":
-        error = event.error;
+        this.#error = event.error;
         break;
 
       case "loss":
-        losses.push(event.loss);
+        this.#losses.push(event.loss);
         break;
 
       case "unhandled":
-        unhandled.push({ rawType: event.rawType, raw: event.raw });
+        this.#unhandled.push({ rawType: event.rawType, raw: event.raw });
         break;
 
       // 传输层信号，不进响应文档：committed 是给调用方判「还能不能换号」的，
@@ -156,25 +157,39 @@ export async function assembleResponse(
     }
   }
 
-  const parts: IRResponsePart[] = [];
-  for (const index of order) {
-    const pending = pendingByIndex.get(index);
-    if (pending === undefined) continue;
-    const finalized = finalizePart(pending);
-    if (finalized === null) {
-      losses.push({
-        stage: "lift",
-        provider: null,
-        path: `$.response.parts[${index}]`,
-        kind: "dropped",
-        detail: `'${pending.part.kind}' is not a model output shape and cannot appear in a response`,
-      });
-      continue;
+  finish(): IRResponse {
+    const parts: IRResponsePart[] = [];
+    for (const index of this.#order) {
+      const pending = this.#pendingByIndex.get(index);
+      if (pending === undefined) continue;
+      const finalized = finalizePart(pending);
+      if (finalized === null) {
+        this.#losses.push({
+          stage: "lift",
+          provider: null,
+          path: `$.response.parts[${index}]`,
+          kind: "dropped",
+          detail: `'${pending.part.kind}' is not a model output shape and cannot appear in a response`,
+        });
+        continue;
+      }
+      parts.push(finalized);
     }
-    parts.push(finalized);
-  }
 
-  return { model, turn: { role: "assistant", parts }, stopReason, usage, error, losses, unhandled };
+    return {
+      model: this.#model, turn: { role: "assistant", parts }, stopReason: this.#stopReason,
+      usage: this.#usage, error: this.#error, losses: this.#losses, unhandled: this.#unhandled,
+    };
+  }
+}
+
+export async function assembleResponse(
+  events: AsyncIterable<IREvent>,
+  fallbackModel: string,
+): Promise<IRResponse> {
+  const accumulator = new IRResponseAccumulator(fallbackModel);
+  for await (const event of events) accumulator.accept(event);
+  return accumulator.finish();
 }
 
 /**

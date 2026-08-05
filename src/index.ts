@@ -8,6 +8,8 @@
 export * from "./ir/types.ts";
 export * from "./ir/codec.ts";
 export * from "./ir/response.ts";
+export * from "./ir/ir_message_interception_extensions.ts";
+export { createRequestHandler, startGateway } from "./server.ts";
 export * from "./ir/admission.ts";
 export * from "./ir/capabilities.ts";
 export * from "./ir/stream_guard.ts";
