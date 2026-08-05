@@ -30,11 +30,23 @@ function decodeBlock(block: unknown, path: string, losses: LossRecorder): IRPart
     (cacheBreakpoint === undefined ? part : { ...part, cacheBreakpoint });
 
   switch (block.type) {
-    case "text":
+    case "text": {
       if (asString(block.text) === null) {
         losses.record({ path: `${path}.text`, kind: "substituted", detail: "text block without a string text value" });
       }
+      // `citations` 是 Anthropic 文本块上的引用数组，IR 没有承载位。语料 807 条里出现 6 次
+      // 且**全是空数组**（等于什么都没说），所以不为它建模型；但非空时必须留痕，
+      // 否则真有引用数据的那天它会静默消失。
+      const citations = block.citations;
+      if (Array.isArray(citations) && citations.length > 0) {
+        losses.record({
+          path: `${path}.citations`,
+          kind: "dropped",
+          detail: `text block carries ${citations.length} citation(s); IR has no slot for them and they will not reach the model`,
+        });
+      }
       return withCache({ kind: "text", text: asString(block.text) ?? "" });
+    }
 
     case "thinking": {
       const signature = asString(block.signature);

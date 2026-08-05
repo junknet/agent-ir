@@ -754,3 +754,38 @@ describe("形状不对时换成空值，但必须留痕", () => {
     expect(losses.length).toBeGreaterThan(0);
   });
 });
+
+/**
+ * `citations` 是 Anthropic 文本块上的引用数组，IR 没有承载位。
+ * 语料 807 条里出现 6 次且全是空数组 —— 所以不为它建模型；但非空必须留痕，
+ * 否则真有引用数据的那天它会静默消失（不变量 3）。
+ */
+describe("text 块的 citations：空数组无声，非空必须留痕", () => {
+  it("空数组不记 loss —— 客户端等于什么都没说", () => {
+    const { request, losses } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8,
+      messages: [{ role: "user", content: [{ type: "text", text: "hi", citations: [] }] }],
+    }, "tr_cit_empty");
+    expect(request.conversation.turns[0]?.parts).toEqual([{ kind: "text", text: "hi" }]);
+    expect(losses.filter((one) => one.path.includes("citations"))).toEqual([]);
+  });
+
+  it("非空数组记一条 dropped，路径指到 citations", () => {
+    const { request, losses } = readAnthropicMessagesRequest({
+      model: "m", max_tokens: 8,
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text", text: "hi",
+          citations: [{ type: "web_search_result_location", url: "https://example.com", title: "t" }],
+        }],
+      }],
+    }, "tr_cit_full");
+    // 正文照常进 IR，丢的只有引用。
+    expect(request.conversation.turns[0]?.parts).toEqual([{ kind: "text", text: "hi" }]);
+    const loss = losses.find((one) => one.path.includes("citations"));
+    expect(loss?.kind).toBe("dropped");
+    expect(loss?.stage).toBe("inbox");
+    expect(loss?.detail).toContain("1 citation");
+  });
+});
