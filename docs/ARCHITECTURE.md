@@ -2,7 +2,12 @@
 
 一句话结论：**入口是封闭集(3)、出口是开放集(3+n),中间只有一个 IR;新增一个上游只付两个函数,换来三条路由。**
 
-边界：agent-ir 只做协议翻译与准入裁决。**不做**账号选择、配额、重试编排、模型映射 —— 那些是调用方(网关)的事。
+边界要分两层说，混为一谈会读错这个仓库：
+
+- **Core**（`src/ir` · `src/ingress` · `src/egress`）只做协议翻译与准入裁决。**不做**账号选择、配额、重试编排、模型映射、任何形式的内容修补 —— 它对「上游是谁、有没有额度、这次该不该重试」一无所知，这是它能保持确定性的前提。
+- **参考网关**（`src/gateway` · `src/server.ts`）做上面那些里的一部分：模型名映射、出口选择、修复策略装配、流策略。它是**可选层**，随仓库发布只是为了让 Core 有一个能跑起来的宿主；把 agent-ir 当库用的调用方可以整个不要它，自己拿 Core 的三个 API 拼。
+
+「不做模型映射」说的是 Core，不是这个仓库 —— 见 §6。
 
 ---
 
@@ -151,7 +156,56 @@ flowchart LR
 
 ---
 
-## 6. 节点到源码
+## 6. 参考网关：Core 之外那一层
+
+> 这张图回答：`src/gateway/` 到底管什么，以及为什么它不能在 Core 里。
+
+前面五节讲的都是 Core。但 Core 的三个 API（读入 / 裁决 / 写出）单独摆着是跑不起来的 ——
+总得有人回答「这条请求发给谁」「客户端说的 `claude-opus-5` 在这家上游叫什么」「哪几条修复是开着的」。
+这些问题的共同点是**换一个部署就会有不同答案**，所以按 §8 的判据它们全是策略，一条都不能进 Core。
+
+```mermaid
+flowchart TB
+  ENV["环境变量"]
+  subgraph GW["src/gateway —— 可选层，一次装配"]
+    CFG["readGatewayConfig<br/>唯一装配点"]
+    MODEL["模型路由表<br/>客户端名 → 上游 id"]
+    SEL["出口选择<br/>EGRESS_CONFIGS"]
+    POL["修复策略 + 流策略"]
+    ADV["拒绝时的修复建议<br/>problem kind → repair kind"]
+  end
+  subgraph CORE["Core —— 不认识上面任何一样东西"]
+    IR(["IR"])
+  end
+  SRV["src/server.ts<br/>纯组合根"]
+  MAIN["src/main.ts<br/>CLI 入口"]
+
+  ENV --> CFG
+  CFG --> MODEL & SEL & POL & ADV
+  MAIN --> SRV
+  CFG --> SRV
+  SRV --> IR
+```
+
+四件事，各自的判据：
+
+| 网关做的事 | 源码 | 为什么不能进 Core |
+|---|---|---|
+| **模型名映射** | `model_routing.ts` | 客户端说的 `claude-opus-5` 与上游签发的 id（windsurf 的 `chat_model_uid`、gemini 的档位名）是**两个命名空间**。这张表因部署而异，没有正确的默认值 |
+| **出口选择** | `egress_selection.ts` · `config.ts` | 「这条请求发给谁」取决于持有哪家凭据、哪家还有额度 —— Core 对此一无所知 |
+| **修复策略装配** | `config.ts` · `repair/**` | 修不修、修哪几条，是调用方的成本/正确性权衡 |
+| **拒绝时给建议** | `repair_advice.ts` | `Record<IRBuildProblemKind, IRRepairKind[]>` —— 新增一种拒绝理由时编译器逼你回答「这条能不能修」 |
+
+两条贯穿设计：
+
+- **构造成功即可用**。`readGatewayConfig` 返回之后不存在「还没校验」的字段：出口已绑好、模型表已解析、修复种类已核对。所有会失败的判断都发生在启动时，不散在第一条请求的路径上 —— 配错了就起不来，而不是跑到半夜才 4xx。
+- **不中默认拒绝，不默认透传**。模型表查不到时默认 `refuse`，因为默认透传等于「配不配都能跑」，那就没人会配它；而配错的人拿到的是上游的 opaque 4xx，指不回网关这边。想透传的人显式写 `AGENT_IR_MODEL_FALLBACK=passthrough` —— 那是一个决定，决定就该写下来。
+
+**把 agent-ir 当库用的调用方可以整个不要这一层**：Core 从 `src/index.ts` 导出，自己拿三个 API 拼一个宿主即可。`src/main.ts` 与 `src/server.ts` 拆开也是为此 —— 宿主可以注册完 IRMessage interceptor 再 `startGateway()`。
+
+---
+
+## 7. 节点到源码
 
 | 图上的东西 | 源码 |
 |---|---|
@@ -166,11 +220,13 @@ flowchart LR
 | 三个入口 codec | `src/ingress/**` |
 | 六个出口 | `src/egress/**`（windsurf 在子目录，唯一带依赖） |
 | repair（可选层） | `src/repair/**` |
+| 参考网关（可选层） | `src/gateway/**`、`src/server.ts` |
+| CLI 入口 | `src/main.ts` |
 | 公共入口 | `src/index.ts` |
 
 ---
 
-## 7. 契约与判据
+## 8. 契约与判据
 
 **Core 的唯一承诺：编译或拒绝。**
 
@@ -196,7 +252,7 @@ writeUpstreamRequest(request): Promise<
 
 ---
 
-## 8. 反模式
+## 9. 反模式
 
 - **把 wire 格式当 IR**。位置不变量（`tool_result` 必须紧邻）是 wire 层的事，混进 IR 会让每个入口各维护一套排列规则。
 - **用索引签名夹带未知字段**。新增出口时它们会静默蒸发；未知必须显式装箱成 `opaque`，让类型系统逼每个出口表态。
