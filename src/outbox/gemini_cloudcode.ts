@@ -146,9 +146,18 @@ export interface GeminiOAuthCredentials {
 
 const DEFAULT_HOST = "cloudcode-pa.googleapis.com";
 const DEFAULT_USER_AGENT = "antigravity/fantasy/1.0.0 linux/amd64";
-/** PROTOCOL_REFERENCE §1.1：Antigravity 的公开 OAuth 客户端。 */
-const OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const OAUTH_CLIENT_SECRET = process.env.ANTIGRAVITY_CLIENT_SECRET ?? process.env.GEMINI_OAUTH_CLIENT_SECRET ?? "";
+/** PROTOCOL_REFERENCE §1.1：Antigravity 的公开 OAuth 客户端（公共 PKCE client_id，RFC 8252）。 */
+const OAUTH_CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID ?? "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+
+function requireOAuthClientSecret(): string {
+  const secret = process.env.ANTIGRAVITY_CLIENT_SECRET ?? process.env.GEMINI_OAUTH_CLIENT_SECRET;
+  if (!secret) {
+    throw new Error(
+      "Gemini OAuth token refresh requires ANTIGRAVITY_CLIENT_SECRET (or GEMINI_OAUTH_CLIENT_SECRET) in environment",
+    );
+  }
+  return secret;
+}
 
 export function defaultGeminiCredentialsPath(): string {
   return join(homedir(), ".gemini", "oauth_creds.json");
@@ -185,7 +194,7 @@ export function createGeminiOAuthTokenSource(
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         client_id: OAUTH_CLIENT_ID,
-        client_secret: OAUTH_CLIENT_SECRET,
+        client_secret: requireOAuthClientSecret(),
         refresh_token: store.refresh_token,
         grant_type: "refresh_token",
       }).toString(),

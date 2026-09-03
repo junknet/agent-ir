@@ -1,7 +1,7 @@
 /**
  * OpenAI Chat Completions 出口。
  *
- * readOutboxResponse 用的 SSE 报文是**真实形状**，逐帧照抄自 `gateway-traffic-logs/`
+ * readOutboxResponse 用的 SSE 报文是**真实形状**，逐帧照抄自生产网关流量日志
  * 里 108115 条 `chat.completion.chunk`（deepseek-v4-flash / kimi-k3 等兼容端点，
  * 2026-07-31..08-04），包括三个容易被臆想掉的细节：
  *   - `delta.content` 常态是 **null**（107486 条带这个键，大量为 null），不是省略；

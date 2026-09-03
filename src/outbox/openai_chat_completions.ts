@@ -14,7 +14,7 @@
  * `writeOutboxRequest` 是**编译或拒绝**：能表达就出 wire，表达不了就带精确 IR 路径拒绝，
  * 绝不发一个非法 body 去换回语义模糊的 4xx。判据与逐条判定见 `OutboxRequestReport`。
  *
- * 真实报文出处：`gateway-traffic-logs/*.ndjson` 里 108115 条
+ * 真实报文出处：生产网关流量日志（`gateway-traffic-logs/*.ndjson`）里 108115 条
  * `chat.completion.chunk`（deepseek-v4-flash / kimi-k3 / glm-5 等兼容端点）。两个反直觉的
  * 实测点已在下面对应位置注明：`delta.content` 常态是 **null** 而不是缺省；工具调用的
  * 续帧带的是 `id:""` / `function.name:""` 而不是省略这两个键。
